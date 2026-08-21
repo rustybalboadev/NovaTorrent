@@ -1,13 +1,16 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     env,
-    io::ErrorKind,
-    net::{IpAddr, SocketAddrV4, TcpListener, UdpSocket},
+    io::{ErrorKind, Read, Write},
+    net::{IpAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket},
     path::{Path, PathBuf},
     process::Command,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU16, AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::Serialize;
@@ -25,7 +28,18 @@ struct AppState {
     session: Arc<TorrentSession>,
     pending_sources: Mutex<Vec<String>>,
     active_workers: Arc<Mutex<HashSet<String>>>,
+    media_stream_port: AtomicU16,
+    media_stream_tokens: Arc<Mutex<HashMap<String, MediaStreamRoute>>>,
+    next_media_stream_token: AtomicU64,
 }
+
+#[derive(Debug, Clone)]
+struct MediaStreamRoute {
+    id: String,
+    file_index: usize,
+}
+
+const MEDIA_STREAM_CHUNK_LIMIT: u64 = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 struct SafeTestTorrent {
@@ -58,7 +72,13 @@ impl AppState {
             session,
             pending_sources: Mutex::new(pending_sources),
             active_workers: Arc::new(Mutex::new(HashSet::new())),
+            media_stream_port: AtomicU16::new(0),
+            media_stream_tokens: Arc::new(Mutex::new(HashMap::new())),
+            next_media_stream_token: AtomicU64::new(1),
         };
+        if let Err(err) = state.start_media_stream_server() {
+            state.session.log(LogLevel::Error, "stream", err, None);
+        }
         match state.start_peer_listener() {
             Ok(port) => {
                 if let Err(err) = state.start_dht_listener(port) {
@@ -98,6 +118,53 @@ impl AppState {
             .lock()
             .map(|mut pending| std::mem::take(&mut *pending))
             .unwrap_or_default()
+    }
+
+    fn start_media_stream_server(&self) -> Result<u16, String> {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .map_err(|err| format!("could not bind local media stream server: {err}"))?;
+        let port = listener
+            .local_addr()
+            .map_err(|err| format!("could not inspect local media stream server: {err}"))?
+            .port();
+        self.media_stream_port.store(port, Ordering::Release);
+
+        let session = Arc::clone(&self.session);
+        let routes = Arc::clone(&self.media_stream_tokens);
+        thread::Builder::new()
+            .name("novatorrent-media-stream".to_string())
+            .spawn(move || {
+                for connection in listener.incoming() {
+                    match connection {
+                        Ok(stream) => {
+                            let session = Arc::clone(&session);
+                            let routes = Arc::clone(&routes);
+                            let _ = thread::Builder::new()
+                                .name("novatorrent-media-range".to_string())
+                                .spawn(move || {
+                                    handle_media_stream_connection(stream, session, routes);
+                                });
+                        }
+                        Err(err) => {
+                            session.log(
+                                LogLevel::Warn,
+                                "stream",
+                                format!("local media stream accept failed: {err}"),
+                                None,
+                            );
+                        }
+                    }
+                }
+            })
+            .map_err(|err| format!("could not start local media stream server: {err}"))?;
+
+        self.session.log(
+            LogLevel::Info,
+            "stream",
+            format!("local media stream server listening on 127.0.0.1:{port}"),
+            None,
+        );
+        Ok(port)
     }
 
     fn start_torrent_worker(&self, id: String) -> Result<(), String> {
@@ -533,6 +600,318 @@ impl AppState {
     }
 }
 
+struct MediaHttpRequest {
+    method: String,
+    path: String,
+    range: Option<String>,
+}
+
+fn handle_media_stream_connection(
+    mut stream: TcpStream,
+    session: Arc<TorrentSession>,
+    routes: Arc<Mutex<HashMap<String, MediaStreamRoute>>>,
+) {
+    let request = match read_media_http_request(&mut stream) {
+        Ok(request) => request,
+        Err(err) => {
+            let _ = write_media_response(
+                &mut stream,
+                "400 Bad Request",
+                &[("Content-Type", "text/plain; charset=utf-8")],
+                err.as_bytes(),
+            );
+            return;
+        }
+    };
+    if !matches!(request.method.as_str(), "GET" | "HEAD") {
+        let _ = write_media_response(
+            &mut stream,
+            "405 Method Not Allowed",
+            &[
+                ("Allow", "GET, HEAD"),
+                ("Content-Type", "text/plain; charset=utf-8"),
+            ],
+            b"method not allowed",
+        );
+        return;
+    }
+    let token = match request.path.strip_prefix("/stream/") {
+        Some(token)
+            if !token.is_empty()
+                && token.len() <= 128
+                && token.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
+        {
+            token
+        }
+        _ => {
+            let _ = write_media_response(
+                &mut stream,
+                "404 Not Found",
+                &[("Content-Type", "text/plain; charset=utf-8")],
+                b"stream route not found",
+            );
+            return;
+        }
+    };
+    let route = match routes.lock().ok().and_then(|routes| routes.get(token).cloned()) {
+        Some(route) => route,
+        None => {
+            let _ = write_media_response(
+                &mut stream,
+                "404 Not Found",
+                &[("Content-Type", "text/plain; charset=utf-8")],
+                b"stream route not found",
+            );
+            return;
+        }
+    };
+
+    let availability = match session.stream_file_availability(&route.id, route.file_index) {
+        Ok(availability) => availability,
+        Err(err) => {
+            session.log(
+                LogLevel::Warn,
+                "stream",
+                format!("could not inspect media stream availability: {err}"),
+                None,
+            );
+            let _ = write_media_response(
+                &mut stream,
+                "404 Not Found",
+                &[("Content-Type", "text/plain; charset=utf-8")],
+                err.as_bytes(),
+            );
+            return;
+        }
+    };
+    if request.method == "HEAD" {
+        let content_length = availability.length.to_string();
+        let content_type = media_content_type(&availability.name);
+        let _ = write_media_response(
+            &mut stream,
+            "200 OK",
+            &[
+                ("Accept-Ranges", "bytes"),
+                ("Cache-Control", "no-store"),
+                ("Content-Type", content_type),
+                ("Content-Length", &content_length),
+            ],
+            b"",
+        );
+        return;
+    }
+    if availability.length == 0 {
+        let _ = write_media_response(
+            &mut stream,
+            "200 OK",
+            &[
+                ("Accept-Ranges", "bytes"),
+                ("Cache-Control", "no-store"),
+                ("Content-Type", media_content_type(&availability.name)),
+                ("Content-Length", "0"),
+            ],
+            b"",
+        );
+        return;
+    }
+
+    let Some((start, end)) = parse_media_range(request.range.as_deref(), availability.length) else {
+        let content_range = format!("bytes */{}", availability.length);
+        let _ = write_media_response(
+            &mut stream,
+            "416 Range Not Satisfiable",
+            &[
+                ("Accept-Ranges", "bytes"),
+                ("Content-Range", &content_range),
+                ("Content-Type", "text/plain; charset=utf-8"),
+            ],
+            b"range not satisfiable",
+        );
+        return;
+    };
+    let length = end - start + 1;
+    let _ = session.update_stream_priority_quietly(
+        &route.id,
+        StreamPriorityRequest {
+            file_index: route.file_index,
+            playhead_offset: start,
+            urgent_bytes: None,
+            lookahead_bytes: None,
+        },
+    );
+    match session.read_stream_file_range(&route.id, route.file_index, start, length) {
+        Ok(read) => {
+            let content_range = format!("bytes {start}-{end}/{}", read.total_length);
+            let content_length = read.bytes.len().to_string();
+            let _ = write_media_response(
+                &mut stream,
+                "206 Partial Content",
+                &[
+                    ("Accept-Ranges", "bytes"),
+                    ("Access-Control-Allow-Origin", "*"),
+                    ("Cache-Control", "no-store"),
+                    ("Content-Type", media_content_type(&availability.name)),
+                    ("Content-Range", &content_range),
+                    ("Content-Length", &content_length),
+                ],
+                &read.bytes,
+            );
+        }
+        Err(err) => {
+            let (status, retry) =
+                if err.contains("not verified yet") || err.contains("not buffered yet") {
+                    ("503 Service Unavailable", true)
+                } else {
+                    ("500 Internal Server Error", false)
+                };
+            let mut headers = vec![("Content-Type", "text/plain; charset=utf-8")];
+            if retry {
+                headers.push(("Retry-After", "1"));
+            }
+            session.log(
+                LogLevel::Debug,
+                "stream",
+                format!("media stream range {start}-{end} unavailable: {err}"),
+                None,
+            );
+            let _ = write_media_response(&mut stream, status, &headers, err.as_bytes());
+        }
+    }
+}
+
+fn read_media_http_request(stream: &mut TcpStream) -> Result<MediaHttpRequest, String> {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .map_err(|err| format!("could not configure media stream timeout: {err}"))?;
+    let mut bytes = Vec::with_capacity(1024);
+    let mut buffer = [0u8; 1024];
+    while bytes.len() < 16 * 1024 {
+        let read = stream
+            .read(&mut buffer)
+            .map_err(|err| format!("could not read media stream request: {err}"))?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+        if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+    }
+    let request = std::str::from_utf8(&bytes)
+        .map_err(|_| "media stream request was not valid UTF-8".to_string())?;
+    let mut lines = request.split("\r\n");
+    let request_line = lines
+        .next()
+        .ok_or_else(|| "media stream request was empty".to_string())?;
+    let mut request_parts = request_line.split_whitespace();
+    let method = request_parts
+        .next()
+        .ok_or_else(|| "media stream request omitted method".to_string())?
+        .to_string();
+    let path = request_parts
+        .next()
+        .ok_or_else(|| "media stream request omitted path".to_string())?
+        .split('?')
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    let mut range = None;
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("range") {
+            range = Some(value.trim().to_string());
+        }
+    }
+    Ok(MediaHttpRequest {
+        method,
+        path,
+        range,
+    })
+}
+
+fn parse_media_range(header: Option<&str>, total_length: u64) -> Option<(u64, u64)> {
+    if total_length == 0 {
+        return Some((0, 0));
+    }
+    let max_end_from_start = |start: u64| {
+        total_length
+            .saturating_sub(1)
+            .min(start.saturating_add(MEDIA_STREAM_CHUNK_LIMIT - 1))
+    };
+    let Some(header) = header else {
+        return Some((0, max_end_from_start(0)));
+    };
+    let spec = header.trim().strip_prefix("bytes=")?;
+    let (start_text, end_text) = spec.split_once('-')?;
+    if start_text.is_empty() {
+        let suffix = end_text.parse::<u64>().ok()?;
+        if suffix == 0 {
+            return None;
+        }
+        let start = total_length.saturating_sub(suffix);
+        return Some((start, total_length - 1));
+    }
+
+    let start = start_text.parse::<u64>().ok()?;
+    if start >= total_length {
+        return None;
+    }
+    let requested_end = if end_text.is_empty() {
+        total_length - 1
+    } else {
+        end_text.parse::<u64>().ok()?.min(total_length - 1)
+    };
+    if requested_end < start {
+        return None;
+    }
+    Some((start, requested_end.min(max_end_from_start(start))))
+}
+
+fn media_content_type(name: &str) -> &'static str {
+    let extension = Path::new(name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase);
+    match extension.as_deref() {
+        Some("mp4") | Some("m4v") => "video/mp4",
+        Some("webm") => "video/webm",
+        Some("ogv") => "video/ogg",
+        Some("mov") => "video/quicktime",
+        Some("mkv") => "video/x-matroska",
+        Some("avi") => "video/x-msvideo",
+        _ => "application/octet-stream",
+    }
+}
+
+fn write_media_response(
+    stream: &mut TcpStream,
+    status: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> std::io::Result<()> {
+    let has_content_length = headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("content-length"));
+    let mut response = format!("HTTP/1.1 {status}\r\nConnection: close\r\n");
+    if !has_content_length {
+        response.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
+    for (name, value) in headers {
+        response.push_str(name);
+        response.push_str(": ");
+        response.push_str(value);
+        response.push_str("\r\n");
+    }
+    response.push_str("\r\n");
+    stream.write_all(response.as_bytes())?;
+    stream.write_all(body)
+}
+
 #[tauri::command]
 fn default_download_dir(state: tauri::State<'_, AppState>) -> String {
     state.session.default_output_dir().to_string_lossy().into_owned()
@@ -767,6 +1146,53 @@ async fn stream_file_availability(
     })
     .await
     .map_err(|err| format!("file availability worker failed: {err}"))?
+}
+
+#[tauri::command]
+async fn stream_file_url(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    file_index: usize,
+) -> Result<String, String> {
+    let session = Arc::clone(&state.session);
+    let validation_id = id.clone();
+    let availability =
+        tauri::async_runtime::spawn_blocking(move || {
+            session.stream_file_availability(&validation_id, file_index)
+        })
+        .await
+        .map_err(|err| format!("file stream URL worker failed: {err}"))??;
+
+    let port = state.media_stream_port.load(Ordering::Acquire);
+    if port == 0 {
+        return Err("local media stream server is not running".to_string());
+    }
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or_default();
+    let sequence = state
+        .next_media_stream_token
+        .fetch_add(1, Ordering::Relaxed);
+    let token = format!("{timestamp:016x}{sequence:016x}");
+    state
+        .media_stream_tokens
+        .lock()
+        .map_err(|_| "media stream route lock poisoned".to_string())?
+        .insert(
+            token.clone(),
+            MediaStreamRoute {
+                id: id.clone(),
+                file_index,
+            },
+        );
+    state.session.log(
+        LogLevel::Info,
+        "stream",
+        format!("prepared local playback URL for '{}'", availability.name),
+        None,
+    );
+    Ok(format!("http://127.0.0.1:{port}/stream/{token}"))
 }
 
 #[tauri::command]
@@ -1072,6 +1498,7 @@ pub fn run() {
             update_torrent_options,
             hash_torrent_file,
             stream_file_availability,
+            stream_file_url,
             set_stream_priority,
             clear_stream_priority,
             open_virustotal_report,

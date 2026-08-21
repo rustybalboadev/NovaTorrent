@@ -58,6 +58,7 @@ import {
   clearStreamPriority,
   setStreamPriority,
   streamFileAvailability,
+  streamFileUrl,
   takePendingOpenSources,
   torrentDetails,
   updateTorrentFiles,
@@ -82,6 +83,7 @@ const playableExtensions = new Set(["mp4", "m4v", "mov", "webm", "mkv", "ogv", "
 type MediaSession = {
   torrentId: string;
   fileIndex: number;
+  url: string;
   availability: TorrentFileAvailability;
   priority: StreamPriorityStatus;
 };
@@ -298,8 +300,9 @@ export function TorrentDashboard() {
         urgentBytes: null,
         lookaheadBytes: null
       });
+      const url = await streamFileUrl(row.id, fileIndex);
       const availability = await streamFileAvailability(row.id, fileIndex);
-      setMediaSession({ torrentId: row.id, fileIndex, priority, availability });
+      setMediaSession({ torrentId: row.id, fileIndex, url, priority, availability });
       setSelectedId(row.id);
       setInspectorTab("Files");
       setError(null);
@@ -912,6 +915,15 @@ function TorrentMediaPanel({
       </div>
       {availability ? (
         <div className="space-y-2 px-3 py-2">
+          {mediaSession.url ? (
+            <video
+              key={mediaSession.url}
+              className="aspect-video w-full rounded-md border bg-black"
+              controls
+              preload="metadata"
+              src={mediaSession.url}
+            />
+          ) : null}
           <Progress value={percent(bufferPercent)} className="h-2" />
           <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
             <span>{availability.ranges.length} verified range{availability.ranges.length === 1 ? "" : "s"}</span>

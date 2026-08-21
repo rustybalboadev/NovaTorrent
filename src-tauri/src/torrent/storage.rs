@@ -203,6 +203,45 @@ impl PartialPieceStore {
         Ok(bytes)
     }
 
+    pub fn read_verified_file_range(
+        &mut self,
+        files: &[TorrentFile],
+        file_index: usize,
+        offset: u64,
+        length: u64,
+    ) -> Result<Vec<u8>, String> {
+        let (file_start, file_length) = file_torrent_offset(files, file_index)?;
+        let end = offset
+            .checked_add(length)
+            .ok_or_else(|| "stream byte range overflow".to_string())?;
+        if end > file_length {
+            return Err("stream byte range exceeds file length".to_string());
+        }
+        let ranges = verified_file_ranges_from_pieces(
+            files,
+            file_index,
+            self.state.piece_length,
+            &self.state.pieces,
+        )?;
+        if !is_range_verified(&ranges, offset, length) {
+            return Err("stream byte range is not verified yet".to_string());
+        }
+
+        let absolute_offset = file_start
+            .checked_add(offset)
+            .ok_or_else(|| "stream byte range overflow".to_string())?;
+        let read_len = usize::try_from(length)
+            .map_err(|_| "stream byte range is too large for this platform".to_string())?;
+        let mut bytes = vec![0u8; read_len];
+        self.data_file
+            .seek(SeekFrom::Start(absolute_offset))
+            .map_err(|err| format!("could not seek partial torrent stream data: {err}"))?;
+        self.data_file
+            .read_exact(&mut bytes)
+            .map_err(|err| format!("could not read partial torrent stream data: {err}"))?;
+        Ok(bytes)
+    }
+
     pub fn write_complete_to_files(
         &mut self,
         output_root: &Path,
@@ -532,19 +571,9 @@ pub fn verified_file_ranges_from_pieces(
     if piece_length == 0 {
         return Err("piece length cannot be zero".to_string());
     }
-    let file = files
-        .get(file_index)
-        .ok_or_else(|| format!("torrent file index is out of range: {file_index}"))?;
-    let file_start = files
-        .iter()
-        .take(file_index)
-        .try_fold(0u64, |total, file| {
-            total
-                .checked_add(file.length)
-                .ok_or_else(|| "file offset overflow".to_string())
-        })?;
+    let (file_start, file_length) = file_torrent_offset(files, file_index)?;
     let file_end = file_start
-        .checked_add(file.length)
+        .checked_add(file_length)
         .ok_or_else(|| "file offset overflow".to_string())?;
     let total_length = total_file_length(files)?;
     let mut ranges = Vec::<VerifiedByteRange>::new();
@@ -577,6 +606,34 @@ pub fn verified_file_ranges_from_pieces(
     }
 
     Ok(ranges)
+}
+
+pub fn file_torrent_offset(files: &[TorrentFile], file_index: usize) -> Result<(u64, u64), String> {
+    let file = files
+        .get(file_index)
+        .ok_or_else(|| format!("torrent file index is out of range: {file_index}"))?;
+    let offset = files
+        .iter()
+        .take(file_index)
+        .try_fold(0u64, |total, file| {
+            total
+                .checked_add(file.length)
+                .ok_or_else(|| "file offset overflow".to_string())
+        })?;
+    Ok((offset, file.length))
+}
+
+pub fn is_range_verified(ranges: &[VerifiedByteRange], offset: u64, length: u64) -> bool {
+    if length == 0 {
+        return true;
+    }
+    let Some(end) = offset.checked_add(length) else {
+        return false;
+    };
+    ranges.iter().any(|range| {
+        let range_end = range.offset.saturating_add(range.length);
+        range.offset <= offset && end <= range_end
+    })
 }
 
 pub fn output_path_for_file(
@@ -858,6 +915,39 @@ mod tests {
             b"hi"
         );
         store.clear().expect("partial store clears");
+        remove_temp_dir(root);
+    }
+
+    #[test]
+    fn partial_piece_store_reads_only_verified_file_ranges() {
+        let root = temp_dir("partial-range-stream");
+        let data = b"abcdefghi";
+        let hashes = data.chunks(4).map(sha1::digest).collect::<Vec<_>>();
+        let files = vec![
+            file("one.bin", &["one.bin"], 3, true),
+            file("two.bin", &["two.bin"], 4, true),
+            file("three.bin", &["three.bin"], 2, true),
+        ];
+        let key = "20112233445566778899aabbccddeeff00112233";
+        let mut store =
+            PartialPieceStore::open(&root, key, data.len() as u64, 4, &hashes).expect("store opens");
+        store.write_piece(0, b"abcd").expect("piece 0 writes");
+
+        assert_eq!(
+            store
+                .read_verified_file_range(&files, 1, 0, 1)
+                .expect("verified file byte reads"),
+            b"d"
+        );
+        assert!(store.read_verified_file_range(&files, 1, 1, 1).is_err());
+
+        store.write_piece(1, b"efgh").expect("piece 1 writes");
+        assert_eq!(
+            store
+                .read_verified_file_range(&files, 1, 0, 4)
+                .expect("verified file range reads"),
+            b"defg"
+        );
         remove_temp_dir(root);
     }
 

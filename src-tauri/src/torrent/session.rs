@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, OpenOptions},
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
     sync::{
@@ -46,6 +46,7 @@ const MAX_RUNTIME_RETRY_DELAY: Duration = Duration::from_secs(60);
 const DEFAULT_STREAM_URGENT_BYTES: u64 = 2 * 1024 * 1024;
 const DEFAULT_STREAM_LOOKAHEAD_BYTES: u64 = 24 * 1024 * 1024;
 const MAX_STREAM_LOOKAHEAD_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_MEDIA_STREAM_READ_BYTES: u64 = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -101,6 +102,12 @@ pub struct TorrentFileAvailability {
     pub complete: bool,
     pub partial_store_present: bool,
     pub ranges: Vec<storage::VerifiedByteRange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamFileRead {
+    pub bytes: Vec<u8>,
+    pub total_length: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -3647,10 +3654,157 @@ impl TorrentSession {
         })
     }
 
+    pub fn read_stream_file_range(
+        &self,
+        id: &str,
+        file_index: usize,
+        offset: u64,
+        length: u64,
+    ) -> Result<StreamFileRead, String> {
+        if length > MAX_MEDIA_STREAM_READ_BYTES {
+            return Err(format!(
+                "stream byte range is too large: maximum is {MAX_MEDIA_STREAM_READ_BYTES} bytes"
+            ));
+        }
+        let (
+            torrent_id,
+            torrent_name,
+            output_folder,
+            files,
+            file,
+            info_hash,
+            piece_length,
+            piece_hashes,
+            finished,
+        ) = {
+            let torrents = self.torrents.lock().map_err(|_| "torrent lock poisoned")?;
+            let torrent = torrents
+                .iter()
+                .find(|torrent| torrent.matches_id(id))
+                .ok_or_else(|| format!("torrent not found: {id}"))?;
+            let file = torrent
+                .files
+                .get(file_index)
+                .cloned()
+                .ok_or_else(|| format!("torrent file index is out of range: {file_index}"))?;
+            (
+                torrent.id,
+                torrent.name.clone(),
+                torrent.output_folder.clone(),
+                torrent.files.clone(),
+                file,
+                torrent.info_hash,
+                torrent.general.piece_size,
+                torrent.piece_hashes.clone(),
+                torrent.stats.finished,
+            )
+        };
+        if files.is_empty() || piece_hashes.is_empty() {
+            return Err("torrent metadata is not available yet".to_string());
+        }
+        if !file.included {
+            return Err("unchecked torrent files are not available for streaming".to_string());
+        }
+        let end = offset
+            .checked_add(length)
+            .ok_or_else(|| "stream byte range overflow".to_string())?;
+        if end > file.length {
+            return Err("stream byte range exceeds file length".to_string());
+        }
+
+        let bytes = if finished {
+            let multi_file = files.len() > 1
+                || files
+                    .first()
+                    .is_some_and(|candidate| candidate.components.len() > 1);
+            let path = storage::output_path_for_file(
+                &output_folder,
+                &torrent_name,
+                &file,
+                multi_file,
+            )?;
+            let link_metadata = fs::symlink_metadata(&path)
+                .map_err(|err| format!("could not inspect torrent stream file: {err}"))?;
+            if link_metadata.file_type().is_symlink() || !link_metadata.file_type().is_file() {
+                return Err("torrent streaming requires a regular, non-symlink file".to_string());
+            }
+            let canonical_root = fs::canonicalize(&output_folder)
+                .map_err(|err| format!("could not resolve torrent output folder: {err}"))?;
+            let canonical_path = fs::canonicalize(&path)
+                .map_err(|err| format!("could not resolve torrent stream file: {err}"))?;
+            if !canonical_path.starts_with(&canonical_root) {
+                return Err("torrent stream file resolves outside its output folder".to_string());
+            }
+            if link_metadata.len() != file.length {
+                return Err(format!(
+                    "torrent stream file length changed: expected {}, found {}",
+                    file.length,
+                    link_metadata.len()
+                ));
+            }
+            let read_len = usize::try_from(length)
+                .map_err(|_| "stream byte range is too large for this platform".to_string())?;
+            let mut bytes = vec![0u8; read_len];
+            let mut input = fs::File::open(&canonical_path)
+                .map_err(|err| format!("could not open torrent stream file: {err}"))?;
+            input
+                .seek(SeekFrom::Start(offset))
+                .map_err(|err| format!("could not seek torrent stream file: {err}"))?;
+            input
+                .read_exact(&mut bytes)
+                .map_err(|err| format!("could not read torrent stream file: {err}"))?;
+            bytes
+        } else {
+            let store_key = sha1::hex(&info_hash);
+            let mut partial_store = storage::PartialPieceStore::open_existing(
+                &output_folder,
+                &store_key,
+                storage::total_file_length(&files)?,
+                piece_length,
+                &piece_hashes,
+            )?
+            .ok_or_else(|| "stream data is not buffered yet".to_string())?;
+            partial_store.read_verified_file_range(&files, file_index, offset, length)?
+        };
+
+        self.log(
+            LogLevel::Debug,
+            "stream",
+            format!(
+                "served {} byte(s) from '{}' at offset {}",
+                bytes.len(),
+                file.name,
+                offset
+            ),
+            Some(torrent_id),
+        );
+        Ok(StreamFileRead {
+            bytes,
+            total_length: file.length,
+        })
+    }
+
     pub fn set_stream_priority(
         &self,
         id: &str,
         request: StreamPriorityRequest,
+    ) -> Result<StreamPriorityStatus, String> {
+        self.set_stream_priority_inner(id, request, true)
+    }
+
+    pub fn update_stream_priority_quietly(
+        &self,
+        id: &str,
+        request: StreamPriorityRequest,
+    ) -> Result<StreamPriorityStatus, String> {
+        self.set_stream_priority_inner(id, request, false)
+    }
+
+    fn set_stream_priority_inner(
+        &self,
+        id: &str,
+        request: StreamPriorityRequest,
+        log_priority: bool,
     ) -> Result<StreamPriorityStatus, String> {
         let mut torrents = self.torrents.lock().map_err(|_| "torrent lock poisoned")?;
         let torrent = torrents
@@ -3697,15 +3851,17 @@ impl TorrentSession {
             lookahead_pieces: plan.lookahead.len(),
             total_priority_pieces: plan.urgent.len() + plan.lookahead.len(),
         };
-        self.log(
-            LogLevel::Info,
-            "stream",
-            format!(
-                "prioritizing '{}' at byte {} ({} urgent piece(s), {} lookahead piece(s))",
-                status.name, status.playhead_offset, status.urgent_pieces, status.lookahead_pieces
-            ),
-            Some(torrent.id),
-        );
+        if log_priority {
+            self.log(
+                LogLevel::Info,
+                "stream",
+                format!(
+                    "prioritizing '{}' at byte {} ({} urgent piece(s), {} lookahead piece(s))",
+                    status.name, status.playhead_offset, status.urgent_pieces, status.lookahead_pieces
+                ),
+                Some(torrent.id),
+            );
+        }
         Ok(status)
     }
 

@@ -193,6 +193,11 @@ export async function streamFileAvailability(id: string, fileIndex: number): Pro
   return invoke<TorrentFileAvailability>("stream_file_availability", { id, fileIndex });
 }
 
+export async function streamFileUrl(id: string, fileIndex: number): Promise<string> {
+  if (!isTauriRuntime()) return "";
+  return invoke<string>("stream_file_url", { id, fileIndex });
+}
+
 export async function setStreamPriority(id: string, request: StreamPriorityRequest): Promise<StreamPriorityStatus> {
   if (!isTauriRuntime()) {
     const file = mockTorrents[0]?.files?.[request.fileIndex];
