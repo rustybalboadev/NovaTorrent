@@ -198,6 +198,14 @@ export async function streamFileUrl(id: string, fileIndex: number): Promise<stri
   return invoke<string>("stream_file_url", { id, fileIndex });
 }
 
+export async function openMediaWindow(id: string, fileIndex: number) {
+  if (!isTauriRuntime()) {
+    window.open(`/media/?id=${encodeURIComponent(id)}&fileIndex=${fileIndex}`, "_blank", "noopener,noreferrer");
+    return;
+  }
+  await invoke("open_media_window", { id, fileIndex });
+}
+
 export async function setStreamPriority(id: string, request: StreamPriorityRequest): Promise<StreamPriorityStatus> {
   if (!isTauriRuntime()) {
     const file = mockTorrents[0]?.files?.[request.fileIndex];

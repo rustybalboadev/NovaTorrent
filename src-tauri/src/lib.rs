@@ -731,7 +731,6 @@ fn handle_media_stream_connection(
         );
         return;
     };
-    let length = end - start + 1;
     let _ = session.update_stream_priority_quietly(
         &route.id,
         StreamPriorityRequest {
@@ -741,9 +740,9 @@ fn handle_media_stream_connection(
             lookahead_bytes: None,
         },
     );
-    match read_media_stream_range_with_wait(&session, &route, start, length) {
+    match read_media_stream_range_with_wait(&session, &route, start, end) {
         Ok(read) => {
-            let content_range = format!("bytes {start}-{end}/{}", read.total_length);
+            let content_range = format!("bytes {start}-{}/{}", read.end, read.total_length);
             let content_length = read.bytes.len().to_string();
             let _ = write_media_response(
                 &mut stream,
@@ -780,16 +779,34 @@ fn handle_media_stream_connection(
     }
 }
 
+struct MediaStreamRangeRead {
+    bytes: Vec<u8>,
+    end: u64,
+    total_length: u64,
+}
+
 fn read_media_stream_range_with_wait(
     session: &TorrentSession,
     route: &MediaStreamRoute,
     start: u64,
-    length: u64,
-) -> Result<crate::torrent::session::StreamFileRead, String> {
+    requested_end: u64,
+) -> Result<MediaStreamRangeRead, String> {
     let started = Instant::now();
     let mut attempts = 0u32;
     loop {
         attempts = attempts.saturating_add(1);
+        let read_end = match session.stream_file_availability(&route.id, route.file_index) {
+            Ok(availability) => verified_media_range_end(&availability.ranges, start, requested_end),
+            Err(err) => return Err(err),
+        };
+        let Some(read_end) = read_end else {
+            if started.elapsed() < MEDIA_STREAM_WAIT_TIMEOUT {
+                thread::sleep(MEDIA_STREAM_WAIT_INTERVAL);
+                continue;
+            }
+            return Err("stream byte range is not verified yet".to_string());
+        };
+        let length = read_end - start + 1;
         match session.read_stream_file_range(&route.id, route.file_index, start, length) {
             Ok(read) => {
                 if attempts > 1 {
@@ -803,7 +820,11 @@ fn read_media_stream_range_with_wait(
                         None,
                     );
                 }
-                return Ok(read);
+                return Ok(MediaStreamRangeRead {
+                    bytes: read.bytes,
+                    end: read_end,
+                    total_length: read.total_length,
+                });
             }
             Err(err)
                 if is_waitable_media_stream_error(&err)
@@ -814,6 +835,17 @@ fn read_media_stream_range_with_wait(
             Err(err) => return Err(err),
         }
     }
+}
+
+fn verified_media_range_end(
+    ranges: &[crate::torrent::storage::VerifiedByteRange],
+    start: u64,
+    requested_end: u64,
+) -> Option<u64> {
+    ranges.iter().find_map(|range| {
+        let range_end = range.offset.checked_add(range.length)?.checked_sub(1)?;
+        (range.offset <= start && start <= range_end).then(|| range_end.min(requested_end))
+    })
 }
 
 fn is_waitable_media_stream_error(err: &str) -> bool {
@@ -1237,6 +1269,45 @@ async fn stream_file_url(
 }
 
 #[tauri::command]
+async fn open_media_window(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    id: String,
+    file_index: usize,
+) -> Result<(), String> {
+    let session = Arc::clone(&state.session);
+    let validation_id = id.clone();
+    let availability = tauri::async_runtime::spawn_blocking(move || {
+        session.stream_file_availability(&validation_id, file_index)
+    })
+    .await
+    .map_err(|err| format!("media window validation failed: {err}"))??;
+
+    let label = media_window_label(&id, file_index);
+    if let Some(window) = app.get_webview_window(&label) {
+        window.show().map_err(error_to_string)?;
+        window.set_focus().map_err(error_to_string)?;
+        return Ok(());
+    }
+
+    let mut route = String::from(media_player_route());
+    route.push_str("?id=");
+    route.push_str(&percent_encode_uri_component(&id));
+    route.push_str("&fileIndex=");
+    route.push_str(&file_index.to_string());
+
+    WebviewWindowBuilder::new(&app, label, WebviewUrl::App(route.into()))
+        .title(format!("NovaTorrent - {}", availability.name))
+        .inner_size(1040.0, 720.0)
+        .min_inner_size(700.0, 460.0)
+        .resizable(true)
+        .build()
+        .map_err(error_to_string)?
+        .set_focus()
+        .map_err(error_to_string)
+}
+
+#[tauri::command]
 fn set_stream_priority(
     state: tauri::State<'_, AppState>,
     id: String,
@@ -1340,6 +1411,26 @@ fn add_torrent_route() -> &'static str {
     } else {
         "add/index.html"
     }
+}
+
+fn media_player_route() -> &'static str {
+    if cfg!(debug_assertions) {
+        "media/"
+    } else {
+        "media/index.html"
+    }
+}
+
+fn media_window_label(id: &str, file_index: usize) -> String {
+    let mut safe_id = id
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .take(32)
+        .collect::<String>();
+    if safe_id.is_empty() {
+        safe_id.push_str("torrent");
+    }
+    format!("media-{safe_id}-{file_index}")
 }
 
 fn supported_open_sources(
@@ -1540,6 +1631,7 @@ pub fn run() {
             hash_torrent_file,
             stream_file_availability,
             stream_file_url,
+            open_media_window,
             set_stream_priority,
             clear_stream_priority,
             open_virustotal_report,
@@ -1611,6 +1703,39 @@ mod open_source_tests {
         assert_eq!(parse_media_range(Some("bytes=4-9"), 20), Some((4, 9)));
         assert_eq!(parse_media_range(Some("bytes=18-99"), 20), Some((18, 19)));
         assert_eq!(parse_media_range(Some("bytes=50-99"), 20), None);
+        assert_eq!(
+            verified_media_range_end(
+                &[crate::torrent::storage::VerifiedByteRange {
+                    offset: 0,
+                    length: 1_048_436,
+                }],
+                0,
+                2_097_151,
+            ),
+            Some(1_048_435)
+        );
+        assert_eq!(
+            verified_media_range_end(
+                &[crate::torrent::storage::VerifiedByteRange {
+                    offset: 3_145_728,
+                    length: 1_932_323,
+                }],
+                3_145_728,
+                5_242_879,
+            ),
+            Some(5_078_050)
+        );
+        assert_eq!(
+            verified_media_range_end(
+                &[crate::torrent::storage::VerifiedByteRange {
+                    offset: 0,
+                    length: 1_048_436,
+                }],
+                1_048_436,
+                2_097_151,
+            ),
+            None
+        );
         assert!(is_waitable_media_stream_error("stream byte range is not verified yet"));
         assert!(is_waitable_media_stream_error("stream data is not buffered yet"));
         assert!(!is_waitable_media_stream_error("torrent metadata is not available yet"));
