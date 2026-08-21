@@ -351,6 +351,8 @@ struct ConnectedPeer {
     connection: peerwire::PeerDownloadConnection,
 }
 
+type PeerConnectionResult = (PeerInfo, Result<peerwire::PeerDownloadConnection, String>);
+
 struct EndgameRaceResult {
     winner: Option<(PeerInfo, peerwire::DownloadedPiece)>,
     cancelled: Vec<PeerInfo>,
@@ -2241,6 +2243,82 @@ impl TorrentSession {
         Err(last_error.unwrap_or_else(|| "no plain HTTP webseed URLs are available".to_string()))
     }
 
+    fn accept_peer_connection_result(
+        &self,
+        id: &str,
+        torrent_id: u64,
+        peer: PeerInfo,
+        result: Result<peerwire::PeerDownloadConnection, String>,
+        connected: &mut Vec<ConnectedPeer>,
+        pending_dht_nodes: &mut Vec<(String, u16)>,
+        errors: &mut Vec<String>,
+    ) -> Result<(), String> {
+        match result {
+            Ok(mut connection) => {
+                self.record_peer_connect_success(id, &peer.address, peer.port)?;
+                if let Some(dht_port) = connection.take_remote_dht_port() {
+                    pending_dht_nodes.push((peer.address.clone(), dht_port));
+                }
+                if let Some(client) =
+                    self.set_peer_client(id, &peer.address, peer.port, &connection.peer_id())?
+                {
+                    self.log(
+                        LogLevel::Debug,
+                        "peer",
+                        format!("{}:{} identified as {client}", peer.address, peer.port),
+                        Some(torrent_id),
+                    );
+                }
+                let available = connection.availability().iter().filter(|piece| **piece).count();
+                self.set_peer_connection(
+                    id,
+                    &peer.address,
+                    peer.port,
+                    &format!("Ready; {available} pieces available"),
+                    None,
+                )?;
+                connected.push(ConnectedPeer { peer, connection });
+            }
+            Err(err) => {
+                self.record_peer_failure(id, &peer.address, peer.port)?;
+                self.set_peer_connection(id, &peer.address, peer.port, "Error", Some(err.clone()))?;
+                self.log(
+                    LogLevel::Warn,
+                    "peer",
+                    format!("{}:{}: {err}", peer.address, peer.port),
+                    Some(torrent_id),
+                );
+                errors.push(format!("{}:{}: {err}", peer.address, peer.port));
+            }
+        }
+        Ok(())
+    }
+
+    fn drain_peer_connection_results(
+        &self,
+        id: &str,
+        torrent_id: u64,
+        receiver: &std::sync::mpsc::Receiver<PeerConnectionResult>,
+        connected: &mut Vec<ConnectedPeer>,
+        pending_dht_nodes: &mut Vec<(String, u16)>,
+        errors: &mut Vec<String>,
+    ) -> Result<usize, String> {
+        let mut drained = 0usize;
+        while let Ok((peer, result)) = receiver.try_recv() {
+            drained += 1;
+            self.accept_peer_connection_result(
+                id,
+                torrent_id,
+                peer,
+                result,
+                connected,
+                pending_dht_nodes,
+                errors,
+            )?;
+        }
+        Ok(drained)
+    }
+
     pub fn download_from_peers(&self, id: &str) -> Result<EmptyJsonResponse, String> {
         let snapshot = {
             let torrents = self.torrents.lock().map_err(|_| "torrent lock poisoned")?;
@@ -2435,52 +2513,18 @@ impl TorrentSession {
                 };
                 received += 1;
                 settled_peers.insert((peer.address.clone(), peer.port));
-                match result {
-                    Ok(mut connection) => {
-                        self.record_peer_connect_success(id, &peer.address, peer.port)?;
-                        if let Some(dht_port) = connection.take_remote_dht_port() {
-                            advertised_dht_nodes.push((peer.address.clone(), dht_port));
-                        }
-                        if let Some(client) =
-                            self.set_peer_client(id, &peer.address, peer.port, &connection.peer_id())?
-                        {
-                            self.log(
-                                LogLevel::Debug,
-                                "peer",
-                                format!("{}:{} identified as {client}", peer.address, peer.port),
-                                Some(snapshot.id),
-                            );
-                        }
-                        let available = connection.availability().iter().filter(|piece| **piece).count();
-                        self.set_peer_connection(
-                            id,
-                            &peer.address,
-                            peer.port,
-                            &format!("Ready; {available} pieces available"),
-                            None,
-                        )?;
-                        if first_connected_at.is_none() {
-                            first_connected_at = Some(Instant::now());
-                        }
-                        connected.push(ConnectedPeer { peer, connection });
-                    }
-                    Err(err) => {
-                        self.record_peer_failure(id, &peer.address, peer.port)?;
-                        self.set_peer_connection(
-                            id,
-                            &peer.address,
-                            peer.port,
-                            "Error",
-                            Some(err.clone()),
-                        )?;
-                        self.log(
-                            LogLevel::Warn,
-                            "peer",
-                            format!("{}:{}: {err}", peer.address, peer.port),
-                            Some(snapshot.id),
-                        );
-                        errors.push(format!("{}:{}: {err}", peer.address, peer.port));
-                    }
+                let connected_before = connected.len();
+                self.accept_peer_connection_result(
+                    id,
+                    snapshot.id,
+                    peer,
+                    result,
+                    &mut connected,
+                    &mut advertised_dht_nodes,
+                    &mut errors,
+                )?;
+                if connected.len() > connected_before && first_connected_at.is_none() {
+                    first_connected_at = Some(Instant::now());
                 }
             }
             for peer in peer_batch {
@@ -2520,46 +2564,14 @@ impl TorrentSession {
             );
 
             if connected.is_empty() {
-                while let Ok((peer, result)) = connect_receiver.try_recv() {
-                    match result {
-                        Ok(mut connection) => {
-                            self.record_peer_connect_success(id, &peer.address, peer.port)?;
-                            if let Some(dht_port) = connection.take_remote_dht_port() {
-                                pending_dht_nodes.push((peer.address.clone(), dht_port));
-                            }
-                            if let Some(client) =
-                                self.set_peer_client(id, &peer.address, peer.port, &connection.peer_id())?
-                            {
-                                self.log(
-                                    LogLevel::Debug,
-                                    "peer",
-                                    format!("{}:{} identified as {client}", peer.address, peer.port),
-                                    Some(snapshot.id),
-                                );
-                            }
-                            let available = connection.availability().iter().filter(|piece| **piece).count();
-                            self.set_peer_connection(
-                                id,
-                                &peer.address,
-                                peer.port,
-                                &format!("Ready; {available} pieces available"),
-                                None,
-                            )?;
-                            connected.push(ConnectedPeer { peer, connection });
-                        }
-                        Err(err) => {
-                            self.record_peer_failure(id, &peer.address, peer.port)?;
-                            self.set_peer_connection(
-                                id,
-                                &peer.address,
-                                peer.port,
-                                "Error",
-                                Some(err.clone()),
-                            )?;
-                            errors.push(format!("{}:{}: {err}", peer.address, peer.port));
-                        }
-                    }
-                }
+                received += self.drain_peer_connection_results(
+                    id,
+                    snapshot.id,
+                    &connect_receiver,
+                    &mut connected,
+                    &mut pending_dht_nodes,
+                    &mut errors,
+                )?;
             }
 
             if connected.is_empty() {
@@ -2582,6 +2594,25 @@ impl TorrentSession {
                 }
                 if verified.iter().all(|piece| *piece) || connected.is_empty() {
                     break;
+                }
+                let late_connections = self.drain_peer_connection_results(
+                    id,
+                    snapshot.id,
+                    &connect_receiver,
+                    &mut connected,
+                    &mut pending_dht_nodes,
+                    &mut errors,
+                )?;
+                received += late_connections;
+                if late_connections > 0 {
+                    self.log(
+                        LogLevel::Debug,
+                        "peer",
+                        format!(
+                            "admitted {late_connections} late peer connection results into the active batch"
+                        ),
+                        Some(snapshot.id),
+                    );
                 }
                 let missing = verified
                     .iter()
@@ -2723,6 +2754,34 @@ impl TorrentSession {
                     assign_rarest_pieces(&verified, &availability)?
                 };
                 if assignments.iter().all(Vec::is_empty) {
+                    if received < peer_batch.len() {
+                        match connect_receiver.recv_timeout(Duration::from_millis(900)) {
+                            Ok((peer, result)) => {
+                                received += 1;
+                                let connected_before = connected.len();
+                                self.accept_peer_connection_result(
+                                    id,
+                                    snapshot.id,
+                                    peer,
+                                    result,
+                                    &mut connected,
+                                    &mut pending_dht_nodes,
+                                    &mut errors,
+                                )?;
+                                if connected.len() > connected_before {
+                                    self.log(
+                                        LogLevel::Debug,
+                                        "peer",
+                                        "late peer connection can cover stalled piece assignment",
+                                        Some(snapshot.id),
+                                    );
+                                }
+                                continue;
+                            }
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+                        }
+                    }
                     break;
                 }
 
@@ -5426,6 +5485,127 @@ mod tests {
                     .files,
             )
             .expect("parallel output reads"),
+            data
+        );
+
+        fs::remove_dir_all(root).expect("temp dir removes");
+    }
+
+    #[test]
+    fn peer_download_admits_late_connection_when_current_peers_stall() {
+        let root = temp_dir("session-peer-late-connection");
+        let torrent_path = root.join("multi.torrent");
+        let output_dir = root.join("out");
+        let data = b"abcdefghi".to_vec();
+        fs::write(&torrent_path, build_multi_file_torrent(&data)).expect("fixture writes");
+
+        let session = TorrentSession::new(output_dir.clone());
+        let added = session
+            .add(AddTorrentRequest {
+                source: TorrentSource::File(torrent_path.to_string_lossy().into_owned()),
+                destination: Some(output_dir.to_string_lossy().into_owned()),
+                paused: false,
+                overwrite: true,
+                disable_trackers: true,
+                only_files: None,
+                sub_folder: None,
+            })
+            .expect("torrent adds");
+        let id = added.id.expect("torrent has ID");
+        let info_hash = session
+            .torrents
+            .lock()
+            .expect("torrent lock")
+            .iter()
+            .find(|torrent| torrent.id == id)
+            .expect("torrent exists")
+            .info_hash;
+
+        let early_listener = TcpListener::bind("127.0.0.1:0").expect("early peer binds");
+        let early_port = early_listener.local_addr().expect("early peer address").port();
+        let late_listener = TcpListener::bind("127.0.0.1:0").expect("late peer binds");
+        let late_port = late_listener.local_addr().expect("late peer address").port();
+        {
+            let mut torrents = session.torrents.lock().expect("torrent lock");
+            let torrent = torrents
+                .iter_mut()
+                .find(|torrent| torrent.id == id)
+                .expect("torrent exists");
+            for (port, client) in [
+                (early_port, "NovaTorrent partial early seed"),
+                (late_port, "NovaTorrent late complete seed"),
+            ] {
+                torrent.peers.push(PeerInfo {
+                    address: "127.0.0.1".to_string(),
+                    port,
+                    client: Some(client.to_string()),
+                    progress: 0.0,
+                    download_speed: 0,
+                    upload_speed: 0,
+                    connection: "Discovered".to_string(),
+                });
+            }
+        }
+
+        let early_data = data.clone();
+        let early_seed = thread::spawn(move || {
+            peerwire::seed_single_peer(
+                early_listener,
+                PeerSeedPlan {
+                    info_hash,
+                    peer_id: *b"-NV0001-LATEPEER0001",
+                    dht_port: None,
+                    piece_length: 4,
+                    bytes: early_data,
+                    available_pieces: Some(vec![true, false, false]),
+                    disconnect_after_blocks: None,
+                    block_response_delay: None,
+                },
+            )
+            .expect("early peer serves its one piece")
+        });
+        let late_data = data.clone();
+        let late_seed = thread::spawn(move || {
+            let (mut stream, _) = late_listener.accept().expect("late peer accepts");
+            thread::sleep(Duration::from_millis(1_200));
+            let handshake = peerwire::read_incoming_handshake(&mut stream)
+                .expect("late peer reads handshake");
+            peerwire::seed_connected_peer(
+                stream,
+                handshake,
+                PeerSeedPlan {
+                    info_hash,
+                    peer_id: *b"-NV0001-LATEPEER0002",
+                    dht_port: None,
+                    piece_length: 4,
+                    bytes: late_data,
+                    available_pieces: Some(vec![true, true, true]),
+                    disconnect_after_blocks: None,
+                    block_response_delay: None,
+                },
+            )
+            .expect("late peer serves remaining pieces")
+        });
+
+        session
+            .download_from_peers(&id.to_string())
+            .expect("swarm completes after admitting the late peer");
+        assert_eq!(early_seed.join().expect("early peer exits").bytes_uploaded, 4);
+        assert_eq!(late_seed.join().expect("late peer exits").bytes_uploaded, 5);
+        assert_eq!(
+            storage::read_torrent_bytes(
+                &output_dir,
+                "Example",
+                &session
+                    .torrents
+                    .lock()
+                    .expect("torrent lock")
+                    .iter()
+                    .find(|torrent| torrent.id == id)
+                    .expect("torrent exists")
+                    .files,
+            )
+            .expect("late peer output reads"),
             data
         );
 
