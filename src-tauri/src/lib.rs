@@ -63,8 +63,8 @@ struct MediaPlayerLogRequest {
 const MEDIA_STREAM_CHUNK_LIMIT: u64 = 2 * 1024 * 1024;
 const MEDIA_STREAM_WAIT_TIMEOUT: Duration = Duration::from_secs(45);
 const MEDIA_STREAM_WAIT_INTERVAL: Duration = Duration::from_millis(150);
-const MEDIA_STREAM_URGENT_PRIORITY_BYTES: u64 = 8 * 1024 * 1024;
-const MEDIA_STREAM_LOOKAHEAD_PRIORITY_BYTES: u64 = 48 * 1024 * 1024;
+const MEDIA_STREAM_URGENT_PRIORITY_BYTES: u64 = 16 * 1024 * 1024;
+const MEDIA_STREAM_LOOKAHEAD_PRIORITY_BYTES: u64 = 192 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 struct SafeTestTorrent {

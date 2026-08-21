@@ -17,8 +17,8 @@ import type { StreamPriorityStatus, TorrentFileAvailability, TorrentDetails } fr
 import { cn, formatBytes, percent } from "@/lib/utils";
 
 const networkRetryLimit = 12;
-const streamUrgentBytes = 8 * 1024 * 1024;
-const streamLookaheadBytes = 48 * 1024 * 1024;
+const streamUrgentBytes = 16 * 1024 * 1024;
+const streamLookaheadBytes = 192 * 1024 * 1024;
 const mediaErrorSrcNotSupported = 4;
 
 type ViewerParams = {
