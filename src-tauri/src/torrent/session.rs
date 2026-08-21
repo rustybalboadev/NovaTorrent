@@ -489,6 +489,7 @@ struct RuntimeSnapshot {
     files: Vec<TorrentFile>,
     paused: bool,
     finished: bool,
+    seed_ratio_reached: bool,
     metadata_available: bool,
     private: bool,
     trackers_disabled: bool,
@@ -715,7 +716,10 @@ impl TorrentSession {
             .map(|torrents| {
                 torrents
                     .iter()
-                    .filter(|torrent| !torrent.options.paused && !torrent.stats.finished)
+                    .filter(|torrent| {
+                        !torrent.options.paused
+                            && (!torrent.stats.finished || !seed_ratio_reached(torrent))
+                    })
                     .map(|torrent| torrent.id)
                     .collect()
             })
@@ -1699,7 +1703,10 @@ impl TorrentSession {
         match result {
             Ok(()) => {
                 if let Ok(completed) = self.runtime_snapshot(id) {
-                    if completed.finished && !completed.trackers_disabled {
+                    if completed.finished
+                        && !completed.seed_ratio_reached
+                        && !completed.trackers_disabled
+                    {
                         if let Err(err) = self.announce_completion_after_verification(id) {
                             self.log(
                                 LogLevel::Warn,
@@ -1711,7 +1718,7 @@ impl TorrentSession {
                             );
                         }
                     }
-                    if completed.finished && !completed.private {
+                    if completed.finished && !completed.seed_ratio_reached && !completed.private {
                         let _ = self.announce_dht_targets(id, Duration::from_secs(4));
                     }
                 }
@@ -4863,6 +4870,7 @@ impl TorrentSession {
             files: torrent.files.clone(),
             paused: torrent.options.paused,
             finished: torrent.stats.finished,
+            seed_ratio_reached: seed_ratio_reached(torrent),
             metadata_available: !torrent.piece_hashes.is_empty(),
             private: torrent.general.private,
             trackers_disabled: torrent.options.disable_trackers,
@@ -7817,6 +7825,58 @@ mod tests {
             .peers
             .iter()
             .any(|peer| peer.connection == "Uploaded requested blocks"));
+
+        fs::remove_dir_all(root).expect("temp dir removes");
+    }
+
+    #[test]
+    fn completed_torrents_remain_runnable_until_seed_ratio_is_reached() {
+        let root = temp_dir("session-complete-runnable");
+        let torrent_path = root.join("multi.torrent");
+        let output_dir = root.join("out");
+        let data = b"abcdefghi".to_vec();
+        fs::write(&torrent_path, build_multi_file_torrent(&data)).expect("fixture writes");
+
+        let session = TorrentSession::new(output_dir.clone());
+        let added = session
+            .add(AddTorrentRequest {
+                source: TorrentSource::File(torrent_path.to_string_lossy().into_owned()),
+                destination: Some(output_dir.to_string_lossy().into_owned()),
+                paused: false,
+                overwrite: true,
+                disable_trackers: true,
+                only_files: None,
+                sub_folder: None,
+            })
+            .expect("torrent adds");
+        let id = added.id.expect("torrent has ID");
+        let files = {
+            let torrents = session.torrents.lock().expect("torrent lock");
+            torrents
+                .iter()
+                .find(|torrent| torrent.id == id)
+                .expect("torrent exists")
+                .files
+                .clone()
+        };
+        storage::write_torrent_bytes(&output_dir, "Example", &files, &data, true)
+            .expect("complete payload writes");
+        session.recheck(&id.to_string()).expect("stored payload verifies");
+
+        assert_eq!(session.runnable_ids(), vec![id]);
+        session
+            .record_upload(id, None, data.len() as u64)
+            .expect("upload is recorded");
+        assert!(session.runnable_ids().is_empty());
+        assert_eq!(
+            session
+                .details(&id.to_string())
+                .expect("details load")
+                .stats
+                .expect("stats exist")
+                .state,
+            "Seed ratio reached"
+        );
 
         fs::remove_dir_all(root).expect("temp dir removes");
     }
