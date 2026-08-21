@@ -15,7 +15,8 @@ use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
 use crate::torrent::session::{
     AddTorrentRequest, AddTorrentResponse, EmptyJsonResponse, LogEntry, LogLevel, TorrentDetails,
-    TorrentFileHash, TorrentListResponse, TorrentSession, UpdateTorrentOptionsRequest,
+    TorrentFileAvailability, TorrentFileHash, TorrentListResponse, TorrentSession,
+    UpdateTorrentOptionsRequest,
 };
 
 mod torrent;
@@ -755,6 +756,20 @@ async fn hash_torrent_file(
 }
 
 #[tauri::command]
+async fn stream_file_availability(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    file_index: usize,
+) -> Result<TorrentFileAvailability, String> {
+    let session = Arc::clone(&state.session);
+    tauri::async_runtime::spawn_blocking(move || {
+        session.stream_file_availability(&id, file_index)
+    })
+    .await
+    .map_err(|err| format!("file availability worker failed: {err}"))?
+}
+
+#[tauri::command]
 fn open_virustotal_report(sha256: String) -> Result<(), String> {
     if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err("VirusTotal report requires a 64-character SHA-256 hash".to_string());
@@ -1039,6 +1054,7 @@ pub fn run() {
             update_torrent_files,
             update_torrent_options,
             hash_torrent_file,
+            stream_file_availability,
             open_virustotal_report,
             backend_logs,
             open_add_torrent_window

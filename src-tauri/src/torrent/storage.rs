@@ -23,6 +23,12 @@ pub struct StoredTorrentCheck {
     pub complete: bool,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct VerifiedByteRange {
+    pub offset: u64,
+    pub length: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct PartialPieceState {
     version: u32,
@@ -48,6 +54,28 @@ impl PartialPieceStore {
         piece_length: u64,
         piece_hashes: &[[u8; 20]],
     ) -> Result<Self, String> {
+        Self::open_inner(output_root, key, total_length, piece_length, piece_hashes, true)?
+            .ok_or_else(|| "partial store was not created".to_string())
+    }
+
+    pub fn open_existing(
+        output_root: &Path,
+        key: &str,
+        total_length: u64,
+        piece_length: u64,
+        piece_hashes: &[[u8; 20]],
+    ) -> Result<Option<Self>, String> {
+        Self::open_inner(output_root, key, total_length, piece_length, piece_hashes, false)
+    }
+
+    fn open_inner(
+        output_root: &Path,
+        key: &str,
+        total_length: u64,
+        piece_length: u64,
+        piece_hashes: &[[u8; 20]],
+        create_missing: bool,
+    ) -> Result<Option<Self>, String> {
         validate_path_component(key)?;
         if piece_length == 0 {
             return Err("piece length cannot be zero".to_string());
@@ -61,10 +89,15 @@ impl PartialPieceStore {
         }
 
         let store_dir = output_root.join(".novatorrent");
-        fs::create_dir_all(&store_dir)
-            .map_err(|err| format!("could not create partial store directory: {err}"))?;
         let data_path = store_dir.join(format!("{key}.part"));
         let state_path = store_dir.join(format!("{key}.json"));
+        if !create_missing && (!data_path.exists() || !state_path.exists()) {
+            return Ok(None);
+        }
+        if create_missing {
+            fs::create_dir_all(&store_dir)
+                .map_err(|err| format!("could not create partial store directory: {err}"))?;
+        }
         let expected_state = PartialPieceState {
             version: 1,
             total_length,
@@ -83,7 +116,7 @@ impl PartialPieceStore {
             .unwrap_or_else(|| expected_state.clone());
 
         let data_file = fs::OpenOptions::new()
-            .create(true)
+            .create(create_missing)
             .read(true)
             .write(true)
             .open(&data_path)
@@ -93,6 +126,11 @@ impl PartialPieceStore {
             .map_err(|err| format!("could not inspect partial torrent data: {err}"))?
             .len();
         if existing_length != total_length {
+            if !create_missing {
+                return Err(format!(
+                    "partial torrent data length mismatch: expected {total_length}, got {existing_length}"
+                ));
+            }
             data_file
                 .set_len(total_length)
                 .map_err(|err| format!("could not size partial torrent data: {err}"))?;
@@ -108,7 +146,7 @@ impl PartialPieceStore {
         };
         store.recheck_marked_pieces()?;
         store.persist_state()?;
-        Ok(store)
+        Ok(Some(store))
     }
 
     pub fn verified_pieces(&self) -> &[bool] {
@@ -483,6 +521,62 @@ pub fn file_progress_from_pieces(
         file_start = file_end;
     }
     Ok(progress)
+}
+
+pub fn verified_file_ranges_from_pieces(
+    files: &[TorrentFile],
+    file_index: usize,
+    piece_length: u64,
+    pieces: &[bool],
+) -> Result<Vec<VerifiedByteRange>, String> {
+    if piece_length == 0 {
+        return Err("piece length cannot be zero".to_string());
+    }
+    let file = files
+        .get(file_index)
+        .ok_or_else(|| format!("torrent file index is out of range: {file_index}"))?;
+    let file_start = files
+        .iter()
+        .take(file_index)
+        .try_fold(0u64, |total, file| {
+            total
+                .checked_add(file.length)
+                .ok_or_else(|| "file offset overflow".to_string())
+        })?;
+    let file_end = file_start
+        .checked_add(file.length)
+        .ok_or_else(|| "file offset overflow".to_string())?;
+    let total_length = total_file_length(files)?;
+    let mut ranges = Vec::<VerifiedByteRange>::new();
+
+    for (piece_index, verified) in pieces.iter().enumerate() {
+        if !verified {
+            continue;
+        }
+        let piece_start = (piece_index as u64)
+            .checked_mul(piece_length)
+            .ok_or_else(|| "piece offset overflow".to_string())?;
+        let piece_end = piece_start
+            .checked_add(piece_length)
+            .ok_or_else(|| "piece offset overflow".to_string())?
+            .min(total_length);
+        let overlap_start = file_start.max(piece_start);
+        let overlap_end = file_end.min(piece_end);
+        if overlap_start >= overlap_end {
+            continue;
+        }
+        let offset = overlap_start - file_start;
+        let length = overlap_end - overlap_start;
+        if let Some(last) = ranges.last_mut() {
+            if last.offset + last.length == offset {
+                last.length += length;
+                continue;
+            }
+        }
+        ranges.push(VerifiedByteRange { offset, length });
+    }
+
+    Ok(ranges)
 }
 
 pub fn output_path_for_file(

@@ -89,6 +89,17 @@ pub struct TorrentFileHash {
     pub virustotal_url: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct TorrentFileAvailability {
+    pub file_index: usize,
+    pub name: String,
+    pub length: u64,
+    pub verified_bytes: u64,
+    pub complete: bool,
+    pub partial_store_present: bool,
+    pub ranges: Vec<storage::VerifiedByteRange>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DhtMaintenanceSummary {
     pub pinged: usize,
@@ -3483,6 +3494,104 @@ impl TorrentSession {
             size: bytes_read,
             sha256,
             virustotal_url,
+        })
+    }
+
+    pub fn stream_file_availability(
+        &self,
+        id: &str,
+        file_index: usize,
+    ) -> Result<TorrentFileAvailability, String> {
+        let (torrent_id, torrent_name, output_folder, files, file, info_hash, piece_length, piece_hashes, finished) = {
+            let torrents = self.torrents.lock().map_err(|_| "torrent lock poisoned")?;
+            let torrent = torrents
+                .iter()
+                .find(|torrent| torrent.matches_id(id))
+                .ok_or_else(|| format!("torrent not found: {id}"))?;
+            let file = torrent
+                .files
+                .get(file_index)
+                .cloned()
+                .ok_or_else(|| format!("torrent file index is out of range: {file_index}"))?;
+            (
+                torrent.id,
+                torrent.name.clone(),
+                torrent.output_folder.clone(),
+                torrent.files.clone(),
+                file,
+                torrent.info_hash,
+                torrent.general.piece_size,
+                torrent.piece_hashes.clone(),
+                torrent.stats.finished,
+            )
+        };
+        if files.is_empty() || piece_hashes.is_empty() {
+            return Err("torrent metadata is not available yet".to_string());
+        }
+        if !file.included {
+            return Err("unchecked torrent files are not available for streaming".to_string());
+        }
+
+        if finished {
+            let ranges = if file.length == 0 {
+                Vec::new()
+            } else {
+                vec![storage::VerifiedByteRange {
+                    offset: 0,
+                    length: file.length,
+                }]
+            };
+            return Ok(TorrentFileAvailability {
+                file_index,
+                name: file.name,
+                length: file.length,
+                verified_bytes: file.length,
+                complete: true,
+                partial_store_present: false,
+                ranges,
+            });
+        }
+
+        let store_key = sha1::hex(&info_hash);
+        let partial_store = storage::PartialPieceStore::open_existing(
+            &output_folder,
+            &store_key,
+            storage::total_file_length(&files)?,
+            piece_length,
+            &piece_hashes,
+        )?;
+        let pieces = partial_store
+            .as_ref()
+            .map(|store| store.verified_pieces().to_vec())
+            .unwrap_or_else(|| vec![false; piece_hashes.len()]);
+        let ranges = storage::verified_file_ranges_from_pieces(
+            &files,
+            file_index,
+            piece_length,
+            &pieces,
+        )?;
+        let verified_bytes = ranges.iter().map(|range| range.length).sum::<u64>();
+        self.log(
+            LogLevel::Debug,
+            "stream",
+            format!(
+                "file availability for '{}' in '{}': {} verified bytes across {} range(s)",
+                file.name,
+                torrent_name,
+                verified_bytes,
+                ranges.len()
+            ),
+            Some(torrent_id),
+        );
+
+        Ok(TorrentFileAvailability {
+            file_index,
+            name: file.name,
+            length: file.length,
+            verified_bytes,
+            complete: verified_bytes == file.length,
+            partial_store_present: partial_store.is_some(),
+            ranges,
         })
     }
 
@@ -6950,6 +7059,88 @@ mod tests {
             .peers
             .iter()
             .any(|peer| peer.address == "192.168.1.45"));
+        fs::remove_dir_all(root).expect("temp dir removes");
+    }
+
+    #[test]
+    fn stream_file_availability_reports_verified_partial_ranges() {
+        let root = temp_dir("session-stream-ranges");
+        let torrent_path = root.join("multi.torrent");
+        let output_dir = root.join("out");
+        let data = b"abcdefghi";
+        fs::write(&torrent_path, build_multi_file_torrent(data)).expect("fixture writes");
+        let session = TorrentSession::new(root.join("default"));
+        let id = session
+            .add(AddTorrentRequest {
+                source: TorrentSource::File(torrent_path.to_string_lossy().into_owned()),
+                destination: Some(output_dir.to_string_lossy().into_owned()),
+                paused: true,
+                overwrite: true,
+                disable_trackers: true,
+                only_files: None,
+                sub_folder: None,
+            })
+            .expect("torrent adds")
+            .id
+            .expect("id assigned");
+        let (info_hash, piece_hashes) = {
+            let torrents = session.torrents.lock().expect("torrent lock");
+            let torrent = torrents
+                .iter()
+                .find(|torrent| torrent.id == id)
+                .expect("torrent exists");
+            (torrent.info_hash, torrent.piece_hashes.clone())
+        };
+        let mut store = storage::PartialPieceStore::open(
+            &output_dir,
+            &sha1::hex(&info_hash),
+            data.len() as u64,
+            4,
+            &piece_hashes,
+        )
+        .expect("partial store opens");
+        store.write_piece(0, &data[..4]).expect("first piece writes");
+        drop(store);
+
+        let partial = session
+            .stream_file_availability(&id.to_string(), 1)
+            .expect("partial availability loads");
+        assert_eq!(partial.name, "two.bin");
+        assert_eq!(partial.length, 4);
+        assert_eq!(partial.verified_bytes, 1);
+        assert!(!partial.complete);
+        assert!(partial.partial_store_present);
+        assert_eq!(
+            partial.ranges,
+            vec![storage::VerifiedByteRange {
+                offset: 0,
+                length: 1,
+            }]
+        );
+
+        let mut store = storage::PartialPieceStore::open(
+            &output_dir,
+            &sha1::hex(&info_hash),
+            data.len() as u64,
+            4,
+            &piece_hashes,
+        )
+        .expect("partial store reopens");
+        store.write_piece(1, &data[4..8]).expect("second piece writes");
+        drop(store);
+
+        let complete = session
+            .stream_file_availability(&id.to_string(), 1)
+            .expect("complete file availability loads");
+        assert_eq!(complete.verified_bytes, 4);
+        assert!(complete.complete);
+        assert_eq!(
+            complete.ranges,
+            vec![storage::VerifiedByteRange {
+                offset: 0,
+                length: 4,
+            }]
+        );
         fs::remove_dir_all(root).expect("temp dir removes");
     }
 

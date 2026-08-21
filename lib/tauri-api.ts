@@ -7,6 +7,7 @@ import type {
   LogEntry,
   SafeTestTorrent,
   TorrentDetails,
+  TorrentFileAvailability,
   TorrentFileHash,
   TorrentListResponse,
   UpdateTorrentOptionsRequest
@@ -170,6 +171,24 @@ export async function hashTorrentFile(id: string, fileIndex: number): Promise<To
     };
   }
   return invoke<TorrentFileHash>("hash_torrent_file", { id, fileIndex });
+}
+
+export async function streamFileAvailability(id: string, fileIndex: number): Promise<TorrentFileAvailability> {
+  if (!isTauriRuntime()) {
+    const file = mockTorrents[0]?.files?.[fileIndex];
+    const length = file?.length ?? 0;
+    const verified = Math.floor(length * 0.35);
+    return {
+      file_index: fileIndex,
+      name: file?.name ?? "preview-video.mp4",
+      length,
+      verified_bytes: verified,
+      complete: verified === length,
+      partial_store_present: verified > 0,
+      ranges: verified > 0 ? [{ offset: 0, length: verified }] : []
+    };
+  }
+  return invoke<TorrentFileAvailability>("stream_file_availability", { id, fileIndex });
 }
 
 export async function openVirusTotalReport(sha256: string) {

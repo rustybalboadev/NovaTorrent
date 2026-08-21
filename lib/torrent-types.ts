@@ -146,6 +146,21 @@ export type TorrentFileHash = {
   virustotal_url: string;
 };
 
+export type VerifiedByteRange = {
+  offset: number;
+  length: number;
+};
+
+export type TorrentFileAvailability = {
+  file_index: number;
+  name: string;
+  length: number;
+  verified_bytes: number;
+  complete: boolean;
+  partial_store_present: boolean;
+  ranges: VerifiedByteRange[];
+};
+
 export type TorrentRow = {
   id: string;
   name: string;
