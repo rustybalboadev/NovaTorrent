@@ -1,0 +1,130 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Fragment>
+    <DirectoryRef Id="TARGETDIR">
+      <Component Id="NovaTorrentProtocolRegistration" Guid="*">
+        <RegistryValue
+          Root="HKCU"
+          Key="Software\Classes\NovaTorrent.Url.Magnet"
+          Type="string"
+          Value="URL:Magnet Protocol"
+        />
+        <RegistryValue
+          Root="HKCU"
+          Key="Software\Classes\NovaTorrent.Url.Magnet"
+          Name="URL Protocol"
+          Type="string"
+          Value=""
+        />
+        <RegistryValue
+          Root="HKCU"
+          Key="Software\Classes\NovaTorrent.Url.Magnet\DefaultIcon"
+          Type="string"
+          Value="[INSTALLDIR]NovaTorrent.exe,0"
+        />
+        <RegistryValue
+          Root="HKCU"
+          Key="Software\Classes\NovaTorrent.Url.Magnet\shell\open\command"
+          Type="string"
+          Value="&quot;[INSTALLDIR]NovaTorrent.exe&quot; &quot;%1&quot;"
+        />
+
+        <RegistryValue
+          Root="HKCU"
+          Key="Software\Classes\NovaTorrent.Url.NovaTorrent"
+          Type="string"
+          Value="URL:NovaTorrent Protocol"
+        />
+        <RegistryValue
+          Root="HKCU"
+          Key="Software\Classes\NovaTorrent.Url.NovaTorrent"
+          Name="URL Protocol"
+          Type="string"
+          Value=""
+        />
+        <RegistryValue
+          Root="HKCU"
+          Key="Software\Classes\NovaTorrent.Url.NovaTorrent\DefaultIcon"
+          Type="string"
+          Value="[INSTALLDIR]NovaTorrent.exe,0"
+        />
+        <RegistryValue
+          Root="HKCU"
+          Key="Software\Classes\NovaTorrent.Url.NovaTorrent\shell\open\command"
+          Type="string"
+          Value="&quot;[INSTALLDIR]NovaTorrent.exe&quot; &quot;%1&quot;"
+        />
+
+        <RegistryValue
+          Root="HKCU"
+          Key="Software\Classes\novatorrent"
+          Type="string"
+          Value="URL:NovaTorrent Protocol"
+        />
+        <RegistryValue
+          Root="HKCU"
+          Key="Software\Classes\novatorrent"
+          Name="URL Protocol"
+          Type="string"
+          Value=""
+        />
+        <RegistryValue
+          Root="HKCU"
+          Key="Software\Classes\novatorrent\DefaultIcon"
+          Type="string"
+          Value="[INSTALLDIR]NovaTorrent.exe,0"
+        />
+        <RegistryValue
+          Root="HKCU"
+          Key="Software\Classes\novatorrent\shell\open\command"
+          Type="string"
+          Value="&quot;[INSTALLDIR]NovaTorrent.exe&quot; &quot;%1&quot;"
+        />
+
+        <RegistryValue
+          Root="HKCU"
+          Key="Software\NovaTorrent\Capabilities"
+          Name="ApplicationName"
+          Type="string"
+          Value="NovaTorrent"
+        />
+        <RegistryValue
+          Root="HKCU"
+          Key="Software\NovaTorrent\Capabilities"
+          Name="ApplicationDescription"
+          Type="string"
+          Value="Modern BitTorrent client"
+        />
+        <RegistryValue
+          Root="HKCU"
+          Key="Software\NovaTorrent\Capabilities"
+          Name="ApplicationIcon"
+          Type="string"
+          Value="[INSTALLDIR]NovaTorrent.exe,0"
+        />
+        <RegistryValue
+          Root="HKCU"
+          Key="Software\NovaTorrent\Capabilities\UrlAssociations"
+          Name="magnet"
+          Type="string"
+          Value="NovaTorrent.Url.Magnet"
+        />
+        <RegistryValue
+          Root="HKCU"
+          Key="Software\NovaTorrent\Capabilities\UrlAssociations"
+          Name="novatorrent"
+          Type="string"
+          Value="NovaTorrent.Url.NovaTorrent"
+        />
+        <RegistryValue
+          Root="HKCU"
+          Key="Software\RegisteredApplications"
+          Name="NovaTorrent"
+          Type="string"
+          Value="Software\NovaTorrent\Capabilities"
+          KeyPath="yes"
+        />
+      </Component>
+    </DirectoryRef>
+  </Fragment>
+</Wix>

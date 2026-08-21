@@ -1,0 +1,12 @@
+node_modules
+.next
+out
+dist
+target
+src-tauri/target
+.DS_Store
+*.log
+*.local
+.env
+.env.*
+*.torrent
