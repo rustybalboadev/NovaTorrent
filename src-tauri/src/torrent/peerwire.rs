@@ -20,7 +20,11 @@ const MAX_PEER_FRAME_LENGTH: usize = 4 * 1024 * 1024;
 const MAX_METADATA_SIZE: u64 = 8 * 1024 * 1024;
 const LOCAL_UT_METADATA_ID: u8 = 3;
 const LOCAL_UT_PEX_ID: u8 = 4;
-const REQUEST_PIPELINE_DEPTH: usize = 8;
+const DEFAULT_REQUEST_PIPELINE_DEPTH: usize = 8;
+const MIN_REQUEST_PIPELINE_DEPTH: usize = 2;
+const MAX_REQUEST_PIPELINE_DEPTH: usize = 16;
+const FAST_PIECE_TARGET: Duration = Duration::from_millis(750);
+const SLOW_PIECE_TARGET: Duration = Duration::from_secs(4);
 const PEER_READ_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const PEER_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(8);
@@ -256,6 +260,7 @@ pub struct PeerDownloadConnection {
     pex_peers: Vec<peer::PeerInfo>,
     cancelled: Option<Arc<AtomicBool>>,
     download_limiter: Option<BandwidthLimiter>,
+    request_pipeline_depth: usize,
 }
 
 impl PeerDownloadConnection {
@@ -316,9 +321,11 @@ impl PeerDownloadConnection {
                 unavailable.push(piece_plan.index);
                 continue;
             }
+            let piece_started = Instant::now();
             let piece_bytes = match download_piece_pipelined(
                 &mut self.stream,
                 &piece_plan,
+                self.request_pipeline_depth,
                 &mut self.availability,
                 &mut self.choked,
                 self.accept_dht_port,
@@ -327,8 +334,22 @@ impl PeerDownloadConnection {
                 self.cancelled.as_deref(),
                 self.download_limiter.as_ref(),
             ) {
-                Ok(bytes) => bytes,
+                Ok(bytes) => {
+                    self.request_pipeline_depth = adapt_request_pipeline_depth(
+                        self.request_pipeline_depth,
+                        bytes.len(),
+                        piece_started.elapsed(),
+                        false,
+                    );
+                    bytes
+                }
                 Err(err) => {
+                    self.request_pipeline_depth = adapt_request_pipeline_depth(
+                        self.request_pipeline_depth,
+                        piece_plan.length as usize,
+                        piece_started.elapsed(),
+                        true,
+                    );
                     return peer_piece_error(self.peer_id, downloaded, unavailable, err);
                 }
             };
@@ -573,6 +594,7 @@ pub fn connect_peer_for_download_with_limiter(
         pex_peers,
         cancelled: plan.cancelled,
         download_limiter,
+        request_pipeline_depth: DEFAULT_REQUEST_PIPELINE_DEPTH,
     })
 }
 
@@ -1034,6 +1056,7 @@ fn wait_until_unchoked(
 fn download_piece_pipelined(
     stream: &mut TcpStream,
     piece_plan: &piece::PiecePlan,
+    pipeline_depth: usize,
     availability: &mut [bool],
     choked: &mut bool,
     accept_dht_port: bool,
@@ -1045,9 +1068,11 @@ fn download_piece_pipelined(
     let mut piece_bytes = vec![0u8; piece_plan.length as usize];
     let mut next_request = 0usize;
     let mut pending = Vec::<(u32, u32)>::new();
+    let pipeline_depth =
+        pipeline_depth.clamp(MIN_REQUEST_PIPELINE_DEPTH, MAX_REQUEST_PIPELINE_DEPTH);
 
     while next_request < piece_plan.blocks.len() || !pending.is_empty() {
-        while next_request < piece_plan.blocks.len() && pending.len() < REQUEST_PIPELINE_DEPTH {
+        while next_request < piece_plan.blocks.len() && pending.len() < pipeline_depth {
             if let Err(err) = ensure_download_active(cancelled) {
                 cancel_pending_requests(stream, piece_plan.index, &pending);
                 return Err(err);
@@ -1135,6 +1160,28 @@ fn download_piece_pipelined(
     }
 
     Ok(piece_bytes)
+}
+
+fn adapt_request_pipeline_depth(
+    current: usize,
+    bytes: usize,
+    elapsed: Duration,
+    failed: bool,
+) -> usize {
+    let current = current.clamp(MIN_REQUEST_PIPELINE_DEPTH, MAX_REQUEST_PIPELINE_DEPTH);
+    if failed {
+        return (current / 2).max(MIN_REQUEST_PIPELINE_DEPTH);
+    }
+
+    let elapsed_millis = elapsed.as_millis().max(1);
+    let bytes_per_second = (bytes as u128).saturating_mul(1_000) / elapsed_millis;
+    if elapsed <= FAST_PIECE_TARGET || bytes_per_second >= 512 * 1024 {
+        return (current + 2).min(MAX_REQUEST_PIPELINE_DEPTH);
+    }
+    if elapsed >= SLOW_PIECE_TARGET || bytes_per_second < 64 * 1024 {
+        return current.saturating_sub(1).max(MIN_REQUEST_PIPELINE_DEPTH);
+    }
+    current
 }
 
 fn cancel_pending_requests(stream: &mut TcpStream, piece_index: u32, pending: &[(u32, u32)]) {
@@ -1417,6 +1464,26 @@ mod tests {
             .expect_err("cancelled reservation stops")
             .contains("cancelled"));
         assert!(cancelled_at.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn request_pipeline_depth_adapts_to_peer_progress() {
+        assert_eq!(
+            adapt_request_pipeline_depth(8, 512 * 1024, Duration::from_millis(500), false),
+            10
+        );
+        assert_eq!(
+            adapt_request_pipeline_depth(8, 16 * 1024, Duration::from_secs(5), false),
+            7
+        );
+        assert_eq!(
+            adapt_request_pipeline_depth(3, 16 * 1024, Duration::from_millis(20), true),
+            MIN_REQUEST_PIPELINE_DEPTH
+        );
+        assert_eq!(
+            adapt_request_pipeline_depth(99, 512 * 1024, Duration::from_millis(1), false),
+            MAX_REQUEST_PIPELINE_DEPTH
+        );
     }
 
     #[test]
