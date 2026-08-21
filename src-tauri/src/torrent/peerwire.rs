@@ -392,6 +392,8 @@ pub struct PeerSeedPlan {
     pub info_hash: [u8; 20],
     pub peer_id: [u8; 20],
     pub dht_port: Option<u16>,
+    pub enable_pex: bool,
+    pub pex_peers: Vec<peer::PeerInfo>,
     pub piece_length: u64,
     pub bytes: Vec<u8>,
     pub available_pieces: Option<Vec<bool>>,
@@ -421,6 +423,12 @@ pub struct MetadataFetchResult {
     pub info_bytes: Vec<u8>,
     pub pieces_received: usize,
     pub remote_dht_port: Option<u16>,
+}
+
+#[derive(Debug, Default)]
+struct RemotePeerExtensions {
+    dht_port: Option<u16>,
+    ut_pex: Option<u8>,
 }
 
 pub fn download_from_peer(
@@ -741,11 +749,13 @@ pub fn seed_connected_peer_with_gate(
 
     let local_dht_port = plan.dht_port.filter(|port| *port != 0);
     let accept_dht_port = local_dht_port.is_some() && peer::supports_dht(&handshake);
-    let local_handshake = if local_dht_port.is_some() {
-        peer::build_dht_handshake(plan.info_hash, plan.peer_id)
-    } else {
-        peer::build_handshake(plan.info_hash, plan.peer_id)
-    };
+    let accept_pex = plan.enable_pex && peer::supports_extension_protocol(&handshake);
+    let local_handshake = peer::build_feature_handshake(
+        plan.info_hash,
+        plan.peer_id,
+        accept_pex,
+        local_dht_port.is_some(),
+    );
     stream
         .write_all(&local_handshake)
         .map_err(|err| format!("could not send seed handshake: {err}"))?;
@@ -754,8 +764,35 @@ pub fn seed_connected_peer_with_gate(
             .write_all(&peer::build_port(local_dht_port.expect("DHT port is present")))
             .map_err(|err| format!("could not send seed DHT port message: {err}"))?;
     }
+    if accept_pex {
+        let local_extension_handshake =
+            metadata::build_extension_handshake_with_pex(None, None, Some(LOCAL_UT_PEX_ID));
+        stream
+            .write_all(&peer::build_extended_message(0, &local_extension_handshake))
+            .map_err(|err| format!("could not send seed PEX extension handshake: {err}"))?;
+    }
 
-    let mut remote_dht_port = wait_for_interested(&mut stream, accept_dht_port)?;
+    let remote_extensions = wait_for_interested(&mut stream, accept_dht_port, accept_pex)?;
+    let mut remote_dht_port = remote_extensions.dht_port;
+    if accept_pex {
+        if let Some(remote_pex_id) = remote_extensions.ut_pex {
+            if !plan.pex_peers.is_empty() {
+                let pex_peers = plan
+                    .pex_peers
+                    .iter()
+                    .map(|peer| pex::PexPeer {
+                        address: peer.address.clone(),
+                        port: peer.port,
+                        flags: if peer.progress >= 1.0 { 0x02 } else { 0 },
+                    })
+                    .collect::<Vec<_>>();
+                let payload = pex::build_pex_message(&pex_peers, &[])?;
+                stream
+                    .write_all(&peer::build_extended_message(remote_pex_id, &payload))
+                    .map_err(|err| format!("could not send seed PEX message: {err}"))?;
+            }
+        }
+    }
     stream
         .write_all(&peer::build_bitfield(&build_availability_bitfield(&available_pieces)))
         .map_err(|err| format!("could not send seed bitfield: {err}"))?;
@@ -1241,13 +1278,20 @@ pub(crate) fn read_peer_message(stream: &mut TcpStream) -> Result<PeerMessage, S
 fn wait_for_interested(
     stream: &mut TcpStream,
     accept_dht_port: bool,
-) -> Result<Option<u16>, String> {
-    let mut remote_dht_port = None;
+    accept_pex: bool,
+) -> Result<RemotePeerExtensions, String> {
+    let mut remote = RemotePeerExtensions::default();
     loop {
         match read_peer_message(stream)? {
-            PeerMessage::Interested => return Ok(remote_dht_port),
+            PeerMessage::Interested => return Ok(remote),
             PeerMessage::Port { port } if accept_dht_port && port != 0 => {
-                remote_dht_port = Some(port);
+                remote.dht_port = Some(port);
+            }
+            PeerMessage::Extended {
+                extension_id: 0,
+                payload,
+            } if accept_pex => {
+                remote.ut_pex = metadata::parse_extension_handshake(&payload)?.ut_pex;
             }
             PeerMessage::KeepAlive => {}
             PeerMessage::NotInterested => {
@@ -1452,6 +1496,8 @@ mod tests {
                     info_hash,
                     peer_id: server_peer_id,
                     dht_port: None,
+                    enable_pex: false,
+                    pex_peers: Vec::new(),
                     piece_length,
                     bytes: seed_data,
                     available_pieces: None,
@@ -1501,6 +1547,8 @@ mod tests {
                     info_hash,
                     peer_id: *b"-NV0001-DHTSEED00001",
                     dht_port: Some(49002),
+                    enable_pex: false,
+                    pex_peers: Vec::new(),
                     piece_length: seed_data.len() as u64,
                     bytes: seed_data,
                     available_pieces: None,
@@ -1627,6 +1675,104 @@ mod tests {
     }
 
     #[test]
+    fn seed_peer_sends_pex_candidates_to_extension_capable_leecher() {
+        let data = b"seed pex data".to_vec();
+        let info_hash = [9u8; 20];
+        let listener = TcpListener::bind("127.0.0.1:0").expect("PEX seed binds");
+        let port = listener.local_addr().expect("PEX seed address").port();
+        let seed_data = data.clone();
+        let seed = thread::spawn(move || {
+            seed_single_peer(
+                listener,
+                PeerSeedPlan {
+                    info_hash,
+                    peer_id: *b"-NV0001-PEXSEED00002",
+                    dht_port: None,
+                    enable_pex: true,
+                    pex_peers: vec![peer::PeerInfo {
+                        address: "203.0.113.7".to_string(),
+                        port: 6881,
+                        client: None,
+                        progress: 1.0,
+                        download_speed: 0,
+                        upload_speed: 0,
+                        connection: "Known".to_string(),
+                    }],
+                    piece_length: seed_data.len() as u64,
+                    bytes: seed_data,
+                    available_pieces: None,
+                    disconnect_after_blocks: None,
+                    block_response_delay: None,
+                },
+            )
+            .expect("PEX seed exits cleanly")
+        });
+
+        let mut socket = TcpStream::connect(("127.0.0.1", port)).expect("leecher connects");
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("leecher read timeout sets");
+        socket
+            .write_all(&peer::build_feature_handshake(
+                info_hash,
+                *b"-NV0001-PEXLEECH0001",
+                true,
+                false,
+            ))
+            .expect("leecher handshake writes");
+        let mut handshake = [0u8; HANDSHAKE_LEN];
+        socket.read_exact(&mut handshake).expect("seed handshake reads");
+        assert!(peer::supports_extension_protocol(
+            &peer::parse_handshake_full(&handshake).expect("seed handshake parses")
+        ));
+        let PeerMessage::Extended {
+            extension_id: 0,
+            payload,
+        } = read_peer_message(&mut socket).expect("seed extension handshake reads")
+        else {
+            panic!("expected seed extension handshake");
+        };
+        assert_eq!(
+            metadata::parse_extension_handshake(&payload)
+                .expect("seed extension handshake parses")
+                .ut_pex,
+            Some(LOCAL_UT_PEX_ID)
+        );
+        socket
+            .write_all(&peer::build_extended_message(
+                0,
+                &metadata::build_extension_handshake_with_pex(None, None, Some(9)),
+            ))
+            .expect("leecher extension handshake writes");
+        socket
+            .write_all(&peer::build_interested())
+            .expect("leecher interested writes");
+        let PeerMessage::Extended {
+            extension_id,
+            payload,
+        } = read_peer_message(&mut socket).expect("seed PEX message reads")
+        else {
+            panic!("expected seed PEX message");
+        };
+        assert_eq!(extension_id, 9);
+        let pex = pex::parse_pex_message(&payload).expect("seed PEX parses");
+        assert_eq!(pex.added[0].address, "203.0.113.7");
+        assert_eq!(pex.added[0].flags, 0x02);
+        assert!(matches!(
+            read_peer_message(&mut socket).expect("seed bitfield reads"),
+            PeerMessage::Bitfield(_)
+        ));
+        assert!(matches!(
+            read_peer_message(&mut socket).expect("seed unchoke reads"),
+            PeerMessage::Unchoke
+        ));
+        socket
+            .write_all(&peer::build_not_interested())
+            .expect("leecher not interested writes");
+        assert_eq!(seed.join().expect("seed exits").bytes_uploaded, 0);
+    }
+
+    #[test]
     fn dht_port_is_not_exchanged_without_mutual_handshake_support() {
         let data = b"no DHT exchange".to_vec();
         let info_hash = [5u8; 20];
@@ -1640,6 +1786,8 @@ mod tests {
                     info_hash,
                     peer_id: *b"-NV0001-DHTSEED00002",
                     dht_port: Some(49002),
+                    enable_pex: false,
+                    pex_peers: Vec::new(),
                     piece_length: seed_data.len() as u64,
                     bytes: seed_data,
                     available_pieces: None,
@@ -1844,6 +1992,8 @@ mod tests {
                     info_hash,
                     peer_id: *b"-NV0001-PARTIAL00001",
                     dht_port: None,
+                    enable_pex: false,
+                    pex_peers: Vec::new(),
                     piece_length,
                     bytes: seed_data,
                     available_pieces: Some(vec![true, false, true]),

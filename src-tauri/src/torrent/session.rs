@@ -406,6 +406,7 @@ struct IncomingSeedSnapshot {
     total_length: u64,
     piece_length: u64,
     piece_hashes: Vec<[u8; 20]>,
+    peers: Vec<PeerInfo>,
     private: bool,
     paused: bool,
     finished: bool,
@@ -1327,6 +1328,7 @@ impl TorrentSession {
                 total_length: torrent.stats.total_bytes,
                 piece_length: torrent.general.piece_size,
                 piece_hashes: torrent.piece_hashes.clone(),
+                peers: torrent.peers.clone(),
                 private: torrent.general.private,
                 paused: torrent.options.paused,
                 finished: torrent.stats.finished,
@@ -1375,6 +1377,8 @@ impl TorrentSession {
                 dht_port: (!snapshot.private)
                     .then(|| self.dht_port())
                     .filter(|port| *port != 0),
+                enable_pex: !snapshot.private,
+                pex_peers: pex_seed_candidates(&snapshot.peers, remote),
                 piece_length: snapshot.piece_length,
                 bytes,
                 available_pieces: None,
@@ -5148,6 +5152,34 @@ fn merge_peers(existing: &mut Vec<PeerInfo>, next: Vec<PeerInfo>) {
     }
 }
 
+fn pex_seed_candidates(peers: &[PeerInfo], remote: Option<SocketAddr>) -> Vec<PeerInfo> {
+    let mut seen_addresses = HashSet::new();
+    let remote_ip = remote.map(|remote| remote.ip());
+    let mut out = Vec::new();
+    for peer in peers {
+        if out.len() >= 50 || peer.port == 0 {
+            break;
+        }
+        let Ok(address) = peer.address.parse::<std::net::IpAddr>() else {
+            continue;
+        };
+        if !address.is_ipv4()
+            || remote_ip == Some(address)
+            || address.is_unspecified()
+            || address.is_loopback()
+            || address.is_multicast()
+            || matches!(address, std::net::IpAddr::V4(address) if address.is_broadcast() || address.is_private())
+        {
+            continue;
+        }
+        if !seen_addresses.insert(peer.address.clone()) {
+            continue;
+        }
+        out.push(peer.clone());
+    }
+    out
+}
+
 fn merge_dht_announce_targets(
     existing: &mut Vec<DhtAnnounceTarget>,
     next: Vec<DhtAnnounceTarget>,
@@ -5345,6 +5377,8 @@ mod tests {
                     info_hash,
                     peer_id: [21u8; 20],
                     dht_port: None,
+                    enable_pex: false,
+                    pex_peers: Vec::new(),
                     piece_length: fast_data.len() as u64,
                     bytes: fast_data,
                     available_pieces: None,
@@ -5528,6 +5562,8 @@ mod tests {
                     info_hash,
                     peer_id: *b"-NV0001-PARALLEL0001",
                     dht_port: None,
+                    enable_pex: false,
+                    pex_peers: Vec::new(),
                     piece_length: 4,
                     bytes: first_data,
                     available_pieces: Some(vec![true, false, true]),
@@ -5545,6 +5581,8 @@ mod tests {
                     info_hash,
                     peer_id: *b"-NV0001-PARALLEL0002",
                     dht_port: None,
+                    enable_pex: false,
+                    pex_peers: Vec::new(),
                     piece_length: 4,
                     bytes: second_data,
                     available_pieces: Some(vec![true, true, true]),
@@ -5650,6 +5688,8 @@ mod tests {
                     info_hash,
                     peer_id: *b"-NV0001-LATEPEER0001",
                     dht_port: None,
+                    enable_pex: false,
+                    pex_peers: Vec::new(),
                     piece_length: 4,
                     bytes: early_data,
                     available_pieces: Some(vec![true, false, false]),
@@ -5672,6 +5712,8 @@ mod tests {
                     info_hash,
                     peer_id: *b"-NV0001-LATEPEER0002",
                     dht_port: None,
+                    enable_pex: false,
+                    pex_peers: Vec::new(),
                     piece_length: 4,
                     bytes: late_data,
                     available_pieces: Some(vec![true, true, true]),
@@ -5886,6 +5928,8 @@ mod tests {
                     info_hash,
                     peer_id: *b"-NV0001-SEEDER000001",
                     dht_port: None,
+                    enable_pex: false,
+                    pex_peers: Vec::new(),
                     piece_length: 4,
                     bytes: seed_data,
                     available_pieces: None,
@@ -5977,6 +6021,8 @@ mod tests {
                     info_hash,
                     peer_id: *b"-NV0001-PARTIAL00001",
                     dht_port: None,
+                    enable_pex: false,
+                    pex_peers: Vec::new(),
                     piece_length: 4,
                     bytes: first_data,
                     available_pieces: Some(vec![true, true, true]),
@@ -6047,6 +6093,8 @@ mod tests {
                     info_hash,
                     peer_id: *b"-NV0001-PARTIAL00001",
                     dht_port: None,
+                    enable_pex: false,
+                    pex_peers: Vec::new(),
                     piece_length: 4,
                     bytes: second_data,
                     available_pieces: Some(vec![false, true, true]),
@@ -6149,6 +6197,8 @@ mod tests {
                         info_hash,
                         peer_id: *b"-NV0001-SEEDER000001",
                         dht_port: None,
+                        enable_pex: false,
+                        pex_peers: Vec::new(),
                         piece_length: 4,
                         bytes: seed_data,
                         available_pieces: None,
@@ -6472,6 +6522,122 @@ mod tests {
             .peers
             .iter()
             .any(|peer| peer.connection == "Uploaded requested blocks"));
+
+        fs::remove_dir_all(root).expect("temp dir removes");
+    }
+
+    #[test]
+    fn incoming_seed_sends_pex_candidates_to_extension_leecher() {
+        let root = temp_dir("session-incoming-pex");
+        let torrent_path = root.join("multi.torrent");
+        let output_dir = root.join("out");
+        let data = b"abcdefghi".to_vec();
+        fs::write(&torrent_path, build_multi_file_torrent(&data)).expect("fixture writes");
+
+        let session = Arc::new(TorrentSession::new(output_dir.clone()));
+        let added = session
+            .add(AddTorrentRequest {
+                source: TorrentSource::File(torrent_path.to_string_lossy().into_owned()),
+                destination: Some(output_dir.to_string_lossy().into_owned()),
+                paused: false,
+                overwrite: true,
+                disable_trackers: true,
+                only_files: None,
+                sub_folder: None,
+            })
+            .expect("torrent adds");
+        let id = added.id.expect("torrent has ID");
+        let (info_hash, files) = {
+            let torrents = session.torrents.lock().expect("torrent lock");
+            let torrent = torrents
+                .iter()
+                .find(|torrent| torrent.id == id)
+                .expect("torrent exists");
+            (torrent.info_hash, torrent.files.clone())
+        };
+        storage::write_torrent_bytes(&output_dir, "Example", &files, &data, true)
+            .expect("complete payload writes");
+        session.recheck(&id.to_string()).expect("stored payload verifies");
+        {
+            let mut torrents = session.torrents.lock().expect("torrent lock");
+            let torrent = torrents
+                .iter_mut()
+                .find(|torrent| torrent.id == id)
+                .expect("torrent exists");
+            torrent.peers.push(PeerInfo {
+                address: "203.0.113.7".to_string(),
+                port: 6881,
+                client: Some("PEX candidate".to_string()),
+                progress: 1.0,
+                download_speed: 0,
+                upload_speed: 0,
+                connection: "Known".to_string(),
+            });
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("incoming listener binds");
+        let port = listener.local_addr().expect("listener address").port();
+        let server_session = Arc::clone(&session);
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("incoming peer connects");
+            server_session
+                .serve_incoming_peer(stream)
+                .expect("incoming PEX leecher is served")
+        });
+
+        let mut socket = TcpStream::connect(("127.0.0.1", port)).expect("leecher connects");
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("leecher timeout sets");
+        socket
+            .write_all(&peer::build_feature_handshake(
+                info_hash,
+                *b"-NV0001-PEXLEECHR001",
+                true,
+                false,
+            ))
+            .expect("leecher handshake writes");
+        let mut handshake = [0u8; HANDSHAKE_LEN];
+        socket.read_exact(&mut handshake).expect("seed handshake reads");
+        assert!(peer::supports_extension_protocol(
+            &peer::parse_handshake_full(&handshake).expect("seed handshake parses")
+        ));
+        assert!(matches!(
+            read_peer_message_for_test(&mut socket).expect("seed extension handshake reads"),
+            PeerMessage::Extended { extension_id: 0, .. }
+        ));
+        socket
+            .write_all(&peer::build_extended_message(
+                0,
+                &metadata::build_extension_handshake_with_pex(None, None, Some(9)),
+            ))
+            .expect("leecher extension handshake writes");
+        socket
+            .write_all(&peer::build_interested())
+            .expect("leecher interested writes");
+        let PeerMessage::Extended {
+            extension_id,
+            payload,
+        } = read_peer_message_for_test(&mut socket).expect("seed PEX reads")
+        else {
+            panic!("expected PEX message");
+        };
+        assert_eq!(extension_id, 9);
+        let message = crate::torrent::pex::parse_pex_message(&payload).expect("PEX parses");
+        assert_eq!(message.added[0].address, "203.0.113.7");
+        assert_eq!(message.added[0].port, 6881);
+        assert!(matches!(
+            read_peer_message_for_test(&mut socket).expect("seed bitfield reads"),
+            PeerMessage::Bitfield(_)
+        ));
+        assert!(matches!(
+            read_peer_message_for_test(&mut socket).expect("seed unchoke reads"),
+            PeerMessage::Unchoke
+        ));
+        socket
+            .write_all(&peer::build_not_interested())
+            .expect("leecher not interested writes");
+        assert_eq!(server.join().expect("incoming server exits").bytes_uploaded, 0);
 
         fs::remove_dir_all(root).expect("temp dir removes");
     }
