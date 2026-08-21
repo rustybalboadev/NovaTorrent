@@ -36,6 +36,7 @@ const MAX_CONNECTION_LIMIT: usize = 500;
 const MAX_UPLOAD_SLOTS: usize = 4;
 const MAX_INBOUND_PEER_CONNECTIONS: usize = 64;
 const MAX_ENDGAME_PIECES: usize = 8;
+const MAX_PIECES_PER_PEER_ROUND: usize = 4;
 const MIN_RATE_LIMIT: u64 = 1024;
 const MAX_RATE_LIMIT: u64 = 10 * 1024 * 1024 * 1024;
 const TRACKER_ANNOUNCE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(16);
@@ -3035,11 +3036,25 @@ impl TorrentSession {
                     .iter()
                     .map(|peer| peer.connection.availability().to_vec())
                     .collect::<Vec<_>>();
-                let assignments = if snapshot.sequential_download {
+                let mut assignments = if snapshot.sequential_download {
                     assign_sequential_pieces(&verified, &availability)?
                 } else {
                     assign_rarest_pieces(&verified, &availability)?
                 };
+                let assigned_before_limit = assignments.iter().map(Vec::len).sum::<usize>();
+                limit_piece_assignments(&mut assignments, MAX_PIECES_PER_PEER_ROUND);
+                let assigned_after_limit = assignments.iter().map(Vec::len).sum::<usize>();
+                if assigned_after_limit < assigned_before_limit {
+                    self.log(
+                        LogLevel::Debug,
+                        "peer",
+                        format!(
+                            "bounded peer assignment round to {assigned_after_limit}/{assigned_before_limit} pieces across {} peers",
+                            assignments.len()
+                        ),
+                        Some(snapshot.id),
+                    );
+                }
                 if assignments.iter().all(Vec::is_empty) {
                     let fresh_candidates = self.untried_peer_count(id, attempted)?;
                     if fresh_candidates > 0 && refresh_round < MAX_SWARM_REFRESH_ROUNDS {
@@ -4964,6 +4979,15 @@ fn assign_sequential_pieces(
     Ok(assignments)
 }
 
+fn limit_piece_assignments(assignments: &mut [Vec<u32>], max_per_peer: usize) {
+    if max_per_peer == 0 {
+        return;
+    }
+    for pieces in assignments {
+        pieces.truncate(max_per_peer);
+    }
+}
+
 fn delete_torrent_payload_files(
     output_root: &Path,
     torrent_name: &str,
@@ -5565,6 +5589,13 @@ mod tests {
         .expect("assignments build");
 
         assert_eq!(assignments, vec![vec![0], vec![2], vec![1]]);
+    }
+
+    #[test]
+    fn piece_assignment_rounds_are_bounded_per_peer() {
+        let mut assignments = vec![vec![0, 3, 6, 9, 12], vec![1, 4], vec![2, 5, 8, 11]];
+        limit_piece_assignments(&mut assignments, 3);
+        assert_eq!(assignments, vec![vec![0, 3, 6], vec![1, 4], vec![2, 5, 8]]);
     }
 
     #[test]
