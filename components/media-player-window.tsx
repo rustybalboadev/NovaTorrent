@@ -88,6 +88,7 @@ export function MediaPlayerWindow() {
       if (range) {
         retryingForSeekRef.current = false;
         setFetchingSeekPoint(false);
+        setBuffering(false);
       }
       return offset;
     },
@@ -289,6 +290,17 @@ export function MediaPlayerWindow() {
   function handleSeekIntent(video: HTMLVideoElement) {
     rememberTargetTime(video.currentTime);
     shouldResumeRef.current = userWantsPlaybackRef.current || !video.paused;
+    const offset = estimateByteOffset(video.currentTime, video.duration, availability?.length);
+    if (availability && offset != null && isOffsetVerified(availability, offset)) {
+      retryingForSeekRef.current = false;
+      setFetchingSeekPoint(false);
+      setBuffering(false);
+      setTargetReady(true);
+      setTargetOffset(offset);
+      setNearestReadyTime(null);
+      void updateStreamPriorityForTime(video.currentTime, true);
+      return;
+    }
     retryingForSeekRef.current = true;
     setFetchingSeekPoint(true);
     setBuffering(true);
@@ -387,7 +399,10 @@ export function MediaPlayerWindow() {
                   shouldResumeRef.current = false;
                 }}
                 onSeeking={(event) => handleSeekIntent(event.currentTarget)}
-                onSeeked={resumeWhenReady}
+                onSeeked={() => {
+                  updateBufferMetrics();
+                  resumeWhenReady();
+                }}
                 onWaiting={() => {
                   rememberPosition();
                   shouldResumeRef.current = true;
