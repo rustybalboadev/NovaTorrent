@@ -4,6 +4,7 @@ use std::{
     time::Duration,
 };
 
+use native_tls::TlsConnector;
 use crate::torrent::{
     bencode::{self, BencodeNode, BencodeValue},
     peer::{self, PeerInfo},
@@ -75,6 +76,7 @@ pub struct HttpTrackerEndpoint {
     pub host: String,
     pub port: u16,
     pub path_and_query: String,
+    pub use_tls: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,14 +134,7 @@ pub fn announce_http(
         .map_err(|err| format!("could not resolve tracker host: {err}"))?
         .next()
         .ok_or_else(|| "tracker host did not resolve to an address".to_string())?;
-    let mut stream = TcpStream::connect_timeout(&address, HTTP_TRACKER_CONNECT_TIMEOUT)
-        .map_err(|err| format!("could not connect to HTTP tracker: {err}"))?;
-    stream
-        .set_read_timeout(Some(HTTP_TRACKER_READ_TIMEOUT))
-        .map_err(|err| format!("could not set tracker read timeout: {err}"))?;
-    stream
-        .set_write_timeout(Some(HTTP_TRACKER_WRITE_TIMEOUT))
-        .map_err(|err| format!("could not set tracker write timeout: {err}"))?;
+    let mut stream = connect_http_tracker_stream(&endpoint, address)?;
     let request = build_http_tracker_request(&endpoint);
     stream
         .write_all(request.as_bytes())
@@ -328,9 +323,13 @@ pub fn announce_udp(
 }
 
 pub fn parse_http_tracker_url(url: &str) -> Result<HttpTrackerEndpoint, String> {
-    let rest = url
-        .strip_prefix("http://")
-        .ok_or_else(|| "only plain http:// trackers are supported by the manual HTTP tracker client".to_string())?;
+    let (rest, use_tls, default_port) = if let Some(rest) = url.strip_prefix("http://") {
+        (rest, false, 80)
+    } else if let Some(rest) = url.strip_prefix("https://") {
+        (rest, true, 443)
+    } else {
+        return Err("HTTP tracker URL must start with http:// or https://".to_string());
+    };
     let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
     if authority.is_empty() {
         return Err("HTTP tracker URL is missing host".to_string());
@@ -339,7 +338,7 @@ pub fn parse_http_tracker_url(url: &str) -> Result<HttpTrackerEndpoint, String> 
         return Err("HTTP tracker URLs with user info are not supported".to_string());
     }
 
-    let (host, port) = parse_http_authority(authority)?;
+    let (host, port) = parse_http_authority(authority, default_port)?;
     let path_and_query = if path.is_empty() {
         "/".to_string()
     } else {
@@ -349,6 +348,7 @@ pub fn parse_http_tracker_url(url: &str) -> Result<HttpTrackerEndpoint, String> 
         host,
         port,
         path_and_query,
+        use_tls,
     })
 }
 
@@ -419,7 +419,35 @@ pub fn percent_encode_bytes(bytes: &[u8]) -> String {
     out
 }
 
-fn parse_http_authority(authority: &str) -> Result<(String, u16), String> {
+trait TrackerHttpStream: Read + Write {}
+
+impl<T: Read + Write> TrackerHttpStream for T {}
+
+fn connect_http_tracker_stream(
+    endpoint: &HttpTrackerEndpoint,
+    address: std::net::SocketAddr,
+) -> Result<Box<dyn TrackerHttpStream>, String> {
+    let stream = TcpStream::connect_timeout(&address, HTTP_TRACKER_CONNECT_TIMEOUT)
+        .map_err(|err| format!("could not connect to HTTP tracker: {err}"))?;
+    stream
+        .set_read_timeout(Some(HTTP_TRACKER_READ_TIMEOUT))
+        .map_err(|err| format!("could not set tracker read timeout: {err}"))?;
+    stream
+        .set_write_timeout(Some(HTTP_TRACKER_WRITE_TIMEOUT))
+        .map_err(|err| format!("could not set tracker write timeout: {err}"))?;
+    if endpoint.use_tls {
+        let connector = TlsConnector::new()
+            .map_err(|err| format!("could not initialize tracker TLS: {err}"))?;
+        let stream = connector
+            .connect(&endpoint.host, stream)
+            .map_err(|err| format!("could not establish tracker TLS: {err}"))?;
+        Ok(Box::new(stream))
+    } else {
+        Ok(Box::new(stream))
+    }
+}
+
+fn parse_http_authority(authority: &str, default_port: u16) -> Result<(String, u16), String> {
     if authority.starts_with('[') {
         let end = authority
             .find(']')
@@ -429,7 +457,7 @@ fn parse_http_authority(authority: &str) -> Result<(String, u16), String> {
             .strip_prefix(':')
             .map(parse_port)
             .transpose()?
-            .unwrap_or(80);
+            .unwrap_or(default_port);
         return Ok((host, port));
     }
 
@@ -440,7 +468,7 @@ fn parse_http_authority(authority: &str) -> Result<(String, u16), String> {
             }
             Ok((host.to_string(), parse_port(port)?))
         }
-        _ => Ok((authority.to_string(), 80)),
+        _ => Ok((authority.to_string(), default_port)),
     }
 }
 
@@ -450,7 +478,8 @@ fn host_header(endpoint: &HttpTrackerEndpoint) -> String {
     } else {
         endpoint.host.clone()
     };
-    if endpoint.port == 80 {
+    let default_port = if endpoint.use_tls { 443 } else { 80 };
+    if endpoint.port == default_port {
         host
     } else {
         format!("{host}:{}", endpoint.port)
@@ -632,8 +661,24 @@ mod tests {
                 host: "tracker.example".to_string(),
                 port: 8080,
                 path_and_query: "/announce?x=1".to_string(),
+                use_tls: false,
             }
         );
+    }
+
+    #[test]
+    fn parses_https_tracker_url_with_default_port() {
+        let endpoint = parse_http_tracker_url("https://tracker.example/announce").expect("URL parses");
+        assert_eq!(
+            endpoint,
+            HttpTrackerEndpoint {
+                host: "tracker.example".to_string(),
+                port: 443,
+                path_and_query: "/announce".to_string(),
+                use_tls: true,
+            }
+        );
+        assert!(build_http_tracker_request(&endpoint).contains("Host: tracker.example\r\n"));
     }
 
     #[test]

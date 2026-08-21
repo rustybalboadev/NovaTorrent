@@ -9,6 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use native_tls::TlsConnector;
 use serde::{Deserialize, Serialize};
 
 use crate::torrent::{
@@ -39,6 +40,7 @@ pub struct HttpEndpoint {
     pub host: String,
     pub port: u16,
     pub path_and_query: String,
+    pub use_tls: bool,
 }
 
 pub fn initial_statuses(urls: &[String]) -> Vec<WebSeedStatus> {
@@ -226,9 +228,13 @@ pub fn download_torrent_cancellable_with_limiter(
 }
 
 pub fn parse_http_url(url: &str) -> Result<HttpEndpoint, String> {
-    let rest = url
-        .strip_prefix("http://")
-        .ok_or_else(|| "webseed currently supports plain http:// URLs only".to_string())?;
+    let (rest, use_tls, default_port) = if let Some(rest) = url.strip_prefix("http://") {
+        (rest, false, 80)
+    } else if let Some(rest) = url.strip_prefix("https://") {
+        (rest, true, 443)
+    } else {
+        return Err("webseed URL must start with http:// or https://".to_string());
+    };
     let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
     if authority.is_empty() {
         return Err("webseed URL is missing host".to_string());
@@ -236,7 +242,7 @@ pub fn parse_http_url(url: &str) -> Result<HttpEndpoint, String> {
     if authority.contains('@') {
         return Err("webseed URLs with user info are not supported".to_string());
     }
-    let (host, port) = parse_authority(authority)?;
+    let (host, port) = parse_authority(authority, default_port)?;
     let path_and_query = if path.is_empty() {
         "/".to_string()
     } else {
@@ -246,6 +252,7 @@ pub fn parse_http_url(url: &str) -> Result<HttpEndpoint, String> {
         host,
         port,
         path_and_query,
+        use_tls,
     })
 }
 
@@ -327,14 +334,7 @@ fn get_http_body(
         .map_err(|err| format!("could not resolve webseed host: {err}"))?
         .next()
         .ok_or_else(|| "webseed host did not resolve to an address".to_string())?;
-    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(10))
-        .map_err(|err| format!("could not connect to HTTP webseed: {err}"))?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(1)))
-        .map_err(|err| format!("could not set webseed read timeout: {err}"))?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(10)))
-        .map_err(|err| format!("could not set webseed write timeout: {err}"))?;
+    let mut stream = connect_http_webseed_stream(endpoint, address)?;
     let max_response_length = usize::try_from(expected_length)
         .map_err(|_| "webseed file is too large for this platform".to_string())?
         .checked_add(1024 * 1024)
@@ -381,7 +381,35 @@ fn ensure_not_cancelled(cancelled: &AtomicBool) -> Result<(), String> {
     }
 }
 
-fn parse_authority(authority: &str) -> Result<(String, u16), String> {
+trait WebSeedHttpStream: Read + Write {}
+
+impl<T: Read + Write> WebSeedHttpStream for T {}
+
+fn connect_http_webseed_stream(
+    endpoint: &HttpEndpoint,
+    address: std::net::SocketAddr,
+) -> Result<Box<dyn WebSeedHttpStream>, String> {
+    let stream = TcpStream::connect_timeout(&address, Duration::from_secs(10))
+        .map_err(|err| format!("could not connect to HTTP webseed: {err}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .map_err(|err| format!("could not set webseed read timeout: {err}"))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .map_err(|err| format!("could not set webseed write timeout: {err}"))?;
+    if endpoint.use_tls {
+        let connector = TlsConnector::new()
+            .map_err(|err| format!("could not initialize webseed TLS: {err}"))?;
+        let stream = connector
+            .connect(&endpoint.host, stream)
+            .map_err(|err| format!("could not establish webseed TLS: {err}"))?;
+        Ok(Box::new(stream))
+    } else {
+        Ok(Box::new(stream))
+    }
+}
+
+fn parse_authority(authority: &str, default_port: u16) -> Result<(String, u16), String> {
     if authority.starts_with('[') {
         let end = authority
             .find(']')
@@ -391,7 +419,7 @@ fn parse_authority(authority: &str) -> Result<(String, u16), String> {
             .strip_prefix(':')
             .map(parse_port)
             .transpose()?
-            .unwrap_or(80);
+            .unwrap_or(default_port);
         return Ok((host, port));
     }
     match authority.rsplit_once(':') {
@@ -401,7 +429,7 @@ fn parse_authority(authority: &str) -> Result<(String, u16), String> {
             }
             Ok((host.to_string(), parse_port(port)?))
         }
-        _ => Ok((authority.to_string(), 80)),
+        _ => Ok((authority.to_string(), default_port)),
     }
 }
 
@@ -411,7 +439,8 @@ fn host_header(endpoint: &HttpEndpoint) -> String {
     } else {
         endpoint.host.clone()
     };
-    if endpoint.port == 80 {
+    let default_port = if endpoint.use_tls { 443 } else { 80 };
+    if endpoint.port == default_port {
         host
     } else {
         format!("{host}:{}", endpoint.port)
@@ -515,8 +544,24 @@ mod tests {
                 host: "mirror.test".to_string(),
                 port: 8080,
                 path_and_query: "/path/file.bin".to_string(),
+                use_tls: false,
             }
         );
+    }
+
+    #[test]
+    fn parses_https_webseed_url_with_default_port() {
+        let endpoint = parse_http_url("https://mirror.test/path/file.bin").expect("URL parses");
+        assert_eq!(
+            endpoint,
+            HttpEndpoint {
+                host: "mirror.test".to_string(),
+                port: 443,
+                path_and_query: "/path/file.bin".to_string(),
+                use_tls: true,
+            }
+        );
+        assert!(build_http_get_request(&endpoint, None).contains("Host: mirror.test\r\n"));
     }
 
     #[test]
@@ -531,6 +576,7 @@ mod tests {
             host: "mirror.test".to_string(),
             port: 80,
             path_and_query: "/file.bin".to_string(),
+            use_tls: false,
         };
         let request = build_http_get_request(&endpoint, Some((1024, 2047)));
         assert!(request.contains("Range: bytes=1024-2047\r\n"));
@@ -678,6 +724,24 @@ mod tests {
             .iter()
             .find(|url| url.starts_with("http://dl-cdn.alpinelinux.org/alpine/"))
             .expect("fixture includes official Alpine HTTP webseed");
+        download_and_verify_alpine_webseed(&meta, seed);
+    }
+
+    #[test]
+    #[ignore = "downloads the safe Alpine fixture over HTTPS"]
+    fn downloads_alpine_safe_fixture_from_https_webseed() {
+        let bytes = include_bytes!("../../../fixtures/safe/alpine-minirootfs-3.23.3-x86_64.tar.gz.torrent");
+        let meta = Metainfo::from_bytes(bytes).expect("small safe fixture parses");
+        let seed = meta
+            .web_seeds
+            .iter()
+            .find(|url| url.starts_with("http://dl-cdn.alpinelinux.org/alpine/"))
+            .expect("fixture includes official Alpine HTTP webseed");
+        let seed = seed.replacen("http://", "https://", 1);
+        download_and_verify_alpine_webseed(&meta, &seed);
+    }
+
+    fn download_and_verify_alpine_webseed(meta: &Metainfo, seed: &str) {
         let file = meta.files.first().expect("fixture has one file");
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)

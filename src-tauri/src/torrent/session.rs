@@ -2172,7 +2172,7 @@ impl TorrentSession {
             };
             tracker_workers.push(std::thread::spawn(move || {
                 let tracker_started = Instant::now();
-                let result = if url.starts_with("http://") {
+                let result = if url.starts_with("http://") || url.starts_with("https://") {
                     tracker::announce_http(
                         &url,
                         request.info_hash,
@@ -2382,7 +2382,11 @@ impl TorrentSession {
                 .first()
                 .is_some_and(|file| file.components.len() > 1);
         let mut last_error = None;
-        for seed_url in snapshot.web_seeds.iter().filter(|url| url.starts_with("http://")) {
+        for seed_url in snapshot
+            .web_seeds
+            .iter()
+            .filter(|url| url.starts_with("http://") || url.starts_with("https://"))
+        {
             self.set_webseed_state(id, seed_url, "Downloading", None, 0)?;
             match webseed::download_torrent_cancellable_with_limiter(
                 seed_url,
@@ -2420,7 +2424,7 @@ impl TorrentSession {
             }
         }
 
-        Err(last_error.unwrap_or_else(|| "no plain HTTP webseed URLs are available".to_string()))
+        Err(last_error.unwrap_or_else(|| "no HTTP(S) webseed URLs are available".to_string()))
     }
 
     fn accept_peer_connection_result(
