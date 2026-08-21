@@ -41,6 +41,7 @@ const MAX_RATE_LIMIT: u64 = 10 * 1024 * 1024 * 1024;
 const TRACKER_ANNOUNCE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(16);
 const TRACKER_EARLY_PEER_GRACE: Duration = Duration::from_millis(450);
 const MAX_SWARM_REFRESH_ROUNDS: usize = 8;
+const MAX_RUNTIME_RETRY_DELAY: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1675,6 +1676,48 @@ impl TorrentSession {
                 Err(err)
             }
         }
+    }
+
+    pub fn retry_delay_after_runtime_failure(
+        &self,
+        id: &str,
+        error: &str,
+        failure_count: u32,
+    ) -> Option<Duration> {
+        if error == RUN_PAUSED || !recoverable_runtime_error(error) {
+            return None;
+        }
+        let snapshot = self.runtime_snapshot(id).ok()?;
+        if snapshot.paused || snapshot.finished {
+            return None;
+        }
+        let has_retry_source = snapshot.peer_count > 0
+            || snapshot.webseed_count > 0
+            || (!snapshot.trackers_disabled && snapshot.tracker_count > 0)
+            || !snapshot.private;
+        if !has_retry_source {
+            return None;
+        }
+        let seconds = 5u64
+            .saturating_mul(2u64.saturating_pow(failure_count.min(4)))
+            .min(MAX_RUNTIME_RETRY_DELAY.as_secs());
+        Some(Duration::from_secs(seconds))
+    }
+
+    pub fn mark_runtime_retry_scheduled(
+        &self,
+        id: &str,
+        error: &str,
+        delay: Duration,
+    ) -> Result<(), String> {
+        self.set_torrent_state(
+            id,
+            TorrentState::Queued,
+            Some(format!(
+                "recoverable issue; retrying in {} seconds: {error}",
+                delay.as_secs()
+            )),
+        )
     }
 
     fn run_torrent_inner(&self, id: &str) -> Result<(), String> {
@@ -5215,6 +5258,24 @@ fn push_peer_candidates(target: &mut Vec<PeerInfo>, peers: Vec<PeerInfo>, max_co
     }
 }
 
+fn recoverable_runtime_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    [
+        "no peers",
+        "no discovered peers",
+        "all known peer endpoints",
+        "swarm is missing",
+        "all discovered peers failed",
+        "all tracker announces failed",
+        "tracker discovery:",
+        "dht discovery:",
+        "could not resolve magnet metadata",
+        "no peers or supported webseeds are available",
+    ]
+    .iter()
+    .any(|needle| error.contains(needle))
+}
+
 fn peer_key(address: &str, port: u16) -> String {
     format!("{address}|{port}")
 }
@@ -6018,6 +6079,78 @@ mod tests {
             )
             .expect("refreshed peer output reads"),
             data
+        );
+
+        fs::remove_dir_all(root).expect("temp dir removes");
+    }
+
+    #[test]
+    fn runtime_retry_policy_keeps_recoverable_public_torrents_alive() {
+        let root = temp_dir("session-runtime-retry");
+        let torrent_path = root.join("multi.torrent");
+        let output_dir = root.join("out");
+        fs::write(&torrent_path, build_multi_file_torrent(b"abcdefghi")).expect("fixture writes");
+
+        let session = TorrentSession::new(output_dir.clone());
+        let added = session
+            .add(AddTorrentRequest {
+                source: TorrentSource::File(torrent_path.to_string_lossy().into_owned()),
+                destination: Some(output_dir.to_string_lossy().into_owned()),
+                paused: false,
+                overwrite: true,
+                disable_trackers: true,
+                only_files: None,
+                sub_folder: None,
+            })
+            .expect("torrent adds");
+        let id = added.id.expect("torrent has ID").to_string();
+
+        assert_eq!(
+            session.retry_delay_after_runtime_failure(
+                &id,
+                "peer download: swarm is missing 2 pieces",
+                0
+            ),
+            Some(Duration::from_secs(5))
+        );
+        session
+            .mark_runtime_retry_scheduled(
+                &id,
+                "peer download: swarm is missing 2 pieces",
+                Duration::from_secs(5),
+            )
+            .expect("retry state marks");
+        let stats = session
+            .details(&id)
+            .expect("details load")
+            .stats
+            .expect("stats exist");
+        assert_eq!(stats.state, "Queued");
+        assert!(stats
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("retrying in 5 seconds")));
+        assert_eq!(
+            session.retry_delay_after_runtime_failure(
+                &id,
+                "peer download: swarm is missing 2 pieces",
+                8
+            ),
+            Some(MAX_RUNTIME_RETRY_DELAY)
+        );
+
+        session.pause(&id).expect("torrent pauses");
+        assert_eq!(
+            session.retry_delay_after_runtime_failure(
+                &id,
+                "peer download: swarm is missing 2 pieces",
+                0
+            ),
+            None
+        );
+        assert_eq!(
+            session.retry_delay_after_runtime_failure(&id, "existing files are corrupt", 0),
+            None
         );
 
         fs::remove_dir_all(root).expect("temp dir removes");

@@ -23,6 +23,7 @@ mod torrent;
 struct AppState {
     session: Arc<TorrentSession>,
     pending_sources: Mutex<Vec<String>>,
+    active_workers: Arc<Mutex<HashSet<String>>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -55,6 +56,7 @@ impl AppState {
         let state = Self {
             session,
             pending_sources: Mutex::new(pending_sources),
+            active_workers: Arc::new(Mutex::new(HashSet::new())),
         };
         match state.start_peer_listener() {
             Ok(port) => {
@@ -99,14 +101,74 @@ impl AppState {
 
     fn start_torrent_worker(&self, id: String) -> Result<(), String> {
         let session = Arc::clone(&self.session);
+        {
+            let mut active = self
+                .active_workers
+                .lock()
+                .map_err(|_| "torrent worker lock poisoned".to_string())?;
+            if !active.insert(id.clone()) {
+                session.log(
+                    LogLevel::Debug,
+                    "runtime",
+                    "torrent already has an active or scheduled background worker",
+                    id.parse().ok(),
+                );
+                return Ok(());
+            }
+        }
+        let active_workers = Arc::clone(&self.active_workers);
+        let worker_id = id.clone();
+        let worker_id_for_spawn_error = worker_id.clone();
         let thread_label = id.chars().take(12).collect::<String>();
-        thread::Builder::new()
+        match thread::Builder::new()
             .name(format!("novatorrent-{thread_label}"))
             .spawn(move || {
-                let _ = session.run_torrent(&id);
-            })
-            .map(|_| ())
-            .map_err(|err| format!("could not start torrent worker: {err}"))
+                let mut failures = 0u32;
+                loop {
+                    match session.run_torrent(&id) {
+                        Ok(_) => break,
+                        Err(err) => {
+                            let Some(delay) =
+                                session.retry_delay_after_runtime_failure(&id, &err, failures)
+                            else {
+                                break;
+                            };
+                            failures = failures.saturating_add(1);
+                            if let Err(mark_err) =
+                                session.mark_runtime_retry_scheduled(&id, &err, delay)
+                            {
+                                session.log(
+                                    LogLevel::Warn,
+                                    "runtime",
+                                    format!("could not mark torrent retry state: {mark_err}"),
+                                    id.parse().ok(),
+                                );
+                            }
+                            session.log(
+                                LogLevel::Info,
+                                "runtime",
+                                format!(
+                                    "background torrent worker will retry after recoverable failure in {} seconds: {err}",
+                                    delay.as_secs()
+                                ),
+                                id.parse().ok(),
+                            );
+                            thread::sleep(delay);
+                        }
+                    }
+                }
+                if let Ok(mut active) = active_workers.lock() {
+                    active.remove(&worker_id);
+                }
+            }) {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                if let Ok(mut active) = self.active_workers.lock() {
+                    active.remove(&worker_id_for_spawn_error);
+                }
+                Err(format!("could not start torrent worker: {err}"))
+            }
+        }
     }
 
     fn start_peer_listener(&self) -> Result<u16, String> {
