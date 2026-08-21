@@ -3,7 +3,6 @@
 import * as React from "react";
 import * as ContextMenu from "@radix-ui/react-context-menu";
 import * as Dialog from "@radix-ui/react-dialog";
-import { useTheme } from "next-themes";
 import {
   Activity,
   BarChart3,
@@ -32,6 +31,7 @@ import {
 } from "lucide-react";
 import { AddTorrentPanel } from "@/components/add-torrent-panel";
 import { FileTree } from "@/components/file-tree";
+import { useTheme } from "@/components/theme-provider";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";

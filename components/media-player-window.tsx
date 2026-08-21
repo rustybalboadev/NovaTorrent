@@ -31,9 +31,7 @@ type InitialViewerState = {
   error: string | null;
 };
 
-function initialViewerState(): InitialViewerState {
-  if (typeof window === "undefined") return { params: null, error: null };
-  const search = new URLSearchParams(window.location.search);
+function parseViewerParams(search: URLSearchParams): InitialViewerState {
   const id = search.get("id") ?? "";
   const fileIndex = Number(search.get("fileIndex"));
   if (!id || !Number.isInteger(fileIndex) || fileIndex < 0) {
@@ -51,19 +49,18 @@ export function MediaPlayerWindow() {
   const lastPriorityTimeRef = React.useRef(0);
   const retryingForSeekRef = React.useRef(false);
   const retryTimerRef = React.useRef<number | null>(null);
-  const [initialState] = React.useState(initialViewerState);
-  const params = initialState.params;
+  const [params, setParams] = React.useState<ViewerParams | null>(null);
   const [details, setDetails] = React.useState<TorrentDetails | null>(null);
   const [availability, setAvailability] = React.useState<TorrentFileAvailability | null>(null);
   const [priority, setPriority] = React.useState<StreamPriorityStatus | null>(null);
   const [streamUrl, setStreamUrl] = React.useState("");
   const [retryKey, setRetryKey] = React.useState(0);
   const [networkRetries, setNetworkRetries] = React.useState(0);
-  const [busy, setBusy] = React.useState(Boolean(params && !initialState.error));
+  const [busy, setBusy] = React.useState(false);
   const [buffering, setBuffering] = React.useState(false);
   const [fetchingSeekPoint, setFetchingSeekPoint] = React.useState(false);
   const [bufferedAheadSeconds, setBufferedAheadSeconds] = React.useState<number | null>(null);
-  const [error, setError] = React.useState<string | null>(initialState.error);
+  const [error, setError] = React.useState<string | null>(null);
 
   const updateBufferMetrics = React.useCallback(
     (nextAvailability: TorrentFileAvailability | null = availability) => {
@@ -84,6 +81,20 @@ export function MediaPlayerWindow() {
     },
     [availability]
   );
+
+  React.useEffect(() => {
+    let disposed = false;
+    window.queueMicrotask(() => {
+      if (disposed) return;
+      const initialState = parseViewerParams(new URLSearchParams(window.location.search));
+      setParams(initialState.params);
+      setError(initialState.error);
+      setBusy(Boolean(initialState.params && !initialState.error));
+    });
+    return () => {
+      disposed = true;
+    };
+  }, []);
 
   React.useEffect(() => {
     if (!params) return;
