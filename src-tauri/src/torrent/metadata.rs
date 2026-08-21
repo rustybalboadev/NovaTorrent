@@ -8,6 +8,7 @@ pub const UT_METADATA_BLOCK_SIZE: usize = 16 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtensionHandshake {
     pub ut_metadata: Option<u8>,
+    pub ut_pex: Option<u8>,
     pub metadata_size: Option<u64>,
 }
 
@@ -27,7 +28,22 @@ pub struct MetadataMessage {
 }
 
 pub fn build_extension_handshake(ut_metadata_id: u8, metadata_size: Option<u64>) -> Vec<u8> {
-    let mut payload = format!("d1:md11:ut_metadatai{ut_metadata_id}ee").into_bytes();
+    build_extension_handshake_with_pex(Some(ut_metadata_id), metadata_size, None)
+}
+
+pub fn build_extension_handshake_with_pex(
+    ut_metadata_id: Option<u8>,
+    metadata_size: Option<u64>,
+    ut_pex_id: Option<u8>,
+) -> Vec<u8> {
+    let mut payload = b"d1:md".to_vec();
+    if let Some(ut_metadata_id) = ut_metadata_id {
+        payload.extend_from_slice(format!("11:ut_metadatai{ut_metadata_id}e").as_bytes());
+    }
+    if let Some(ut_pex_id) = ut_pex_id {
+        payload.extend_from_slice(format!("6:ut_pexi{ut_pex_id}e").as_bytes());
+    }
+    payload.push(b'e');
     if let Some(metadata_size) = metadata_size {
         payload.extend_from_slice(format!("13:metadata_sizei{metadata_size}e").as_bytes());
     }
@@ -44,6 +60,13 @@ pub fn parse_extension_handshake(payload: &[u8]) -> Result<ExtensionHandshake, S
         .map(u8::try_from)
         .transpose()
         .map_err(|_| "ut_metadata extension id is out of range".to_string())?;
+    let ut_pex = root
+        .dict_get(b"m")
+        .and_then(|m| m.dict_get(b"ut_pex"))
+        .and_then(BencodeNode::as_i64)
+        .map(u8::try_from)
+        .transpose()
+        .map_err(|_| "ut_pex extension id is out of range".to_string())?;
     let metadata_size = root
         .dict_get(b"metadata_size")
         .and_then(BencodeNode::as_i64)
@@ -53,6 +76,7 @@ pub fn parse_extension_handshake(payload: &[u8]) -> Result<ExtensionHandshake, S
 
     Ok(ExtensionHandshake {
         ut_metadata,
+        ut_pex,
         metadata_size,
     })
 }
@@ -129,7 +153,23 @@ mod tests {
             parsed,
             ExtensionHandshake {
                 ut_metadata: Some(3),
+                ut_pex: None,
                 metadata_size: Some(65_000),
+            }
+        );
+    }
+
+    #[test]
+    fn builds_and_parses_extension_handshake_with_pex() {
+        let payload = build_extension_handshake_with_pex(None, None, Some(4));
+        let parsed = parse_extension_handshake(&payload).expect("handshake parses");
+
+        assert_eq!(
+            parsed,
+            ExtensionHandshake {
+                ut_metadata: None,
+                ut_pex: Some(4),
+                metadata_size: None,
             }
         );
     }

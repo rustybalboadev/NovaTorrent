@@ -2261,13 +2261,16 @@ impl TorrentSession {
         connected: &mut Vec<ConnectedPeer>,
         pending_dht_nodes: &mut Vec<(String, u16)>,
         errors: &mut Vec<String>,
-    ) -> Result<(), String> {
+    ) -> Result<usize, String> {
         match result {
             Ok(mut connection) => {
                 self.record_peer_connect_success(id, &peer.address, peer.port)?;
                 if let Some(dht_port) = connection.take_remote_dht_port() {
                     pending_dht_nodes.push((peer.address.clone(), dht_port));
                 }
+                let pex_peers = connection.take_pex_peers();
+                let pex_added =
+                    self.merge_pex_discovered_peers(id, torrent_id, &peer, pex_peers)?;
                 if let Some(client) =
                     self.set_peer_client(id, &peer.address, peer.port, &connection.peer_id())?
                 {
@@ -2287,6 +2290,7 @@ impl TorrentSession {
                     None,
                 )?;
                 connected.push(ConnectedPeer { peer, connection });
+                Ok(pex_added)
             }
             Err(err) => {
                 self.record_peer_failure(id, &peer.address, peer.port)?;
@@ -2298,9 +2302,9 @@ impl TorrentSession {
                     Some(torrent_id),
                 );
                 errors.push(format!("{}:{}: {err}", peer.address, peer.port));
+                Ok(0)
             }
         }
-        Ok(())
     }
 
     fn drain_peer_connection_results(
@@ -2311,11 +2315,12 @@ impl TorrentSession {
         connected: &mut Vec<ConnectedPeer>,
         pending_dht_nodes: &mut Vec<(String, u16)>,
         errors: &mut Vec<String>,
-    ) -> Result<usize, String> {
+    ) -> Result<(usize, usize), String> {
         let mut drained = 0usize;
+        let mut pex_added = 0usize;
         while let Ok((peer, result)) = receiver.try_recv() {
             drained += 1;
-            self.accept_peer_connection_result(
+            pex_added += self.accept_peer_connection_result(
                 id,
                 torrent_id,
                 peer,
@@ -2325,7 +2330,58 @@ impl TorrentSession {
                 errors,
             )?;
         }
-        Ok(drained)
+        Ok((drained, pex_added))
+    }
+
+    fn merge_pex_discovered_peers(
+        &self,
+        id: &str,
+        torrent_id: u64,
+        source: &PeerInfo,
+        peers: Vec<PeerInfo>,
+    ) -> Result<usize, String> {
+        if peers.is_empty() {
+            return Ok(0);
+        }
+        let mut torrents = self.torrents.lock().map_err(|_| "torrent lock poisoned")?;
+        let torrent = torrents
+            .iter_mut()
+            .find(|torrent| torrent.matches_id(id))
+            .ok_or_else(|| format!("torrent not found: {id}"))?;
+        if torrent.general.private {
+            return Ok(0);
+        }
+        let mut known_addresses = torrent
+            .peers
+            .iter()
+            .map(|peer| peer.address.clone())
+            .collect::<HashSet<_>>();
+        let before = torrent.peers.len();
+        let mut accepted = Vec::new();
+        for peer in peers {
+            if peer.address == source.address || peer.port == 0 {
+                continue;
+            }
+            if !known_addresses.insert(peer.address.clone()) {
+                continue;
+            }
+            accepted.push(peer);
+        }
+        merge_peers(&mut torrent.peers, accepted);
+        let added = torrent.peers.len().saturating_sub(before);
+        drop(torrents);
+        if added > 0 {
+            self.log(
+                LogLevel::Debug,
+                "pex",
+                format!(
+                    "accepted {added} PEX peer candidates from {}:{}",
+                    source.address, source.port
+                ),
+                Some(torrent_id),
+            );
+        }
+        Ok(added)
     }
 
     pub fn download_from_peers(&self, id: &str) -> Result<EmptyJsonResponse, String> {
@@ -2445,6 +2501,7 @@ impl TorrentSession {
         }
         let mut errors = Vec::new();
         let mut pending_dht_nodes = Vec::new();
+        let mut pex_candidates_added = 0usize;
         for peer_batch in snapshot
             .peers
             .chunks(snapshot.max_connections.min(MAX_PARALLEL_PEERS))
@@ -2468,6 +2525,7 @@ impl TorrentSession {
                     dht_port: (!snapshot.private)
                         .then(|| self.dht_port())
                         .filter(|port| *port != 0),
+                    enable_pex: !snapshot.private,
                     total_length: snapshot.total_length,
                     piece_length: snapshot.piece_length,
                     piece_hashes: snapshot.piece_hashes.clone(),
@@ -2523,7 +2581,7 @@ impl TorrentSession {
                 received += 1;
                 settled_peers.insert((peer.address.clone(), peer.port));
                 let connected_before = connected.len();
-                self.accept_peer_connection_result(
+                pex_candidates_added += self.accept_peer_connection_result(
                     id,
                     snapshot.id,
                     peer,
@@ -2573,7 +2631,7 @@ impl TorrentSession {
             );
 
             if connected.is_empty() {
-                received += self.drain_peer_connection_results(
+                let (drained, pex_added) = self.drain_peer_connection_results(
                     id,
                     snapshot.id,
                     &connect_receiver,
@@ -2581,6 +2639,8 @@ impl TorrentSession {
                     &mut pending_dht_nodes,
                     &mut errors,
                 )?;
+                received += drained;
+                pex_candidates_added += pex_added;
             }
 
             if connected.is_empty() {
@@ -2604,7 +2664,7 @@ impl TorrentSession {
                 if verified.iter().all(|piece| *piece) || connected.is_empty() {
                     break;
                 }
-                let late_connections = self.drain_peer_connection_results(
+                let (late_connections, pex_added) = self.drain_peer_connection_results(
                     id,
                     snapshot.id,
                     &connect_receiver,
@@ -2613,6 +2673,7 @@ impl TorrentSession {
                     &mut errors,
                 )?;
                 received += late_connections;
+                pex_candidates_added += pex_added;
                 if late_connections > 0 {
                     self.log(
                         LogLevel::Debug,
@@ -2768,7 +2829,7 @@ impl TorrentSession {
                             Ok((peer, result)) => {
                                 received += 1;
                                 let connected_before = connected.len();
-                                self.accept_peer_connection_result(
+                                pex_candidates_added += self.accept_peer_connection_result(
                                     id,
                                     snapshot.id,
                                     peer,
@@ -2825,6 +2886,13 @@ impl TorrentSession {
                         advertised_dht_nodes
                             .push((connected_peer.peer.address.clone(), dht_port));
                     }
+                    let pex_peers = connected_peer.connection.take_pex_peers();
+                    pex_candidates_added += self.merge_pex_discovered_peers(
+                        id,
+                        snapshot.id,
+                        &connected_peer.peer,
+                        pex_peers,
+                    )?;
                     let peer = &connected_peer.peer;
                     let mut contributed_bytes = 0u64;
                     let mut contributed_pieces = 0usize;
@@ -2908,6 +2976,22 @@ impl TorrentSession {
                 self.verify_peer_dht_nodes(pending_dht_nodes, snapshot.id);
             }
             return Ok(EmptyJsonResponse {});
+        }
+
+        if pex_candidates_added > 0 {
+            self.log(
+                LogLevel::Info,
+                "pex",
+                format!(
+                    "peer path learned {pex_candidates_added} PEX candidates; retrying swarm scheduling before failing"
+                ),
+                Some(snapshot.id),
+            );
+            if !pending_dht_nodes.is_empty() {
+                self.verify_peer_dht_nodes(pending_dht_nodes, snapshot.id);
+            }
+            drop(partial_store);
+            return self.download_from_peers(id);
         }
 
         let missing = verified.iter().filter(|piece| !**piece).count();
@@ -5144,6 +5228,7 @@ mod tests {
         metadata::{self, MetadataMessageType},
         peer::{self, PeerMessage, HANDSHAKE_LEN},
         peerwire::{PeerDownloadPlan, PeerSeedPlan},
+        pex::PexPeer,
         sha1,
     };
 
@@ -5311,6 +5396,7 @@ mod tests {
             info_hash,
             peer_id: [23u8; 20],
             dht_port: None,
+            enable_pex: false,
             total_length: data.len() as u64,
             piece_length: data.len() as u64,
             piece_hashes: vec![sha1::digest(&data)],
@@ -5617,6 +5703,134 @@ mod tests {
             .expect("late peer output reads"),
             data
         );
+
+        fs::remove_dir_all(root).expect("temp dir removes");
+    }
+
+    #[test]
+    fn peer_download_records_pex_candidates_from_connected_peer() {
+        let root = temp_dir("session-peer-pex");
+        let torrent_path = root.join("multi.torrent");
+        let output_dir = root.join("out");
+        let data = b"abcdefghi".to_vec();
+        fs::write(&torrent_path, build_multi_file_torrent(&data)).expect("fixture writes");
+
+        let session = TorrentSession::new(output_dir.clone());
+        let added = session
+            .add(AddTorrentRequest {
+                source: TorrentSource::File(torrent_path.to_string_lossy().into_owned()),
+                destination: Some(output_dir.to_string_lossy().into_owned()),
+                paused: false,
+                overwrite: true,
+                disable_trackers: true,
+                only_files: None,
+                sub_folder: None,
+            })
+            .expect("torrent adds");
+        let id = added.id.expect("torrent has ID");
+        let info_hash = session
+            .torrents
+            .lock()
+            .expect("torrent lock")
+            .iter()
+            .find(|torrent| torrent.id == id)
+            .expect("torrent exists")
+            .info_hash;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("PEX seed binds");
+        let port = listener.local_addr().expect("PEX seed address").port();
+        {
+            let mut torrents = session.torrents.lock().expect("torrent lock");
+            let torrent = torrents
+                .iter_mut()
+                .find(|torrent| torrent.id == id)
+                .expect("torrent exists");
+            torrent.peers.push(PeerInfo {
+                address: "127.0.0.1".to_string(),
+                port,
+                client: Some("NovaTorrent PEX seed".to_string()),
+                progress: 0.0,
+                download_speed: 0,
+                upload_speed: 0,
+                connection: "Discovered".to_string(),
+            });
+        }
+
+        let server_data = data.clone();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("PEX client connects");
+            let mut handshake = [0u8; HANDSHAKE_LEN];
+            socket.read_exact(&mut handshake).expect("client handshake reads");
+            assert!(peer::supports_extension_protocol(
+                &peer::parse_handshake_full(&handshake).expect("client handshake parses")
+            ));
+            socket
+                .write_all(&peer::build_extended_handshake(
+                    info_hash,
+                    *b"-NV0001-SESSIONPEX01",
+                ))
+                .expect("server extension handshake writes");
+            let PeerMessage::Extended {
+                extension_id: 0,
+                payload,
+            } = read_peer_message_for_test(&mut socket).expect("client extension handshake reads")
+            else {
+                panic!("expected extension handshake");
+            };
+            assert_eq!(
+                metadata::parse_extension_handshake(&payload)
+                    .expect("extension handshake parses")
+                    .ut_pex,
+                Some(4)
+            );
+            assert!(matches!(
+                read_peer_message_for_test(&mut socket).expect("interested reads"),
+                PeerMessage::Interested
+            ));
+            let payload = crate::torrent::pex::build_pex_message(
+                &[PexPeer {
+                    address: "203.0.113.7".to_string(),
+                    port: 6881,
+                    flags: 0x10,
+                }],
+                &[],
+            )
+            .expect("PEX payload builds");
+            socket
+                .write_all(&peer::build_extended_message(4, &payload))
+                .expect("PEX message writes");
+            socket
+                .write_all(&peer::build_bitfield(&[0b1110_0000]))
+                .expect("bitfield writes");
+            socket.write_all(&peer::build_unchoke()).expect("unchoke writes");
+            for _ in 0..3 {
+                let PeerMessage::Request {
+                    index,
+                    begin,
+                    length,
+                } = read_peer_message_for_test(&mut socket).expect("request reads")
+                else {
+                    panic!("expected request");
+                };
+                let start = index as usize * 4 + begin as usize;
+                let end = (start + length as usize).min(server_data.len());
+                socket
+                    .write_all(&peer::build_piece(index, begin, &server_data[start..end]))
+                    .expect("piece writes");
+            }
+        });
+
+        session
+            .download_from_peers(&id.to_string())
+            .expect("PEX seed download completes");
+        server.join().expect("PEX seed exits");
+        let details = session.details(&id.to_string()).expect("details load");
+        assert!(details.peers.iter().any(|peer| {
+            peer.address == "203.0.113.7"
+                && peer.port == 6881
+                && peer.connection == "PEX discovered"
+        }));
+        assert_eq!(fs::read(output_dir.join("Example").join("dir").join("one.bin")).expect("file reads"), b"abc");
 
         fs::remove_dir_all(root).expect("temp dir removes");
     }
@@ -6237,6 +6451,7 @@ mod tests {
                 info_hash,
                 peer_id: *b"-NV0001-LEECHER00001",
                 dht_port: None,
+                enable_pex: false,
                 total_length: data.len() as u64,
                 piece_length: 4,
                 piece_hashes,
@@ -6358,6 +6573,7 @@ mod tests {
                 info_hash,
                 peer_id: *b"-NV0001-SEEDRATIO001",
                 dht_port: None,
+                enable_pex: false,
                 total_length: data.len() as u64,
                 piece_length: 4,
                 piece_hashes,

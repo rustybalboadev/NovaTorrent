@@ -5,6 +5,7 @@ pub mod metainfo;
 pub mod metadata;
 pub mod peer;
 pub mod peerwire;
+pub mod pex;
 pub mod piece;
 pub mod session;
 pub mod sha1;

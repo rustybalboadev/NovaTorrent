@@ -12,12 +12,14 @@ use std::{
 use crate::torrent::{
     metadata::{self, MetadataMessageType},
     peer::{self, PeerMessage, HANDSHAKE_LEN},
+    pex,
     piece,
 };
 
 const MAX_PEER_FRAME_LENGTH: usize = 4 * 1024 * 1024;
 const MAX_METADATA_SIZE: u64 = 8 * 1024 * 1024;
 const LOCAL_UT_METADATA_ID: u8 = 3;
+const LOCAL_UT_PEX_ID: u8 = 4;
 const REQUEST_PIPELINE_DEPTH: usize = 8;
 const PEER_READ_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -215,6 +217,7 @@ pub struct PeerDownloadPlan {
     pub info_hash: [u8; 20],
     pub peer_id: [u8; 20],
     pub dht_port: Option<u16>,
+    pub enable_pex: bool,
     pub total_length: u64,
     pub piece_length: u64,
     pub piece_hashes: Vec<[u8; 20]>,
@@ -250,6 +253,7 @@ pub struct PeerDownloadConnection {
     choked: bool,
     accept_dht_port: bool,
     remote_dht_port: Option<u16>,
+    pex_peers: Vec<peer::PeerInfo>,
     cancelled: Option<Arc<AtomicBool>>,
     download_limiter: Option<BandwidthLimiter>,
 }
@@ -265,6 +269,10 @@ impl PeerDownloadConnection {
 
     pub fn take_remote_dht_port(&mut self) -> Option<u16> {
         self.remote_dht_port.take()
+    }
+
+    pub fn take_pex_peers(&mut self) -> Vec<peer::PeerInfo> {
+        std::mem::take(&mut self.pex_peers)
     }
 
     pub fn download_pieces(&mut self, wanted_pieces: &[u32]) -> PeerPieceDownloadResult {
@@ -298,6 +306,7 @@ impl PeerDownloadConnection {
                     &mut self.choked,
                     self.accept_dht_port,
                     &mut self.remote_dht_port,
+                    &mut self.pex_peers,
                     self.cancelled.as_deref(),
                 ) {
                     return peer_piece_error(self.peer_id, downloaded, unavailable, err);
@@ -314,6 +323,7 @@ impl PeerDownloadConnection {
                 &mut self.choked,
                 self.accept_dht_port,
                 &mut self.remote_dht_port,
+                &mut self.pex_peers,
                 self.cancelled.as_deref(),
                 self.download_limiter.as_ref(),
             ) {
@@ -494,11 +504,12 @@ pub fn connect_peer_for_download_with_limiter(
         .set_write_timeout(Some(Duration::from_secs(10)))
         .map_err(|err| format!("could not set peer write timeout: {err}"))?;
 
-    let local_handshake = if local_dht_port.is_some() {
-        peer::build_dht_handshake(plan.info_hash, plan.peer_id)
-    } else {
-        peer::build_handshake(plan.info_hash, plan.peer_id)
-    };
+    let local_handshake = peer::build_feature_handshake(
+        plan.info_hash,
+        plan.peer_id,
+        plan.enable_pex,
+        local_dht_port.is_some(),
+    );
     stream
         .write_all(&local_handshake)
         .map_err(|err| format!("could not send peer handshake: {err}"))?;
@@ -515,6 +526,14 @@ pub fn connect_peer_for_download_with_limiter(
             .write_all(&peer::build_port(local_dht_port.expect("DHT port is present")))
             .map_err(|err| format!("could not send DHT port message: {err}"))?;
     }
+    let accept_pex = plan.enable_pex && peer::supports_extension_protocol(&handshake);
+    if accept_pex {
+        let local_extension_handshake =
+            metadata::build_extension_handshake_with_pex(None, None, Some(LOCAL_UT_PEX_ID));
+        stream
+            .write_all(&peer::build_extended_message(0, &local_extension_handshake))
+            .map_err(|err| format!("could not send PEX extension handshake: {err}"))?;
+    }
 
     stream
         .write_all(&peer::build_interested())
@@ -524,12 +543,14 @@ pub fn connect_peer_for_download_with_limiter(
     let mut availability = vec![false; pieces.len()];
     let mut choked = true;
     let mut remote_dht_port = None;
+    let mut pex_peers = Vec::new();
     wait_until_unchoked(
         &mut stream,
         &mut availability,
         &mut choked,
         accept_dht_port,
         &mut remote_dht_port,
+        &mut pex_peers,
         plan.cancelled.as_deref(),
     )?;
 
@@ -541,6 +562,7 @@ pub fn connect_peer_for_download_with_limiter(
         choked,
         accept_dht_port,
         remote_dht_port,
+        pex_peers,
         cancelled: plan.cancelled,
         download_limiter,
     })
@@ -954,6 +976,7 @@ fn wait_until_unchoked(
     choked: &mut bool,
     accept_dht_port: bool,
     remote_dht_port: &mut Option<u16>,
+    pex_peers: &mut Vec<peer::PeerInfo>,
     cancelled: Option<&AtomicBool>,
 ) -> Result<(), String> {
     while *choked {
@@ -965,6 +988,7 @@ fn wait_until_unchoked(
             choked,
             accept_dht_port,
             remote_dht_port,
+            pex_peers,
         )?;
     }
     Ok(())
@@ -977,6 +1001,7 @@ fn download_piece_pipelined(
     choked: &mut bool,
     accept_dht_port: bool,
     remote_dht_port: &mut Option<u16>,
+    pex_peers: &mut Vec<peer::PeerInfo>,
     cancelled: Option<&AtomicBool>,
     download_limiter: Option<&BandwidthLimiter>,
 ) -> Result<Vec<u8>, String> {
@@ -1064,6 +1089,7 @@ fn download_piece_pipelined(
                 choked,
                 accept_dht_port,
                 remote_dht_port,
+                pex_peers,
             )?,
         }
         if *choked {
@@ -1080,12 +1106,24 @@ fn cancel_pending_requests(stream: &mut TcpStream, piece_index: u32, pending: &[
     }
 }
 
+fn merge_pex_peers(existing: &mut Vec<peer::PeerInfo>, next: Vec<peer::PeerInfo>) {
+    for peer in next {
+        let duplicate = existing
+            .iter()
+            .any(|current| current.address == peer.address);
+        if !duplicate {
+            existing.push(peer);
+        }
+    }
+}
+
 fn update_peer_state(
     message: PeerMessage,
     availability: &mut [bool],
     choked: &mut bool,
     accept_dht_port: bool,
     remote_dht_port: &mut Option<u16>,
+    pex_peers: &mut Vec<peer::PeerInfo>,
 ) -> Result<(), String> {
     match message {
         PeerMessage::KeepAlive => {}
@@ -1101,6 +1139,13 @@ fn update_peer_state(
         PeerMessage::Piece { .. } => {}
         PeerMessage::Port { port } if accept_dht_port && port != 0 => {
             *remote_dht_port = Some(port);
+        }
+        PeerMessage::Extended {
+            extension_id,
+            payload,
+        } if extension_id == LOCAL_UT_PEX_ID => {
+            let message = pex::parse_pex_message(&payload)?;
+            merge_pex_peers(pex_peers, pex::pex_peers_to_peer_info(&message.added));
         }
         PeerMessage::Interested
         | PeerMessage::NotInterested
@@ -1281,7 +1326,7 @@ mod tests {
     use super::*;
     use std::thread;
 
-    use crate::torrent::{metadata::MetadataMessageType, sha1};
+    use crate::torrent::{metadata::MetadataMessageType, pex::PexPeer, sha1};
 
     #[test]
     fn applies_bitfield_high_bit_first() {
@@ -1424,6 +1469,7 @@ mod tests {
                 info_hash,
                 peer_id: client_peer_id,
                 dht_port: None,
+                enable_pex: false,
                 total_length: data.len() as u64,
                 piece_length,
                 piece_hashes: hashes,
@@ -1472,6 +1518,7 @@ mod tests {
                 info_hash,
                 peer_id: *b"-NV0001-DHTCLIENT001",
                 dht_port: Some(49001),
+                enable_pex: false,
                 total_length: data.len() as u64,
                 piece_length: data.len() as u64,
                 piece_hashes: vec![sha1::digest(&data)],
@@ -1487,6 +1534,96 @@ mod tests {
 
         let seed_result = seed.join().expect("seed exits");
         assert_eq!(seed_result.remote_dht_port, Some(49001));
+    }
+
+    #[test]
+    fn peer_download_collects_pex_peers_from_extension_messages() {
+        let data = b"pex extension data".to_vec();
+        let info_hash = [4u8; 20];
+        let listener = TcpListener::bind("127.0.0.1:0").expect("PEX peer binds");
+        let port = listener.local_addr().expect("PEX peer address").port();
+        let server_data = data.clone();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("PEX client connects");
+            let mut handshake = [0u8; HANDSHAKE_LEN];
+            socket.read_exact(&mut handshake).expect("client handshake reads");
+            assert!(peer::supports_extension_protocol(
+                &peer::parse_handshake_full(&handshake).expect("client handshake parses")
+            ));
+            socket
+                .write_all(&peer::build_extended_handshake(
+                    info_hash,
+                    *b"-NV0001-PEXSEED00001",
+                ))
+                .expect("server extension handshake writes");
+            let PeerMessage::Extended {
+                extension_id: 0,
+                payload,
+            } = read_peer_message(&mut socket).expect("client extension handshake reads")
+            else {
+                panic!("expected extension handshake");
+            };
+            assert_eq!(
+                metadata::parse_extension_handshake(&payload)
+                    .expect("client extension handshake parses")
+                    .ut_pex,
+                Some(LOCAL_UT_PEX_ID)
+            );
+            assert!(matches!(
+                read_peer_message(&mut socket).expect("interested reads"),
+                PeerMessage::Interested
+            ));
+            let pex_payload = pex::build_pex_message(
+                &[PexPeer {
+                    address: "203.0.113.7".to_string(),
+                    port: 6881,
+                    flags: 0x10,
+                }],
+                &[],
+            )
+            .expect("PEX payload builds");
+            socket
+                .write_all(&peer::build_extended_message(LOCAL_UT_PEX_ID, &pex_payload))
+                .expect("PEX message writes");
+            socket
+                .write_all(&peer::build_bitfield(&[0b1000_0000]))
+                .expect("bitfield writes");
+            socket.write_all(&peer::build_unchoke()).expect("unchoke writes");
+            let PeerMessage::Request {
+                index,
+                begin,
+                length,
+            } = read_peer_message(&mut socket).expect("request reads")
+            else {
+                panic!("expected request");
+            };
+            assert_eq!((index, begin, length), (0, 0, server_data.len() as u32));
+            socket
+                .write_all(&peer::build_piece(0, 0, &server_data))
+                .expect("piece writes");
+        });
+
+        let mut connection = connect_peer_for_download(
+            "127.0.0.1",
+            port,
+            PeerDownloadPlan {
+                info_hash,
+                peer_id: *b"-NV0001-PEXCLIENT001",
+                dht_port: None,
+                enable_pex: true,
+                total_length: data.len() as u64,
+                piece_length: data.len() as u64,
+                piece_hashes: vec![sha1::digest(&data)],
+                cancelled: None,
+            },
+        )
+        .expect("PEX-capable peer connects");
+        assert_eq!(connection.take_pex_peers()[0].address, "203.0.113.7");
+        let result = connection.download_pieces(&[0]);
+        assert!(result.error.is_none());
+        assert_eq!(result.pieces[0].bytes, data);
+        drop(connection);
+        server.join().expect("PEX peer exits");
     }
 
     #[test]
@@ -1520,6 +1657,7 @@ mod tests {
                 info_hash,
                 peer_id: *b"-NV0001-NODHTCLIENT1",
                 dht_port: None,
+                enable_pex: false,
                 total_length: data.len() as u64,
                 piece_length: data.len() as u64,
                 piece_hashes: vec![sha1::digest(&data)],
@@ -1603,6 +1741,7 @@ mod tests {
                 info_hash,
                 peer_id: *b"-NV0001-PIPECLIENT01",
                 dht_port: None,
+                enable_pex: false,
                 total_length: data.len() as u64,
                 piece_length: data.len() as u64,
                 piece_hashes: vec![sha1::digest(&data)],
@@ -1669,6 +1808,7 @@ mod tests {
                 info_hash,
                 peer_id: *b"-NV0001-PIPECLIENT02",
                 dht_port: None,
+                enable_pex: false,
                 total_length: data.len() as u64,
                 piece_length: data.len() as u64,
                 piece_hashes: vec![sha1::digest(&data)],
@@ -1721,6 +1861,7 @@ mod tests {
                 info_hash,
                 peer_id: *b"-NV0001-CLIENT000001",
                 dht_port: None,
+                enable_pex: false,
                 total_length: data.len() as u64,
                 piece_length,
                 piece_hashes: hashes,
@@ -1752,6 +1893,7 @@ mod tests {
                 info_hash: [1; 20],
                 peer_id: *b"-NV0001-CANCEL000001",
                 dht_port: None,
+                enable_pex: false,
                 total_length: 1,
                 piece_length: 1,
                 piece_hashes: vec![sha1::digest(b"x")],
