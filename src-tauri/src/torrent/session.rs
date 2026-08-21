@@ -341,6 +341,7 @@ struct PeerDownloadSnapshot {
     cancelled: Arc<AtomicBool>,
     candidate_peers: usize,
     deferred_for_backoff: usize,
+    deferred_for_duplicate_ip: usize,
 }
 
 struct ConnectedPeer {
@@ -2141,6 +2142,7 @@ impl TorrentSession {
                 peers,
                 candidate_peers,
                 deferred_for_backoff,
+                deferred_for_duplicate_ip,
             } = schedule_peers_for_download(torrent, max_connections);
             PeerDownloadSnapshot {
                 id: torrent.id,
@@ -2160,6 +2162,7 @@ impl TorrentSession {
                 cancelled: Arc::clone(&torrent.cancelled),
                 candidate_peers,
                 deferred_for_backoff,
+                deferred_for_duplicate_ip,
             }
         };
 
@@ -2202,6 +2205,17 @@ impl TorrentSession {
                     snapshot.peers.len(),
                     snapshot.candidate_peers,
                     snapshot.deferred_for_backoff
+                ),
+                Some(snapshot.id),
+            );
+        }
+        if snapshot.deferred_for_duplicate_ip > 0 {
+            self.log(
+                LogLevel::Debug,
+                "peer",
+                format!(
+                    "peer scheduler deferred {} duplicate-IP candidates to preserve swarm diversity",
+                    snapshot.deferred_for_duplicate_ip
                 ),
                 Some(snapshot.id),
             );
@@ -4686,6 +4700,7 @@ struct PeerSchedule {
     peers: Vec<PeerInfo>,
     candidate_peers: usize,
     deferred_for_backoff: usize,
+    deferred_for_duplicate_ip: usize,
 }
 
 fn schedule_peers_for_download(torrent: &TorrentTask, max_connections: usize) -> PeerSchedule {
@@ -4726,16 +4741,55 @@ fn schedule_peers_for_download(torrent: &TorrentTask, max_connections: usize) ->
             .then_with(|| left.address.cmp(&right.address))
             .then_with(|| left.port.cmp(&right.port))
     });
-    let backed_off_count = backed_off.len();
-    let selected_backed_off = max_connections.saturating_sub(ready.len()).min(backed_off_count);
-    if ready.len() < max_connections {
-        ready.extend(backed_off.into_iter().take(selected_backed_off));
-    }
-    ready.truncate(max_connections);
+    let (ready_unique, ready_duplicates) = split_duplicate_ip_peers(ready);
+    let (backed_off_unique, backed_off_duplicates) = split_duplicate_ip_peers(backed_off);
+    let backed_off_count = backed_off_unique.len() + backed_off_duplicates.len();
+    let duplicate_count = ready_duplicates.len() + backed_off_duplicates.len();
+    let mut selected = Vec::new();
+    push_peer_candidates(&mut selected, ready_unique, max_connections);
+    push_peer_candidates(&mut selected, ready_duplicates, max_connections);
+    push_peer_candidates(&mut selected, backed_off_unique, max_connections);
+    push_peer_candidates(&mut selected, backed_off_duplicates, max_connections);
+    let selected_backed_off = selected
+        .iter()
+        .filter(|peer| {
+            peer_is_in_backoff(
+                torrent.peer_health.get(&peer_key(&peer.address, peer.port)),
+                now,
+            )
+        })
+        .count();
+    let mut selected_addresses = HashSet::new();
+    let selected_duplicates = selected
+        .iter()
+        .filter(|peer| !selected_addresses.insert(peer.address.clone()))
+        .count();
     PeerSchedule {
-        peers: ready,
+        peers: selected,
         candidate_peers: torrent.peers.len(),
         deferred_for_backoff: backed_off_count.saturating_sub(selected_backed_off),
+        deferred_for_duplicate_ip: duplicate_count.saturating_sub(selected_duplicates),
+    }
+}
+
+fn split_duplicate_ip_peers(peers: Vec<PeerInfo>) -> (Vec<PeerInfo>, Vec<PeerInfo>) {
+    let mut seen = HashSet::new();
+    let mut unique = Vec::new();
+    let mut duplicates = Vec::new();
+    for peer in peers {
+        if seen.insert(peer.address.clone()) {
+            unique.push(peer);
+        } else {
+            duplicates.push(peer);
+        }
+    }
+    (unique, duplicates)
+}
+
+fn push_peer_candidates(target: &mut Vec<PeerInfo>, peers: Vec<PeerInfo>, max_connections: usize) {
+    let remaining = max_connections.saturating_sub(target.len());
+    if remaining > 0 {
+        target.extend(peers.into_iter().take(remaining));
     }
 }
 
@@ -4910,7 +4964,7 @@ mod tests {
     }
 
     #[test]
-    fn peer_scheduler_prioritizes_success_and_defers_recent_failures() {
+    fn peer_scheduler_prioritizes_success_and_defers_risky_candidates() {
         let root = temp_dir("session-peer-scheduler");
         let torrent_path = root.join("multi.torrent");
         let output_dir = root.join("out");
@@ -4948,6 +5002,7 @@ mod tests {
             peer("127.0.0.1", 6001),
             peer("127.0.0.2", 6002),
             peer("127.0.0.3", 6003),
+            peer("127.0.0.3", 6004),
         ];
         torrent.peer_health.insert(
             peer_key("127.0.0.1", 6001),
@@ -4974,8 +5029,9 @@ mod tests {
 
         let schedule = schedule_peers_for_download(torrent, 2);
 
-        assert_eq!(schedule.candidate_peers, 3);
+        assert_eq!(schedule.candidate_peers, 4);
         assert_eq!(schedule.deferred_for_backoff, 1);
+        assert_eq!(schedule.deferred_for_duplicate_ip, 1);
         assert_eq!(
             schedule
                 .peers
