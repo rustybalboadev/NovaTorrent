@@ -1188,6 +1188,7 @@ impl TorrentSession {
                         !torrent.options.paused
                             && !torrent.options.disable_trackers
                             && !torrent.trackers.is_empty()
+                            && !(torrent.stats.finished && seed_ratio_reached(torrent))
                             && torrent
                                 .next_announce_at_ms
                                 .map_or(true, |next_announce| next_announce <= now)
@@ -1509,6 +1510,14 @@ impl TorrentSession {
                 ),
                 Some(id),
             );
+            if let Err(err) = self.announce_stopped(&id.to_string()) {
+                self.log(
+                    LogLevel::Warn,
+                    "tracker",
+                    format!("could not send stopped announce after seed ratio limit was reached: {err}"),
+                    Some(id),
+                );
+            }
         }
         Ok(())
     }
@@ -6248,6 +6257,121 @@ mod tests {
             .peers
             .iter()
             .any(|peer| peer.connection == "Uploaded requested blocks"));
+
+        fs::remove_dir_all(root).expect("temp dir removes");
+    }
+
+    #[test]
+    fn seed_ratio_limit_sends_stopped_and_suppresses_tracker_maintenance() {
+        let root = temp_dir("session-seed-ratio-stop");
+        let torrent_path = root.join("multi.torrent");
+        let output_dir = root.join("out");
+        let data = b"abcdefghi".to_vec();
+        fs::write(&torrent_path, build_multi_file_torrent(&data)).expect("fixture writes");
+
+        let tracker_listener = TcpListener::bind("127.0.0.1:0").expect("tracker binds");
+        let tracker_port = tracker_listener.local_addr().expect("tracker address").port();
+        let tracker_url = format!("http://127.0.0.1:{tracker_port}/announce");
+        let tracker = thread::spawn(move || {
+            let mut events = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = tracker_listener.accept().expect("announce connects");
+                let mut buffer = [0u8; 4096];
+                let length = stream.read(&mut buffer).expect("announce request reads");
+                let request = String::from_utf8_lossy(&buffer[..length]);
+                let event = if request.contains("event=started") {
+                    "started"
+                } else if request.contains("event=stopped") {
+                    "stopped"
+                } else {
+                    "other"
+                };
+                events.push(event.to_string());
+                let body = b"d8:intervali60e5:peers0:e";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).expect("tracker headers write");
+                stream.write_all(body).expect("tracker body writes");
+            }
+            events
+        });
+
+        let session = Arc::new(TorrentSession::new(output_dir.clone()));
+        let added = session
+            .add(AddTorrentRequest {
+                source: TorrentSource::File(torrent_path.to_string_lossy().into_owned()),
+                destination: Some(output_dir.to_string_lossy().into_owned()),
+                paused: false,
+                overwrite: true,
+                disable_trackers: false,
+                only_files: None,
+                sub_folder: None,
+            })
+            .expect("torrent adds");
+        let id = added.id.expect("torrent has ID");
+        {
+            let mut torrents = session.torrents.lock().expect("torrent lock");
+            let torrent = torrents
+                .iter_mut()
+                .find(|torrent| torrent.id == id)
+                .expect("torrent exists");
+            torrent.trackers.push(TrackerStatus {
+                url: tracker_url,
+                state: "Not contacted".to_string(),
+                seeders: None,
+                leechers: None,
+                next_announce_seconds: None,
+                message: None,
+            });
+        }
+        session.set_listen_port(6999);
+        session.announce(&id.to_string()).expect("started announce succeeds");
+
+        let (info_hash, files, piece_hashes) = {
+            let torrents = session.torrents.lock().expect("torrent lock");
+            let torrent = torrents
+                .iter()
+                .find(|torrent| torrent.id == id)
+                .expect("torrent exists");
+            (torrent.info_hash, torrent.files.clone(), torrent.piece_hashes.clone())
+        };
+        storage::write_torrent_bytes(&output_dir, "Example", &files, &data, true)
+            .expect("complete payload writes");
+        session.recheck(&id.to_string()).expect("stored payload verifies");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("incoming listener binds");
+        let port = listener.local_addr().expect("listener address").port();
+        let server_session = Arc::clone(&session);
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("incoming peer connects");
+            server_session
+                .serve_incoming_peer(stream)
+                .expect("incoming peer is served")
+        });
+
+        let result = peerwire::download_from_peer(
+            "127.0.0.1",
+            port,
+            PeerDownloadPlan {
+                info_hash,
+                peer_id: *b"-NV0001-SEEDRATIO001",
+                dht_port: None,
+                total_length: data.len() as u64,
+                piece_length: 4,
+                piece_hashes,
+                cancelled: None,
+            },
+        )
+        .expect("leecher downloads from session listener");
+        assert_eq!(result.bytes, data);
+        assert_eq!(server.join().expect("incoming server exits").bytes_uploaded, data.len() as u64);
+
+        let details = session.details(&id.to_string()).expect("details load");
+        assert_eq!(details.stats.expect("stats exist").state, "Seed ratio reached");
+        assert!(session.due_tracker_ids().is_empty());
+        assert_eq!(tracker.join().expect("tracker exits"), vec!["started", "stopped"]);
 
         fs::remove_dir_all(root).expect("temp dir removes");
     }
