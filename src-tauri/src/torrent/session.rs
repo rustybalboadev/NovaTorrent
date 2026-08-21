@@ -40,6 +40,7 @@ const MIN_RATE_LIMIT: u64 = 1024;
 const MAX_RATE_LIMIT: u64 = 10 * 1024 * 1024 * 1024;
 const TRACKER_ANNOUNCE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(16);
 const TRACKER_EARLY_PEER_GRACE: Duration = Duration::from_millis(450);
+const MAX_SWARM_REFRESH_ROUNDS: usize = 8;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -2465,6 +2466,16 @@ impl TorrentSession {
     }
 
     pub fn download_from_peers(&self, id: &str) -> Result<EmptyJsonResponse, String> {
+        let mut attempted = HashSet::new();
+        self.download_from_peers_refreshing(id, &mut attempted, 0)
+    }
+
+    fn download_from_peers_refreshing(
+        &self,
+        id: &str,
+        attempted: &mut HashSet<(String, u16)>,
+        refresh_round: usize,
+    ) -> Result<EmptyJsonResponse, String> {
         let snapshot = {
             let torrents = self.torrents.lock().map_err(|_| "torrent lock poisoned")?;
             let torrent = torrents
@@ -2473,11 +2484,12 @@ impl TorrentSession {
                 .ok_or_else(|| format!("torrent not found: {id}"))?;
             let max_connections = normalized_connection_limit(torrent.options.max_connections);
             let PeerSchedule {
-                peers,
+                mut peers,
                 candidate_peers,
                 deferred_for_backoff,
                 deferred_for_duplicate_ip,
             } = schedule_peers_for_download(torrent, max_connections);
+            peers.retain(|peer| !attempted.contains(&(peer.address.clone(), peer.port)));
             PeerDownloadSnapshot {
                 id: torrent.id,
                 name: torrent.name.clone(),
@@ -2510,13 +2522,25 @@ impl TorrentSession {
             return Err("torrent metadata is not available yet".to_string());
         }
         if snapshot.peers.is_empty() {
+            if attempted.is_empty() {
+                self.log(
+                    LogLevel::Warn,
+                    "peer",
+                    "peer download skipped: announce trackers first to discover peers",
+                    Some(snapshot.id),
+                );
+                return Err("torrent has no discovered peers; announce trackers first".to_string());
+            }
             self.log(
                 LogLevel::Warn,
                 "peer",
-                "peer download skipped: announce trackers first to discover peers",
+                format!(
+                    "peer download skipped: all {} known peer endpoint(s) have already been tried",
+                    snapshot.candidate_peers
+                ),
                 Some(snapshot.id),
             );
-            return Err("torrent has no discovered peers; announce trackers first".to_string());
+            return Err("all known peer endpoints have already been tried".to_string());
         }
 
         self.set_torrent_state(id, TorrentState::Downloading, None)?;
@@ -2596,6 +2620,7 @@ impl TorrentSession {
 
             let (connect_sender, connect_receiver) = std::sync::mpsc::channel();
             for peer in peer_batch.iter().cloned() {
+                attempted.insert((peer.address.clone(), peer.port));
                 self.set_peer_connection(id, &peer.address, peer.port, "Connecting", None)?;
                 self.record_peer_attempt(id, &peer.address, peer.port)?;
                 let address = peer.address.clone();
@@ -3058,7 +3083,7 @@ impl TorrentSession {
             return Ok(EmptyJsonResponse {});
         }
 
-        if pex_candidates_added > 0 {
+        if pex_candidates_added > 0 && refresh_round < MAX_SWARM_REFRESH_ROUNDS {
             self.log(
                 LogLevel::Info,
                 "pex",
@@ -3071,7 +3096,24 @@ impl TorrentSession {
                 self.verify_peer_dht_nodes(pending_dht_nodes, snapshot.id);
             }
             drop(partial_store);
-            return self.download_from_peers(id);
+            return self.download_from_peers_refreshing(id, attempted, refresh_round + 1);
+        }
+
+        let fresh_candidates = self.untried_peer_count(id, attempted)?;
+        if fresh_candidates > 0 && refresh_round < MAX_SWARM_REFRESH_ROUNDS {
+            self.log(
+                LogLevel::Info,
+                "peer",
+                format!(
+                    "swarm stalled with {fresh_candidates} newly discovered peer candidate(s); refreshing peer schedule"
+                ),
+                Some(snapshot.id),
+            );
+            if !pending_dht_nodes.is_empty() {
+                self.verify_peer_dht_nodes(pending_dht_nodes, snapshot.id);
+            }
+            drop(partial_store);
+            return self.download_from_peers_refreshing(id, attempted, refresh_round + 1);
         }
 
         let missing = verified.iter().filter(|piece| !**piece).count();
@@ -3089,6 +3131,23 @@ impl TorrentSession {
             self.verify_peer_dht_nodes(pending_dht_nodes, snapshot.id);
         }
         Err(detail)
+    }
+
+    fn untried_peer_count(
+        &self,
+        id: &str,
+        attempted: &HashSet<(String, u16)>,
+    ) -> Result<usize, String> {
+        let torrents = self.torrents.lock().map_err(|_| "torrent lock poisoned")?;
+        let torrent = torrents
+            .iter()
+            .find(|torrent| torrent.matches_id(id))
+            .ok_or_else(|| format!("torrent not found: {id}"))?;
+        Ok(torrent
+            .peers
+            .iter()
+            .filter(|peer| !attempted.contains(&(peer.address.clone(), peer.port)))
+            .count())
     }
 
     pub fn recheck(&self, id: &str) -> Result<EmptyJsonResponse, String> {
@@ -5819,6 +5878,145 @@ mod tests {
                     .files,
             )
             .expect("late peer output reads"),
+            data
+        );
+
+        fs::remove_dir_all(root).expect("temp dir removes");
+    }
+
+    #[test]
+    fn peer_download_refreshes_newly_discovered_peers_after_snapshot_stalls() {
+        let root = temp_dir("session-peer-refresh");
+        let torrent_path = root.join("multi.torrent");
+        let output_dir = root.join("out");
+        let data = b"abcdefghi".to_vec();
+        fs::write(&torrent_path, build_multi_file_torrent(&data)).expect("fixture writes");
+
+        let session = TorrentSession::new(output_dir.clone());
+        let added = session
+            .add(AddTorrentRequest {
+                source: TorrentSource::File(torrent_path.to_string_lossy().into_owned()),
+                destination: Some(output_dir.to_string_lossy().into_owned()),
+                paused: false,
+                overwrite: true,
+                disable_trackers: true,
+                only_files: None,
+                sub_folder: None,
+            })
+            .expect("torrent adds");
+        let id = added.id.expect("torrent has ID");
+        let info_hash = session
+            .torrents
+            .lock()
+            .expect("torrent lock")
+            .iter()
+            .find(|torrent| torrent.id == id)
+            .expect("torrent exists")
+            .info_hash;
+
+        let partial_listener = TcpListener::bind("127.0.0.1:0").expect("partial peer binds");
+        let partial_port = partial_listener
+            .local_addr()
+            .expect("partial peer address")
+            .port();
+        let fresh_listener = TcpListener::bind("127.0.0.1:0").expect("fresh peer binds");
+        let fresh_port = fresh_listener.local_addr().expect("fresh peer address").port();
+        {
+            let mut torrents = session.torrents.lock().expect("torrent lock");
+            let torrent = torrents
+                .iter_mut()
+                .find(|torrent| torrent.id == id)
+                .expect("torrent exists");
+            torrent.peers.push(PeerInfo {
+                address: "127.0.0.1".to_string(),
+                port: partial_port,
+                client: Some("NovaTorrent initial partial seed".to_string()),
+                progress: 0.0,
+                download_speed: 0,
+                upload_speed: 0,
+                connection: "Discovered".to_string(),
+            });
+        }
+
+        let partial_data = data.clone();
+        let partial_seed = thread::spawn(move || {
+            peerwire::seed_single_peer(
+                partial_listener,
+                PeerSeedPlan {
+                    info_hash,
+                    peer_id: *b"-NV0001-REFRESH00001",
+                    dht_port: None,
+                    enable_pex: false,
+                    pex_peers: Vec::new(),
+                    piece_length: 4,
+                    bytes: partial_data,
+                    available_pieces: Some(vec![true, false, false]),
+                    disconnect_after_blocks: None,
+                    block_response_delay: Some(Duration::from_millis(300)),
+                },
+            )
+            .expect("partial peer serves one piece")
+        });
+        let fresh_data = data.clone();
+        let fresh_seed = thread::spawn(move || {
+            peerwire::seed_single_peer(
+                fresh_listener,
+                PeerSeedPlan {
+                    info_hash,
+                    peer_id: *b"-NV0001-REFRESH00002",
+                    dht_port: None,
+                    enable_pex: false,
+                    pex_peers: Vec::new(),
+                    piece_length: 4,
+                    bytes: fresh_data,
+                    available_pieces: Some(vec![true, true, true]),
+                    disconnect_after_blocks: None,
+                    block_response_delay: None,
+                },
+            )
+            .expect("fresh peer serves remaining pieces")
+        });
+
+        std::thread::scope(|scope| {
+            let add_fresh_peer = scope.spawn(|| {
+                thread::sleep(Duration::from_millis(75));
+                let mut torrents = session.torrents.lock().expect("torrent lock");
+                let torrent = torrents
+                    .iter_mut()
+                    .find(|torrent| torrent.id == id)
+                    .expect("torrent exists");
+                torrent.peers.push(PeerInfo {
+                    address: "127.0.0.1".to_string(),
+                    port: fresh_port,
+                    client: Some("NovaTorrent fresh complete seed".to_string()),
+                    progress: 0.0,
+                    download_speed: 0,
+                    upload_speed: 0,
+                    connection: "DHT discovered".to_string(),
+                });
+            });
+            session
+                .download_from_peers(&id.to_string())
+                .expect("swarm refresh discovers the fresh peer and completes");
+            add_fresh_peer.join().expect("fresh peer is inserted");
+        });
+
+        assert_eq!(partial_seed.join().expect("partial peer exits").bytes_uploaded, 4);
+        assert_eq!(fresh_seed.join().expect("fresh peer exits").bytes_uploaded, 5);
+        assert_eq!(
+            storage::read_torrent_bytes(
+                &output_dir,
+                "Example",
+                &session
+                    .torrents
+                    .lock()
+                    .expect("torrent lock")
+                    .iter()
+                    .find(|torrent| torrent.id == id)
+                    .expect("torrent exists")
+                    .files,
+            )
+            .expect("refreshed peer output reads"),
             data
         );
 
