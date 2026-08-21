@@ -206,6 +206,14 @@ export async function openMediaWindow(id: string, fileIndex: number) {
   await invoke("open_media_window", { id, fileIndex });
 }
 
+export async function closeMediaWindow(id: string, fileIndex: number) {
+  if (!isTauriRuntime()) {
+    window.close();
+    return;
+  }
+  await invoke("close_media_window", { id, fileIndex });
+}
+
 export async function setStreamPriority(id: string, request: StreamPriorityRequest): Promise<StreamPriorityStatus> {
   if (!isTauriRuntime()) {
     const file = mockTorrents[0]?.files?.[request.fileIndex];

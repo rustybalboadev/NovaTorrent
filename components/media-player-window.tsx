@@ -5,6 +5,7 @@ import { Clapperboard, Crosshair, Loader2, Pause, Play, RotateCw, SkipForward, X
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import {
+  closeMediaWindow,
   clearStreamPriority,
   setStreamPriority,
   streamFileAvailability,
@@ -340,17 +341,17 @@ export function MediaPlayerWindow() {
   async function closeViewer() {
     if (params) {
       try {
-        await clearStreamPriority(params.id);
+        await closeMediaWindow(params.id, params.fileIndex);
+        return;
       } catch {
-        undefined;
+        try {
+          await clearStreamPriority(params.id);
+        } catch {
+          undefined;
+        }
       }
     }
-    try {
-      const { getCurrentWindow } = await import("@tauri-apps/api/window");
-      await getCurrentWindow().close();
-    } catch {
-      window.close();
-    }
+    window.close();
   }
 
   return (

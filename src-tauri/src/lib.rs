@@ -1310,6 +1310,20 @@ async fn open_media_window(
 }
 
 #[tauri::command]
+fn close_media_window(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    id: String,
+    file_index: usize,
+) -> Result<(), String> {
+    let _ = state.session.clear_stream_priority(&id);
+    if let Some(window) = app.get_webview_window(&media_window_label(&id, file_index)) {
+        window.close().map_err(error_to_string)?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
 fn set_stream_priority(
     state: tauri::State<'_, AppState>,
     id: String,
@@ -1634,6 +1648,7 @@ pub fn run() {
             stream_file_availability,
             stream_file_url,
             open_media_window,
+            close_media_window,
             set_stream_priority,
             clear_stream_priority,
             open_virustotal_report,
