@@ -40,6 +40,8 @@ struct MediaStreamRoute {
 }
 
 const MEDIA_STREAM_CHUNK_LIMIT: u64 = 2 * 1024 * 1024;
+const MEDIA_STREAM_WAIT_TIMEOUT: Duration = Duration::from_secs(8);
+const MEDIA_STREAM_WAIT_INTERVAL: Duration = Duration::from_millis(150);
 
 #[derive(Debug, Clone, Serialize)]
 struct SafeTestTorrent {
@@ -739,7 +741,7 @@ fn handle_media_stream_connection(
             lookahead_bytes: None,
         },
     );
-    match session.read_stream_file_range(&route.id, route.file_index, start, length) {
+    match read_media_stream_range_with_wait(&session, &route, start, length) {
         Ok(read) => {
             let content_range = format!("bytes {start}-{end}/{}", read.total_length);
             let content_length = read.bytes.len().to_string();
@@ -758,12 +760,11 @@ fn handle_media_stream_connection(
             );
         }
         Err(err) => {
-            let (status, retry) =
-                if err.contains("not verified yet") || err.contains("not buffered yet") {
-                    ("503 Service Unavailable", true)
-                } else {
-                    ("500 Internal Server Error", false)
-                };
+            let (status, retry) = if is_waitable_media_stream_error(&err) {
+                ("503 Service Unavailable", true)
+            } else {
+                ("500 Internal Server Error", false)
+            };
             let mut headers = vec![("Content-Type", "text/plain; charset=utf-8")];
             if retry {
                 headers.push(("Retry-After", "1"));
@@ -777,6 +778,46 @@ fn handle_media_stream_connection(
             let _ = write_media_response(&mut stream, status, &headers, err.as_bytes());
         }
     }
+}
+
+fn read_media_stream_range_with_wait(
+    session: &TorrentSession,
+    route: &MediaStreamRoute,
+    start: u64,
+    length: u64,
+) -> Result<crate::torrent::session::StreamFileRead, String> {
+    let started = Instant::now();
+    let mut attempts = 0u32;
+    loop {
+        attempts = attempts.saturating_add(1);
+        match session.read_stream_file_range(&route.id, route.file_index, start, length) {
+            Ok(read) => {
+                if attempts > 1 {
+                    session.log(
+                        LogLevel::Info,
+                        "stream",
+                        format!(
+                            "media stream range starting at {start} became available after {} ms and {attempts} read attempt(s)",
+                            started.elapsed().as_millis()
+                        ),
+                        None,
+                    );
+                }
+                return Ok(read);
+            }
+            Err(err)
+                if is_waitable_media_stream_error(&err)
+                    && started.elapsed() < MEDIA_STREAM_WAIT_TIMEOUT =>
+            {
+                thread::sleep(MEDIA_STREAM_WAIT_INTERVAL);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn is_waitable_media_stream_error(err: &str) -> bool {
+    err.contains("not verified yet") || err.contains("not buffered yet")
 }
 
 fn read_media_http_request(stream: &mut TcpStream) -> Result<MediaHttpRequest, String> {
@@ -1562,5 +1603,16 @@ mod open_source_tests {
         assert!(normalize_open_source("novatorrent://settings?magnet=x", None, 0).is_none());
         assert!(normalize_open_source("novatorrent://open?magnet=%ZZ", None, 0).is_none());
         assert!(normalize_open_source("magnet:?xt=urn:btih:not-a-hash", None, 0).is_none());
+    }
+
+    #[test]
+    fn media_stream_ranges_are_capped_and_retryable_errors_are_identified() {
+        assert_eq!(parse_media_range(None, 10 * 1024 * 1024), Some((0, MEDIA_STREAM_CHUNK_LIMIT - 1)));
+        assert_eq!(parse_media_range(Some("bytes=4-9"), 20), Some((4, 9)));
+        assert_eq!(parse_media_range(Some("bytes=18-99"), 20), Some((18, 19)));
+        assert_eq!(parse_media_range(Some("bytes=50-99"), 20), None);
+        assert!(is_waitable_media_stream_error("stream byte range is not verified yet"));
+        assert!(is_waitable_media_stream_error("stream data is not buffered yet"));
+        assert!(!is_waitable_media_stream_error("torrent metadata is not available yet"));
     }
 }
