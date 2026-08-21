@@ -13,7 +13,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
 use crate::torrent::session::{
@@ -37,6 +37,27 @@ struct AppState {
 struct MediaStreamRoute {
     id: String,
     file_index: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MediaPlayerLogRequest {
+    id: String,
+    file_index: usize,
+    event: String,
+    current_time: Option<f64>,
+    duration: Option<f64>,
+    ready_state: Option<u16>,
+    network_state: Option<u16>,
+    paused: Option<bool>,
+    seeking: Option<bool>,
+    target_time: Option<f64>,
+    target_offset: Option<u64>,
+    target_ready: Option<bool>,
+    buffered_ahead_seconds: Option<f64>,
+    retry_key: Option<u32>,
+    network_retries: Option<u32>,
+    message: Option<String>,
 }
 
 const MEDIA_STREAM_CHUNK_LIMIT: u64 = 2 * 1024 * 1024;
@@ -733,6 +754,19 @@ fn handle_media_stream_connection(
         );
         return;
     };
+    session.log(
+        LogLevel::Debug,
+        "stream",
+        format!(
+            "media request {} '{}' range={} parsed={start}-{end} verified={} across {} range(s)",
+            request.method,
+            availability.name,
+            request.range.as_deref().unwrap_or("<none>"),
+            availability.verified_bytes,
+            availability.ranges.len()
+        ),
+        parse_torrent_log_id(&route.id),
+    );
     let _ = session.update_stream_priority_quietly(
         &route.id,
         StreamPriorityRequest {
@@ -797,16 +831,18 @@ fn read_media_stream_range_with_wait(
     let mut attempts = 0u32;
     loop {
         attempts = attempts.saturating_add(1);
-        let read_end = match session.stream_file_availability(&route.id, route.file_index) {
-            Ok(availability) => verified_media_range_end(&availability.ranges, start, requested_end),
-            Err(err) => return Err(err),
-        };
+        let availability = session.stream_file_availability(&route.id, route.file_index)?;
+        let read_end = verified_media_range_end(&availability.ranges, start, requested_end);
         let Some(read_end) = read_end else {
             if started.elapsed() < MEDIA_STREAM_WAIT_TIMEOUT {
                 thread::sleep(MEDIA_STREAM_WAIT_INTERVAL);
                 continue;
             }
-            return Err("stream byte range is not verified yet".to_string());
+            return Err(format!(
+                "stream byte range is not verified yet after {} ms; verified ranges: {}",
+                started.elapsed().as_millis(),
+                verified_media_ranges_summary(&availability.ranges)
+            ));
         };
         let length = read_end - start + 1;
         match session.read_stream_file_range(&route.id, route.file_index, start, length) {
@@ -837,6 +873,25 @@ fn read_media_stream_range_with_wait(
             Err(err) => return Err(err),
         }
     }
+}
+
+fn verified_media_ranges_summary(ranges: &[crate::torrent::storage::VerifiedByteRange]) -> String {
+    if ranges.is_empty() {
+        return "none".to_string();
+    }
+    let mut summary = ranges
+        .iter()
+        .take(6)
+        .map(|range| {
+            let end = range.offset.saturating_add(range.length.saturating_sub(1));
+            format!("{}-{}", range.offset, end)
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    if ranges.len() > 6 {
+        summary.push_str(&format!(", +{} more", ranges.len() - 6));
+    }
+    summary
 }
 
 fn verified_media_range_end(
@@ -1324,6 +1379,65 @@ fn close_media_window(
 }
 
 #[tauri::command]
+fn media_player_log(
+    state: tauri::State<'_, AppState>,
+    request: MediaPlayerLogRequest,
+) -> Result<EmptyJsonResponse, String> {
+    let mut parts = vec![
+        format!("event={}", request.event),
+        format!("file_index={}", request.file_index),
+    ];
+    if let Some(value) = request.current_time {
+        parts.push(format!("current_time={value:.3}"));
+    }
+    if let Some(value) = request.duration {
+        parts.push(format!("duration={value:.3}"));
+    }
+    if let Some(value) = request.ready_state {
+        parts.push(format!("ready_state={value}"));
+    }
+    if let Some(value) = request.network_state {
+        parts.push(format!("network_state={value}"));
+    }
+    if let Some(value) = request.paused {
+        parts.push(format!("paused={value}"));
+    }
+    if let Some(value) = request.seeking {
+        parts.push(format!("seeking={value}"));
+    }
+    if let Some(value) = request.target_time {
+        parts.push(format!("target_time={value:.3}"));
+    }
+    if let Some(value) = request.target_offset {
+        parts.push(format!("target_offset={value}"));
+    }
+    if let Some(value) = request.target_ready {
+        parts.push(format!("target_ready={value}"));
+    }
+    if let Some(value) = request.buffered_ahead_seconds {
+        parts.push(format!("buffered_ahead_seconds={value:.3}"));
+    }
+    if let Some(value) = request.retry_key {
+        parts.push(format!("retry_key={value}"));
+    }
+    if let Some(value) = request.network_retries {
+        parts.push(format!("network_retries={value}"));
+    }
+    if let Some(message) = request.message {
+        if !message.is_empty() {
+            parts.push(format!("note={message}"));
+        }
+    }
+    state.session.log(
+        LogLevel::Debug,
+        "media-ui",
+        parts.join(" "),
+        parse_torrent_log_id(&request.id),
+    );
+    Ok(EmptyJsonResponse {})
+}
+
+#[tauri::command]
 fn set_stream_priority(
     state: tauri::State<'_, AppState>,
     id: String,
@@ -1447,6 +1561,10 @@ fn media_window_label(id: &str, file_index: usize) -> String {
         safe_id.push_str("torrent");
     }
     format!("media-{safe_id}-{file_index}")
+}
+
+fn parse_torrent_log_id(id: &str) -> Option<u64> {
+    id.parse().ok()
 }
 
 fn supported_open_sources(
@@ -1649,6 +1767,7 @@ pub fn run() {
             stream_file_url,
             open_media_window,
             close_media_window,
+            media_player_log,
             set_stream_priority,
             clear_stream_priority,
             open_virustotal_report,

@@ -177,6 +177,25 @@ export type StreamPriorityStatus = {
   total_priority_pieces: number;
 };
 
+export type MediaPlayerLogRequest = {
+  id: string;
+  fileIndex: number;
+  event: string;
+  currentTime?: number | null;
+  duration?: number | null;
+  readyState?: number | null;
+  networkState?: number | null;
+  paused?: boolean | null;
+  seeking?: boolean | null;
+  targetTime?: number | null;
+  targetOffset?: number | null;
+  targetReady?: boolean | null;
+  bufferedAheadSeconds?: number | null;
+  retryKey?: number | null;
+  networkRetries?: number | null;
+  message?: string | null;
+};
+
 export type TorrentRow = {
   id: string;
   name: string;

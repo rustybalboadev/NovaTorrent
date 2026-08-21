@@ -7,6 +7,7 @@ import { Progress } from "@/components/ui/progress";
 import {
   closeMediaWindow,
   clearStreamPriority,
+  mediaPlayerLog,
   setStreamPriority,
   streamFileAvailability,
   streamFileUrl,
@@ -133,8 +134,26 @@ export function MediaPlayerWindow() {
         setPriority(nextPriority);
         setStreamUrl(nextUrl);
         setAvailability(nextAvailability);
+        void mediaPlayerLog({
+          id: viewerParams.id,
+          fileIndex: viewerParams.fileIndex,
+          event: "prepare-ready",
+          targetTime: 0,
+          targetOffset: 0,
+          targetReady: nextAvailability.ranges.some((range) => range.offset === 0 && range.length > 0),
+          message: `${nextAvailability.verified_bytes} verified byte(s) across ${nextAvailability.ranges.length} range(s)`
+        }).catch(() => undefined);
       } catch (err) {
-        if (!disposed) setError(err instanceof Error ? err.message : "Could not prepare media playback.");
+        const message = err instanceof Error ? err.message : "Could not prepare media playback.";
+        if (!disposed) {
+          setError(message);
+          void mediaPlayerLog({
+            id: viewerParams.id,
+            fileIndex: viewerParams.fileIndex,
+            event: "prepare-error",
+            message
+          }).catch(() => undefined);
+        }
       } finally {
         if (!disposed) setBusy(false);
       }
@@ -183,6 +202,64 @@ export function MediaPlayerWindow() {
       ? `${formatBytes(targetOffset)} / ${formatBytes(availability.length)}`
       : "Target pending";
 
+  function mediaNumber(value: number | undefined) {
+    return value != null && Number.isFinite(value) ? value : null;
+  }
+
+  function logPlayerEvent(event: string, message?: string) {
+    if (!params) return;
+    const video = videoRef.current;
+    const currentTime = mediaNumber(video?.currentTime);
+    const duration = mediaNumber(video?.duration);
+    const playbackTarget = targetPlaybackTime();
+    const playbackTargetOffset =
+      estimateByteOffset(playbackTarget, duration ?? undefined, availability?.length) ?? targetOffset;
+    const playbackTargetReady =
+      availability && playbackTargetOffset != null ? isOffsetVerified(availability, playbackTargetOffset) : targetReady;
+    void mediaPlayerLog({
+      id: params.id,
+      fileIndex: params.fileIndex,
+      event,
+      currentTime,
+      duration,
+      readyState: video?.readyState ?? null,
+      networkState: video?.networkState ?? null,
+      paused: video?.paused ?? null,
+      seeking: video?.seeking ?? null,
+      targetTime: playbackTarget,
+      targetOffset: playbackTargetOffset,
+      targetReady: playbackTargetReady,
+      bufferedAheadSeconds,
+      retryKey,
+      networkRetries,
+      message: message ?? null
+    }).catch(() => undefined);
+  }
+
+  function verifiedOffsetForTime(time: number) {
+    const video = videoRef.current;
+    const offset = estimateByteOffset(time, video?.duration, availability?.length);
+    return availability && offset != null && isOffsetVerified(availability, offset) ? offset : null;
+  }
+
+  function markTargetReady(offset: number, message?: string) {
+    retryingForSeekRef.current = false;
+    setFetchingSeekPoint(false);
+    setBuffering(false);
+    setTargetReady(true);
+    setTargetOffset(offset);
+    setNearestReadyTime(null);
+    setNetworkRetries(0);
+    if (message) logPlayerEvent("target-ready", message);
+  }
+
+  function clearBufferingIfTargetReady(message: string) {
+    const offset = verifiedOffsetForTime(targetPlaybackTime());
+    if (offset == null) return false;
+    markTargetReady(offset, message);
+    return true;
+  }
+
   function rememberPosition() {
     const video = videoRef.current;
     if (!video || !Number.isFinite(video.currentTime)) return;
@@ -206,7 +283,7 @@ export function MediaPlayerWindow() {
 
   function resumeWhenReady() {
     const video = videoRef.current;
-    if (!video || !shouldResumeRef.current || !streamUrl) return;
+    if (!video || !streamUrl) return;
     const targetTime = pendingResumeTimeRef.current ?? lastTimeRef.current;
     if (targetTime > 0 && Math.abs(video.currentTime - targetTime) > 0.35) {
       try {
@@ -215,7 +292,7 @@ export function MediaPlayerWindow() {
         undefined;
       }
     }
-    if (video.paused && video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+    if (shouldResumeRef.current && video.paused && video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
       void video.play().catch(() => undefined);
     }
     if (Math.abs(video.currentTime - targetTime) <= 1 && video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
@@ -263,9 +340,7 @@ export function MediaPlayerWindow() {
       setPriority(nextPriority);
       const nextAvailability = await refreshAvailability();
       if (nextAvailability && isOffsetVerified(nextAvailability, offset)) {
-        setBuffering(false);
-        setFetchingSeekPoint(false);
-        retryingForSeekRef.current = false;
+        markTargetReady(offset, "priority target is verified after refresh");
         resumeWhenReady();
       }
     } catch (err) {
@@ -293,18 +368,14 @@ export function MediaPlayerWindow() {
     shouldResumeRef.current = userWantsPlaybackRef.current || !video.paused;
     const offset = estimateByteOffset(video.currentTime, video.duration, availability?.length);
     if (availability && offset != null && isOffsetVerified(availability, offset)) {
-      retryingForSeekRef.current = false;
-      setFetchingSeekPoint(false);
-      setBuffering(false);
-      setTargetReady(true);
-      setTargetOffset(offset);
-      setNearestReadyTime(null);
+      markTargetReady(offset, "seek target already verified");
       void updateStreamPriorityForTime(video.currentTime, true);
       return;
     }
     retryingForSeekRef.current = true;
     setFetchingSeekPoint(true);
     setBuffering(true);
+    logPlayerEvent("seek-fetch", "seek target is not verified yet");
     void updateStreamPriorityForTime(video.currentTime, true);
   }
 
@@ -313,8 +384,7 @@ export function MediaPlayerWindow() {
     const currentOffset = updateBufferMetrics();
     void updateStreamPriorityForTime(targetPlaybackTime());
     if (currentOffset != null && availability && isOffsetVerified(availability, currentOffset)) {
-      retryingForSeekRef.current = false;
-      setFetchingSeekPoint(false);
+      markTargetReady(currentOffset);
     }
   }
 
@@ -329,6 +399,7 @@ export function MediaPlayerWindow() {
     }
     setBuffering(true);
     setFetchingSeekPoint(true);
+    logPlayerEvent("network-retry", mediaError ? `media error ${mediaError.code}` : "retrying media source");
     if (retryTimerRef.current != null) {
       window.clearTimeout(retryTimerRef.current);
     }
@@ -341,6 +412,7 @@ export function MediaPlayerWindow() {
   async function closeViewer() {
     if (params) {
       try {
+        logPlayerEvent("close");
         await closeMediaWindow(params.id, params.fileIndex);
         return;
       } catch {
@@ -386,46 +458,69 @@ export function MediaPlayerWindow() {
                   userWantsPlaybackRef.current = true;
                   shouldResumeRef.current = true;
                   setBuffering(false);
+                  logPlayerEvent("play");
                   void updateStreamPriorityForTime(targetPlaybackTime(), true);
                 }}
                 onPause={(event) => {
                   const video = event.currentTarget;
                   rememberPosition();
-                  if (!video.ended && video.readyState < HTMLMediaElement.HAVE_FUTURE_DATA) {
-                    shouldResumeRef.current = true;
+                  if (
+                    !video.ended &&
+                    (video.seeking ||
+                      retryingForSeekRef.current ||
+                      fetchingSeekPoint ||
+                      pendingResumeTimeRef.current != null ||
+                      video.readyState < HTMLMediaElement.HAVE_FUTURE_DATA)
+                  ) {
+                    shouldResumeRef.current = shouldResumeRef.current || userWantsPlaybackRef.current;
                     setBuffering(true);
+                    logPlayerEvent("pause-buffering", "media element paused while waiting for stream data");
                     return;
                   }
                   userWantsPlaybackRef.current = false;
                   shouldResumeRef.current = false;
+                  logPlayerEvent("pause");
                 }}
                 onSeeking={(event) => handleSeekIntent(event.currentTarget)}
                 onSeeked={() => {
+                  logPlayerEvent("seeked");
                   updateBufferMetrics();
                   resumeWhenReady();
                 }}
                 onWaiting={() => {
                   rememberPosition();
+                  if (clearBufferingIfTargetReady("waiting event ignored because target is verified")) return;
                   shouldResumeRef.current = true;
                   setBuffering(true);
+                  logPlayerEvent("waiting", "media element is waiting for data");
                   void updateStreamPriorityForTime(targetPlaybackTime(), true);
                 }}
                 onStalled={() => {
                   rememberPosition();
+                  if (clearBufferingIfTargetReady("stalled event ignored because target is verified")) return;
                   shouldResumeRef.current = true;
                   setBuffering(true);
+                  logPlayerEvent("stalled", "media element reported a stalled network load");
                   void updateStreamPriorityForTime(targetPlaybackTime(), true);
                 }}
                 onTimeUpdate={handlePlaybackProgress}
                 onLoadedMetadata={() => {
+                  logPlayerEvent("loaded-metadata");
                   void updateStreamPriorityForTime(targetPlaybackTime(), true);
                   resumeWhenReady();
                 }}
                 onCanPlay={() => {
-                  setBuffering(false);
+                  if (!clearBufferingIfTargetReady("can-play reached verified target")) {
+                    setBuffering(false);
+                    if (!retryingForSeekRef.current) setFetchingSeekPoint(false);
+                    logPlayerEvent("can-play");
+                  }
                   resumeWhenReady();
                 }}
-                onProgress={resumeWhenReady}
+                onProgress={() => {
+                  clearBufferingIfTargetReady("progress event reached verified target");
+                  resumeWhenReady();
+                }}
                 onError={scheduleNetworkRetry}
               />
             ) : (

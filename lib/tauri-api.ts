@@ -5,6 +5,7 @@ import type {
   AddTorrentRequest,
   AddTorrentResponse,
   LogEntry,
+  MediaPlayerLogRequest,
   SafeTestTorrent,
   StreamPriorityRequest,
   StreamPriorityStatus,
@@ -212,6 +213,11 @@ export async function closeMediaWindow(id: string, fileIndex: number) {
     return;
   }
   await invoke("close_media_window", { id, fileIndex });
+}
+
+export async function mediaPlayerLog(request: MediaPlayerLogRequest) {
+  if (!isTauriRuntime()) return;
+  await invoke("media_player_log", { request });
 }
 
 export async function setStreamPriority(id: string, request: StreamPriorityRequest): Promise<StreamPriorityStatus> {
