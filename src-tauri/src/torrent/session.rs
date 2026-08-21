@@ -6214,6 +6214,18 @@ mod tests {
         .expect("stream assignments build");
 
         assert_eq!(&assignments[0][..3], &[3, 1, 4]);
+
+        let assignments = assign_streaming_pieces(
+            &[false, false, false, true, false],
+            &[vec![true, true, true, true, true]],
+            &files,
+            4,
+            &priority,
+            false,
+        )
+        .expect("stream assignments skip verified pieces");
+
+        assert_eq!(&assignments[0][..3], &[1, 4, 0]);
     }
 
     #[test]

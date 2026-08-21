@@ -42,6 +42,8 @@ struct MediaStreamRoute {
 const MEDIA_STREAM_CHUNK_LIMIT: u64 = 2 * 1024 * 1024;
 const MEDIA_STREAM_WAIT_TIMEOUT: Duration = Duration::from_secs(8);
 const MEDIA_STREAM_WAIT_INTERVAL: Duration = Duration::from_millis(150);
+const MEDIA_STREAM_URGENT_PRIORITY_BYTES: u64 = 8 * 1024 * 1024;
+const MEDIA_STREAM_LOOKAHEAD_PRIORITY_BYTES: u64 = 48 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 struct SafeTestTorrent {
@@ -736,8 +738,8 @@ fn handle_media_stream_connection(
         StreamPriorityRequest {
             file_index: route.file_index,
             playhead_offset: start,
-            urgent_bytes: None,
-            lookahead_bytes: None,
+            urgent_bytes: Some(MEDIA_STREAM_URGENT_PRIORITY_BYTES),
+            lookahead_bytes: Some(MEDIA_STREAM_LOOKAHEAD_PRIORITY_BYTES),
         },
     );
     match read_media_stream_range_with_wait(&session, &route, start, end) {
