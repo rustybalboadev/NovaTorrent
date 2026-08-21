@@ -1,5 +1,6 @@
 pub mod bencode;
 pub mod dht;
+pub mod lsd;
 pub mod magnet;
 pub mod metainfo;
 pub mod metadata;

@@ -18,6 +18,7 @@ use crate::torrent::{
         self, DhtAnnounceTarget, DhtContact, DhtLookupOptions, DhtNode, DhtQueryKind,
         DhtRoutingTable,
     },
+    lsd::{self, LsdAnnounce},
     magnet::MagnetLink,
     metainfo::{Metainfo, TorrentFile},
     peer::PeerInfo,
@@ -663,6 +664,81 @@ impl TorrentSession {
 
     pub fn listen_port(&self) -> u16 {
         self.listen_port.load(Ordering::Relaxed)
+    }
+
+    pub fn lsd_public_info_hashes(&self) -> Vec<[u8; 20]> {
+        if self.listen_port() == 0 {
+            return Vec::new();
+        }
+        self.torrents
+            .lock()
+            .map(|torrents| {
+                torrents
+                    .iter()
+                    .filter(|torrent| {
+                        !torrent.options.paused
+                            && !torrent.general.private
+                            && !seed_ratio_reached(torrent)
+                    })
+                    .map(|torrent| torrent.info_hash)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn handle_lsd_announce(
+        &self,
+        announce: &LsdAnnounce,
+        source: SocketAddr,
+    ) -> Result<usize, String> {
+        if !lsd::contactable_lsd_source(source.ip()) {
+            return Ok(0);
+        }
+        let listen_port = self.listen_port();
+        if listen_port != 0 && source.ip().is_loopback() && announce.port == listen_port {
+            return Ok(0);
+        }
+        let peer = PeerInfo {
+            address: source.ip().to_string(),
+            port: announce.port,
+            client: None,
+            progress: 0.0,
+            download_speed: 0,
+            upload_speed: 0,
+            connection: "LSD discovered".to_string(),
+        };
+        let mut added = 0usize;
+        let mut matched_ids = Vec::new();
+        let mut torrents = self.torrents.lock().map_err(|_| "torrent lock poisoned")?;
+        for info_hash in &announce.info_hashes {
+            let Some(torrent) = torrents.iter_mut().find(|torrent| {
+                torrent.info_hash == *info_hash
+                    && !torrent.general.private
+                    && !torrent.options.paused
+                    && !seed_ratio_reached(torrent)
+            }) else {
+                continue;
+            };
+            let before = torrent.peers.len();
+            merge_peers(&mut torrent.peers, vec![peer.clone()]);
+            if torrent.peers.len() > before {
+                added += 1;
+                matched_ids.push(torrent.id);
+            }
+        }
+        drop(torrents);
+        for id in matched_ids {
+            self.log(
+                LogLevel::Debug,
+                "lsd",
+                format!(
+                    "accepted LAN peer candidate {}:{} from BEP 14 announce",
+                    peer.address, peer.port
+                ),
+                Some(id),
+            );
+        }
+        Ok(added)
     }
 
     pub fn set_dht_port(&self, port: u16) {
@@ -6343,6 +6419,79 @@ mod tests {
             .logs(None)
             .iter()
             .any(|entry| entry.message.contains("not valid JSON")));
+        fs::remove_dir_all(root).expect("temp dir removes");
+    }
+
+    #[test]
+    fn lsd_announce_adds_public_lan_peer_and_skips_private_torrents() {
+        let root = temp_dir("session-lsd");
+        let torrent_path = root.join("public.torrent");
+        let output_dir = root.join("out");
+        fs::write(&torrent_path, build_multi_file_torrent(b"abcdefghi")).expect("fixture writes");
+
+        let session = TorrentSession::new(output_dir.clone());
+        session.set_listen_port(6881);
+        let add = session
+            .add(AddTorrentRequest {
+                source: TorrentSource::File(torrent_path.to_string_lossy().into_owned()),
+                destination: Some(output_dir.to_string_lossy().into_owned()),
+                paused: false,
+                overwrite: true,
+                disable_trackers: true,
+                only_files: None,
+                sub_folder: None,
+            })
+            .expect("public torrent adds");
+        let id = add.id.expect("added torrent has id");
+        let info_hash = {
+            let torrents = session.torrents.lock().expect("torrent lock");
+            torrents
+                .iter()
+                .find(|torrent| torrent.id == id)
+                .expect("torrent exists")
+                .info_hash
+        };
+
+        let announce = lsd::LsdAnnounce {
+            port: 51413,
+            info_hashes: vec![info_hash],
+            cookie: None,
+        };
+        let added = session
+            .handle_lsd_announce(&announce, "192.168.1.44:6771".parse().expect("source parses"))
+            .expect("LSD announce applies");
+        assert_eq!(added, 1);
+        let details = session.details(&id.to_string()).expect("details load");
+        assert!(details.peers.iter().any(|peer| {
+            peer.address == "192.168.1.44"
+                && peer.port == 51413
+                && peer.connection == "LSD discovered"
+        }));
+
+        {
+            let mut torrents = session.torrents.lock().expect("torrent lock");
+            let torrent = torrents
+                .iter_mut()
+                .find(|torrent| torrent.id == id)
+                .expect("torrent exists");
+            torrent.general.private = true;
+        }
+        let skipped = session
+            .handle_lsd_announce(
+                &lsd::LsdAnnounce {
+                    port: 51414,
+                    info_hashes: vec![info_hash],
+                    cookie: None,
+                },
+                "192.168.1.45:6771".parse().expect("source parses"),
+            )
+            .expect("private LSD announce is ignored");
+        assert_eq!(skipped, 0);
+        let details = session.details(&id.to_string()).expect("details load");
+        assert!(!details
+            .peers
+            .iter()
+            .any(|peer| peer.address == "192.168.1.45"));
         fs::remove_dir_all(root).expect("temp dir removes");
     }
 

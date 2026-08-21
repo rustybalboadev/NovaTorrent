@@ -1,12 +1,13 @@
 use std::{
     collections::HashSet,
     env,
-    net::{TcpListener, UdpSocket},
+    io::ErrorKind,
+    net::{IpAddr, SocketAddrV4, TcpListener, UdpSocket},
     path::{Path, PathBuf},
     process::Command,
     sync::{Arc, Mutex},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use serde::Serialize;
@@ -75,6 +76,9 @@ impl AppState {
             state
                 .session
                 .log(LogLevel::Error, "tracker", err, None);
+        }
+        if let Err(err) = state.start_lsd_service() {
+            state.session.log(LogLevel::Warn, "lsd", err, None);
         }
         for id in state.session.runnable_ids() {
             if let Err(err) = state.start_torrent_worker(id.to_string()) {
@@ -287,6 +291,173 @@ impl AppState {
             })
             .map(|_| ())
             .map_err(|err| format!("could not start DHT maintenance scheduler: {err}"))
+    }
+
+    fn start_lsd_service(&self) -> Result<(), String> {
+        let listen_port = self.session.listen_port();
+        if listen_port == 0 {
+            return Err("LSD disabled because no inbound BitTorrent TCP listener is active"
+                .to_string());
+        }
+
+        let mut receive_enabled = true;
+        let socket = match UdpSocket::bind(("0.0.0.0", crate::torrent::lsd::LSD_PORT)) {
+            Ok(socket) => socket,
+            Err(err) => {
+                receive_enabled = false;
+                self.session.log(
+                    LogLevel::Warn,
+                    "lsd",
+                    format!(
+                        "could not bind UDP {} for LAN peer discovery receives: {err}; LSD announces will still be sent",
+                        crate::torrent::lsd::LSD_PORT
+                    ),
+                    None,
+                );
+                UdpSocket::bind(("0.0.0.0", 0))
+                    .map_err(|err| format!("could not bind a UDP socket for LSD announces: {err}"))?
+            }
+        };
+        socket
+            .set_multicast_ttl_v4(1)
+            .map_err(|err| format!("could not set LSD multicast TTL: {err}"))?;
+        socket
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .map_err(|err| format!("could not set LSD read timeout: {err}"))?;
+        if receive_enabled {
+            if let Err(err) = socket.join_multicast_v4(
+                &crate::torrent::lsd::LSD_IPV4_GROUP,
+                &std::net::Ipv4Addr::UNSPECIFIED,
+            ) {
+                receive_enabled = false;
+                self.session.log(
+                    LogLevel::Warn,
+                    "lsd",
+                    format!(
+                        "could not join BEP 14 multicast group {}: {err}; LSD announces will still be sent",
+                        crate::torrent::lsd::LSD_IPV4_GROUP
+                    ),
+                    None,
+                );
+            }
+        }
+
+        self.session.log(
+            LogLevel::Info,
+            "lsd",
+            format!(
+                "Local Service Discovery active on UDP multicast {}:{} with TCP port {listen_port}",
+                crate::torrent::lsd::LSD_IPV4_GROUP,
+                crate::torrent::lsd::LSD_PORT
+            ),
+            None,
+        );
+        let session = Arc::clone(&self.session);
+        let cookie = format!("novatorrent-{}-{listen_port}", std::process::id());
+        thread::Builder::new()
+            .name("novatorrent-lsd".to_string())
+            .spawn(move || {
+                let target = SocketAddrV4::new(
+                    crate::torrent::lsd::LSD_IPV4_GROUP,
+                    crate::torrent::lsd::LSD_PORT,
+                );
+                let now = Instant::now();
+                let mut last_announce = now.checked_sub(Duration::from_secs(300)).unwrap_or(now);
+                let mut announce_cursor = 0usize;
+                let mut buffer = [0u8; 2048];
+                loop {
+                    if last_announce.elapsed() >= Duration::from_secs(300) {
+                        let hashes = session.lsd_public_info_hashes();
+                        let port = session.listen_port();
+                        if port != 0 && !hashes.is_empty() {
+                            let (batch, next_cursor) =
+                                crate::torrent::lsd::round_robin_info_hash_batch(
+                                    &hashes,
+                                    announce_cursor,
+                                );
+                            announce_cursor = next_cursor;
+                            match crate::torrent::lsd::build_lsd_announce(
+                                &batch,
+                                port,
+                                Some(&cookie),
+                            ) {
+                                Ok(packet) => match socket.send_to(&packet, target) {
+                                    Ok(_) => session.log(
+                                        LogLevel::Debug,
+                                        "lsd",
+                                        format!(
+                                            "sent LAN peer announce for {} of {} active public torrent(s)",
+                                            batch.len(),
+                                            hashes.len()
+                                        ),
+                                        None,
+                                    ),
+                                    Err(err) => session.log(
+                                        LogLevel::Warn,
+                                        "lsd",
+                                        format!("could not send LAN peer announce: {err}"),
+                                        None,
+                                    ),
+                                },
+                                Err(err) => session.log(
+                                    LogLevel::Warn,
+                                    "lsd",
+                                    format!("could not build LAN peer announce: {err}"),
+                                    None,
+                                ),
+                            }
+                        }
+                        last_announce = Instant::now();
+                    }
+
+                    if !receive_enabled {
+                        thread::sleep(Duration::from_secs(1));
+                        continue;
+                    }
+                    match socket.recv_from(&mut buffer) {
+                        Ok((length, source)) => {
+                            if matches!(source.ip(), IpAddr::V4(_)) {
+                                match crate::torrent::lsd::parse_lsd_announce(&buffer[..length]) {
+                                    Ok(announce) => {
+                                        if announce.cookie.as_deref() == Some(cookie.as_str()) {
+                                            continue;
+                                        }
+                                        if let Err(err) =
+                                            session.handle_lsd_announce(&announce, source)
+                                        {
+                                            session.log(
+                                                LogLevel::Warn,
+                                                "lsd",
+                                                format!("could not apply LAN peer announce: {err}"),
+                                                None,
+                                            );
+                                        }
+                                    }
+                                    Err(err) => session.log(
+                                        LogLevel::Debug,
+                                        "lsd",
+                                        format!("ignored malformed LAN peer announce from {source}: {err}"),
+                                        None,
+                                    ),
+                                }
+                            }
+                        }
+                        Err(err)
+                            if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+                        Err(err) => {
+                            session.log(
+                                LogLevel::Warn,
+                                "lsd",
+                                format!("LAN peer discovery receive failed: {err}"),
+                                None,
+                            );
+                            thread::sleep(Duration::from_secs(5));
+                        }
+                    }
+                }
+            })
+            .map(|_| ())
+            .map_err(|err| format!("could not start LSD worker: {err}"))
     }
 
     fn stop_tracker_background(&self, id: String) {
