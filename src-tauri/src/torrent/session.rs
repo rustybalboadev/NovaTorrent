@@ -37,6 +37,8 @@ const MAX_INBOUND_PEER_CONNECTIONS: usize = 64;
 const MAX_ENDGAME_PIECES: usize = 8;
 const MIN_RATE_LIMIT: u64 = 1024;
 const MAX_RATE_LIMIT: u64 = 10 * 1024 * 1024 * 1024;
+const TRACKER_ANNOUNCE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(16);
+const TRACKER_EARLY_PEER_GRACE: Duration = Duration::from_millis(450);
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -2009,8 +2011,25 @@ impl TorrentSession {
         }
         drop(tracker_sender);
 
-        for _ in 0..snapshot.trackers.len() {
-            let Ok((url, result, elapsed)) = tracker_receiver.recv_timeout(Duration::from_secs(16)) else {
+        let can_use_early_peers = matches!(
+            snapshot.event,
+            UdpAnnounceEvent::Started | UdpAnnounceEvent::None
+        );
+        let mut first_peer_result_at = None::<Instant>;
+        while results.len() < snapshot.trackers.len() {
+            let receive_timeout = if let Some(first_peer_result_at) = first_peer_result_at {
+                let elapsed = first_peer_result_at.elapsed();
+                if elapsed >= TRACKER_EARLY_PEER_GRACE {
+                    break;
+                }
+                TRACKER_EARLY_PEER_GRACE.saturating_sub(elapsed)
+            } else {
+                TRACKER_ANNOUNCE_RESPONSE_TIMEOUT
+            };
+            let Ok((url, result, elapsed)) = tracker_receiver.recv_timeout(receive_timeout) else {
+                if first_peer_result_at.is_some() {
+                    break;
+                }
                 self.log(
                     LogLevel::Warn,
                     "tracker",
@@ -2019,6 +2038,7 @@ impl TorrentSession {
                 );
                 break;
             };
+            let usable_peer_response = matches!(&result, Ok(response) if !response.peers.is_empty());
             self.log(
                 match &result {
                     Ok(_) => LogLevel::Debug,
@@ -2041,16 +2061,32 @@ impl TorrentSession {
                 },
                 Some(snapshot.id),
             );
+            if can_use_early_peers && usable_peer_response && first_peer_result_at.is_none() {
+                first_peer_result_at = Some(Instant::now());
+            }
             results.push((url, result));
         }
-        for worker in tracker_workers {
-            if worker.join().is_err() {
-                self.log(
-                    LogLevel::Warn,
-                    "tracker",
-                    "tracker announce worker panicked",
-                    Some(snapshot.id),
-                );
+        let pending_workers = snapshot.trackers.len().saturating_sub(results.len());
+        let using_early_peers = can_use_early_peers && first_peer_result_at.is_some() && pending_workers > 0;
+        if using_early_peers {
+            self.log(
+                LogLevel::Info,
+                "tracker",
+                format!(
+                    "using early tracker peers; {pending_workers} tracker workers still pending"
+                ),
+                Some(snapshot.id),
+            );
+        } else {
+            for worker in tracker_workers {
+                if worker.join().is_err() {
+                    self.log(
+                        LogLevel::Warn,
+                        "tracker",
+                        "tracker announce worker panicked",
+                        Some(snapshot.id),
+                    );
+                }
             }
         }
 
@@ -6117,6 +6153,111 @@ mod tests {
         assert!(requests[1].contains("event=completed"));
         assert!(!requests[2].contains("event="));
         assert!(requests[3].contains("event=stopped"));
+
+        fs::remove_dir_all(root).expect("temp dir removes");
+    }
+
+    #[test]
+    fn tracker_announce_uses_fast_peers_before_slow_trackers_finish() {
+        let root = temp_dir("session-early-tracker-peers");
+        let torrent_path = root.join("multi.torrent");
+        fs::write(&torrent_path, build_multi_file_torrent(b"abcdefghi")).expect("fixture writes");
+
+        let fast_listener = TcpListener::bind("127.0.0.1:0").expect("fast tracker binds");
+        let fast_port = fast_listener.local_addr().expect("fast tracker address").port();
+        let fast_url = format!("http://127.0.0.1:{fast_port}/announce");
+        let fast_tracker = thread::spawn(move || {
+            let (mut stream, _) = fast_listener.accept().expect("fast announce connects");
+            let mut buffer = [0u8; 4096];
+            let _ = stream.read(&mut buffer).expect("fast announce request reads");
+            let mut body = b"d8:intervali60e5:peers6:".to_vec();
+            body.extend_from_slice(&[127, 0, 0, 1, 0x1a, 0xe1]);
+            body.push(b'e');
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).expect("fast tracker headers write");
+            stream.write_all(&body).expect("fast tracker body writes");
+        });
+
+        let slow_listener = TcpListener::bind("127.0.0.1:0").expect("slow tracker binds");
+        let slow_port = slow_listener.local_addr().expect("slow tracker address").port();
+        let slow_url = format!("http://127.0.0.1:{slow_port}/announce");
+        let slow_tracker = thread::spawn(move || {
+            let (mut stream, _) = slow_listener.accept().expect("slow announce connects");
+            let mut buffer = [0u8; 4096];
+            let _ = stream.read(&mut buffer).expect("slow announce request reads");
+            thread::sleep(Duration::from_millis(1_400));
+            let body = b"d8:intervali60e5:peers0:e";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).expect("slow tracker headers write");
+            stream.write_all(body).expect("slow tracker body writes");
+        });
+
+        let session = TorrentSession::new(root.join("out"));
+        let added = session
+            .add(AddTorrentRequest {
+                source: TorrentSource::File(torrent_path.to_string_lossy().into_owned()),
+                destination: Some(root.join("out").to_string_lossy().into_owned()),
+                paused: false,
+                overwrite: true,
+                disable_trackers: false,
+                only_files: None,
+                sub_folder: None,
+            })
+            .expect("torrent adds");
+        let id = added.id.expect("torrent has ID");
+        {
+            let mut torrents = session.torrents.lock().expect("torrent lock");
+            let torrent = torrents
+                .iter_mut()
+                .find(|torrent| torrent.id == id)
+                .expect("torrent exists");
+            torrent.trackers.push(TrackerStatus {
+                url: fast_url,
+                state: "Not contacted".to_string(),
+                seeders: None,
+                leechers: None,
+                next_announce_seconds: None,
+                message: None,
+            });
+            torrent.trackers.push(TrackerStatus {
+                url: slow_url,
+                state: "Not contacted".to_string(),
+                seeders: None,
+                leechers: None,
+                next_announce_seconds: None,
+                message: None,
+            });
+        }
+        session.set_listen_port(6999);
+
+        let started = Instant::now();
+        session.announce(&id.to_string()).expect("announce succeeds");
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(1_000),
+            "announce waited for the slow tracker: {elapsed:?}"
+        );
+        let peers = {
+            let torrents = session.torrents.lock().expect("torrent lock");
+            torrents
+                .iter()
+                .find(|torrent| torrent.id == id)
+                .expect("torrent exists")
+                .peers
+                .clone()
+        };
+        assert!(peers
+            .iter()
+            .any(|peer| peer.address == "127.0.0.1" && peer.port == 6881));
+        fast_tracker.join().expect("fast tracker exits");
+        slow_tracker.join().expect("slow tracker exits");
 
         fs::remove_dir_all(root).expect("temp dir removes");
     }
