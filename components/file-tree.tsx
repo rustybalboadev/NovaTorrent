@@ -1,8 +1,9 @@
 "use client";
 
 import * as React from "react";
-import { ChevronRight, FileText, Folder, FolderOpen } from "lucide-react";
+import { ChevronRight, FileText, Folder, FolderOpen, Play } from "lucide-react";
 import { Checkbox } from "@/components/ui/checkbox";
+import { Button } from "@/components/ui/button";
 import { cn, formatBytes } from "@/lib/utils";
 import type { TorrentFile } from "@/lib/torrent-types";
 
@@ -19,11 +20,21 @@ type FileTreeProps = {
   files: TorrentFile[];
   selectedFileIds: Set<number>;
   onSelectionChange?: (selected: Set<number>) => void;
+  onPlayFile?: (fileIndex: number) => void;
+  activeMediaFileIndex?: number | null;
   readonly?: boolean;
   compact?: boolean;
 };
 
-export function FileTree({ files, selectedFileIds, onSelectionChange, readonly, compact }: FileTreeProps) {
+export function FileTree({
+  files,
+  selectedFileIds,
+  onSelectionChange,
+  onPlayFile,
+  activeMediaFileIndex,
+  readonly,
+  compact
+}: FileTreeProps) {
   const tree = React.useMemo(() => buildTree(files), [files]);
   const [expanded, setExpanded] = React.useState<Set<string>>(() => new Set());
 
@@ -72,6 +83,8 @@ export function FileTree({ files, selectedFileIds, onSelectionChange, readonly, 
           readonly={readonly}
           onToggleExpanded={toggleExpanded}
           onToggleNode={toggleNode}
+          onPlayFile={onPlayFile}
+          activeMediaFileIndex={activeMediaFileIndex}
         />
       ))}
     </div>
@@ -85,7 +98,9 @@ function TreeNode({
   selectedFileIds,
   readonly,
   onToggleExpanded,
-  onToggleNode
+  onToggleNode,
+  onPlayFile,
+  activeMediaFileIndex
 }: {
   node: FileNode;
   depth: number;
@@ -94,15 +109,19 @@ function TreeNode({
   readonly?: boolean;
   onToggleExpanded: (id: string) => void;
   onToggleNode: (node: FileNode, checked: boolean) => void;
+  onPlayFile?: (fileIndex: number) => void;
+  activeMediaFileIndex?: number | null;
 }) {
   const isExpanded = expanded.has(node.id);
   const checkboxState = getCheckboxState(node, selectedFileIds);
   const Icon = node.type === "folder" ? (isExpanded ? FolderOpen : Folder) : FileText;
+  const playableFileId = node.type === "file" && isPlayableMediaName(node.name) ? node.fileIds[0] : null;
+  const isActiveMedia = playableFileId != null && activeMediaFileIndex === playableFileId;
 
   return (
     <div>
       <div
-        className="grid min-h-8 grid-cols-[auto_1fr_auto] items-center gap-2 rounded-md px-2 hover:bg-secondary/65"
+        className="grid min-h-8 grid-cols-[auto_1fr_auto_auto] items-center gap-2 rounded-md px-2 hover:bg-secondary/65"
         style={{ paddingLeft: `${depth * 18 + 8}px` }}
       >
         <div className="flex items-center gap-1">
@@ -126,9 +145,24 @@ function TreeNode({
         </div>
         <div className="flex min-w-0 items-center gap-2">
           <Icon className={cn("h-4 w-4 shrink-0", node.type === "folder" ? "text-accent" : "text-muted-foreground")} />
-          <span className="truncate text-sm">{node.name}</span>
+          <span className={cn("truncate text-sm", isActiveMedia && "font-semibold text-primary")}>{node.name}</span>
         </div>
         <span className="text-xs tabular-nums text-muted-foreground">{formatBytes(node.size)}</span>
+        {playableFileId != null && onPlayFile ? (
+          <Button
+            type="button"
+            variant={isActiveMedia ? "default" : "outline"}
+            size="icon"
+            className="h-7 w-7"
+            title={isActiveMedia ? "Active media file" : "Play media file"}
+            aria-label={isActiveMedia ? "Active media file" : `Play ${node.name}`}
+            onClick={() => onPlayFile(playableFileId)}
+          >
+            <Play className="h-3.5 w-3.5" />
+          </Button>
+        ) : (
+          <span className="h-7 w-7" />
+        )}
       </div>
       {node.type === "folder" && isExpanded ? (
         <div>
@@ -142,6 +176,8 @@ function TreeNode({
               readonly={readonly}
               onToggleExpanded={onToggleExpanded}
               onToggleNode={onToggleNode}
+              onPlayFile={onPlayFile}
+              activeMediaFileIndex={activeMediaFileIndex}
             />
           ))}
         </div>
@@ -203,4 +239,9 @@ function getCheckboxState(node: FileNode, selectedFileIds: Set<number>) {
   if (selected === 0) return false;
   if (selected === node.fileIds.length) return true;
   return "indeterminate";
+}
+
+function isPlayableMediaName(name: string) {
+  const extension = name.split(".").pop()?.toLowerCase();
+  return Boolean(extension && ["mp4", "m4v", "mov", "webm", "mkv", "ogv", "avi"].includes(extension));
 }

@@ -8,6 +8,7 @@ import {
   Activity,
   BarChart3,
   CheckCircle2,
+  Clapperboard,
   Download,
   ExternalLink,
   FileCog,
@@ -27,6 +28,7 @@ import {
   Sun,
   Trash2,
   Upload,
+  X,
 } from "lucide-react";
 import { AddTorrentPanel } from "@/components/add-torrent-panel";
 import { FileTree } from "@/components/file-tree";
@@ -53,6 +55,9 @@ import {
   recheckTorrent,
   resolveMagnetTorrent,
   resumeTorrent,
+  clearStreamPriority,
+  setStreamPriority,
+  streamFileAvailability,
   takePendingOpenSources,
   torrentDetails,
   updateTorrentFiles,
@@ -61,6 +66,8 @@ import {
 import {
   normalizeTorrent,
   type LogEntry,
+  type StreamPriorityStatus,
+  type TorrentFileAvailability,
   type TorrentFileHash,
   type TorrentRow,
   type UpdateTorrentOptionsRequest
@@ -70,6 +77,14 @@ import { cn, formatBytes, formatEta, formatRate, percent } from "@/lib/utils";
 const filters = ["All", "Downloading", "Seeding", "Paused", "Complete", "Error"] as const;
 const inspectorTabs = ["Status", "General", "Peers", "Trackers", "Web Seeds", "Files", "Security", "Options", "Logs"] as const;
 const completedStates = new Set(["Complete", "Seeding", "Seed Ratio Reached"]);
+const playableExtensions = new Set(["mp4", "m4v", "mov", "webm", "mkv", "ogv", "avi"]);
+
+type MediaSession = {
+  torrentId: string;
+  fileIndex: number;
+  availability: TorrentFileAvailability;
+  priority: StreamPriorityStatus;
+};
 
 export function TorrentDashboard() {
   const { resolvedTheme, setTheme } = useTheme();
@@ -84,9 +99,14 @@ export function TorrentDashboard() {
   const [inspectorTab, setInspectorTab] = React.useState<(typeof inspectorTabs)[number]>("Status");
   const [logs, setLogs] = React.useState<LogEntry[]>([]);
   const [logFilePath, setLogFilePath] = React.useState<string | null>(null);
+  const [mediaSession, setMediaSession] = React.useState<MediaSession | null>(null);
+  const [mediaBusy, setMediaBusy] = React.useState(false);
+  const [mediaError, setMediaError] = React.useState<string | null>(null);
 
   const selected = selectedId ? rows.find((row) => row.id === selectedId) ?? null : null;
   const selectedBackendId = typeof selected?.raw.id === "number" ? selected.raw.id : null;
+  const mediaTorrentId = mediaSession?.torrentId ?? null;
+  const mediaFileIndex = mediaSession?.fileIndex ?? null;
   const selectedFileIds = React.useMemo(() => {
     if (!selected) return new Set<number>();
     return fileSelections[selected.id] ?? includedFileIds(selected.files);
@@ -124,6 +144,30 @@ export function TorrentDashboard() {
       void hydrateDetails(selected.id);
     }
   }, [selected]);
+
+  React.useEffect(() => {
+    if (mediaTorrentId == null || mediaFileIndex == null) return;
+    let disposed = false;
+    const loadAvailability = async () => {
+      try {
+        const availability = await streamFileAvailability(mediaTorrentId, mediaFileIndex);
+        if (!disposed) {
+          setMediaSession((current) =>
+            current && current.torrentId === mediaTorrentId && current.fileIndex === mediaFileIndex
+              ? { ...current, availability }
+              : current
+          );
+        }
+      } catch {
+        undefined;
+      }
+    };
+    const interval = window.setInterval(loadAvailability, 2500);
+    return () => {
+      disposed = true;
+      window.clearInterval(interval);
+    };
+  }, [mediaTorrentId, mediaFileIndex]);
 
   React.useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -168,6 +212,9 @@ export function TorrentDashboard() {
       const nextRows = response.torrents.map(normalizeTorrent);
       setRows((currentRows) => mergeRows(currentRows, nextRows));
       setSelectedId((current) => (current && nextRows.some((row) => row.id === current) ? current : null));
+      setMediaSession((current) =>
+        current && nextRows.some((row) => row.id === current.torrentId) ? current : null
+      );
       setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not list torrents.");
@@ -238,6 +285,45 @@ export function TorrentDashboard() {
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not update torrent options.");
       throw err;
+    }
+  }
+
+  async function handlePlayFile(row: TorrentRow, fileIndex: number, playheadOffset = 0) {
+    setMediaBusy(true);
+    setMediaError(null);
+    try {
+      const priority = await setStreamPriority(row.id, {
+        fileIndex,
+        playheadOffset,
+        urgentBytes: null,
+        lookaheadBytes: null
+      });
+      const availability = await streamFileAvailability(row.id, fileIndex);
+      setMediaSession({ torrentId: row.id, fileIndex, priority, availability });
+      setSelectedId(row.id);
+      setInspectorTab("Files");
+      setError(null);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Could not prepare this file for streaming.";
+      setMediaError(message);
+      setError(message);
+    } finally {
+      setMediaBusy(false);
+    }
+  }
+
+  async function handleClearStream() {
+    if (!mediaSession) return;
+    const torrentId = mediaSession.torrentId;
+    setMediaBusy(true);
+    setMediaError(null);
+    try {
+      await clearStreamPriority(torrentId);
+      setMediaSession(null);
+    } catch (err) {
+      setMediaError(err instanceof Error ? err.message : "Could not stop stream priority.");
+    } finally {
+      setMediaBusy(false);
     }
   }
 
@@ -370,6 +456,11 @@ export function TorrentDashboard() {
                 logs={logs}
                 logFilePath={logFilePath}
                 onFileSelectionChange={handleFileSelection}
+                mediaSession={mediaSession?.torrentId === selected.id ? mediaSession : null}
+                mediaBusy={mediaBusy}
+                mediaError={mediaSession?.torrentId === selected.id ? mediaError : null}
+                onPlayFile={(fileIndex) => void handlePlayFile(selected, fileIndex)}
+                onClearStream={() => void handleClearStream()}
                 onOptionsChange={handleOptionsChange}
                 onRefresh={() => void hydrateDetails(selected.id)}
               />
@@ -490,6 +581,11 @@ function TorrentInspector({
   logs,
   logFilePath,
   onFileSelectionChange,
+  mediaSession,
+  mediaBusy,
+  mediaError,
+  onPlayFile,
+  onClearStream,
   onOptionsChange,
   onRefresh
 }: {
@@ -502,6 +598,11 @@ function TorrentInspector({
   logs: LogEntry[];
   logFilePath: string | null;
   onFileSelectionChange: (selected: Set<number>) => void;
+  mediaSession: MediaSession | null;
+  mediaBusy: boolean;
+  mediaError: string | null;
+  onPlayFile: (fileIndex: number) => void;
+  onClearStream: () => void;
   onOptionsChange: (request: UpdateTorrentOptionsRequest) => Promise<void>;
   onRefresh: () => void;
 }) {
@@ -562,6 +663,11 @@ function TorrentInspector({
           logs={logs}
           logFilePath={logFilePath}
           onFileSelectionChange={onFileSelectionChange}
+          mediaSession={mediaSession}
+          mediaBusy={mediaBusy}
+          mediaError={mediaError}
+          onPlayFile={onPlayFile}
+          onClearStream={onClearStream}
           onOptionsChange={onOptionsChange}
           onRefresh={onRefresh}
         />
@@ -577,6 +683,11 @@ function InspectorTab({
   logs,
   logFilePath,
   onFileSelectionChange,
+  mediaSession,
+  mediaBusy,
+  mediaError,
+  onPlayFile,
+  onClearStream,
   onOptionsChange,
   onRefresh
 }: {
@@ -586,6 +697,11 @@ function InspectorTab({
   logs: LogEntry[];
   logFilePath: string | null;
   onFileSelectionChange: (selected: Set<number>) => void;
+  mediaSession: MediaSession | null;
+  mediaBusy: boolean;
+  mediaError: string | null;
+  onPlayFile: (fileIndex: number) => void;
+  onClearStream: () => void;
   onOptionsChange: (request: UpdateTorrentOptionsRequest) => Promise<void>;
   onRefresh: () => void;
 }) {
@@ -699,7 +815,21 @@ function InspectorTab({
             Refresh
           </Button>
         </div>
-        <FileTree files={selected.files} selectedFileIds={selectedFileIds} onSelectionChange={onFileSelectionChange} compact />
+        <TorrentMediaPanel
+          selected={selected}
+          mediaSession={mediaSession}
+          mediaBusy={mediaBusy}
+          mediaError={mediaError}
+          onClearStream={onClearStream}
+        />
+        <FileTree
+          files={selected.files}
+          selectedFileIds={selectedFileIds}
+          onSelectionChange={onFileSelectionChange}
+          onPlayFile={onPlayFile}
+          activeMediaFileIndex={mediaSession?.fileIndex ?? null}
+          compact
+        />
       </div>
     );
   }
@@ -734,6 +864,63 @@ function InspectorTab({
       ) : (
         <EmptyTab icon={<ScrollText />} text="No backend logs yet." />
       )}
+    </div>
+  );
+}
+
+function TorrentMediaPanel({
+  selected,
+  mediaSession,
+  mediaBusy,
+  mediaError,
+  onClearStream
+}: {
+  selected: TorrentRow;
+  mediaSession: MediaSession | null;
+  mediaBusy: boolean;
+  mediaError: string | null;
+  onClearStream: () => void;
+}) {
+  const playableCount = selected.files.filter(isPlayableMedia).length;
+  if (!playableCount && !mediaSession && !mediaError) return null;
+
+  const availability = mediaSession?.availability;
+  const bufferPercent = availability && availability.length > 0 ? (availability.verified_bytes / availability.length) * 100 : 0;
+
+  return (
+    <div className="rounded-md border bg-background">
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b px-3 py-2">
+        <div className="flex min-w-0 items-center gap-2">
+          <Clapperboard className="h-4 w-4 shrink-0 text-primary" />
+          <div className="min-w-0">
+            <div className="truncate text-sm font-semibold">
+              {availability ? availability.name : `${playableCount} playable ${playableCount === 1 ? "file" : "files"}`}
+            </div>
+            <div className="text-xs text-muted-foreground">
+              {availability
+                ? `${formatBytes(availability.verified_bytes)} verified of ${formatBytes(availability.length)}`
+                : "No active media file"}
+            </div>
+          </div>
+        </div>
+        {mediaSession ? (
+          <Button type="button" variant="outline" size="sm" disabled={mediaBusy} onClick={onClearStream}>
+            <X />
+            Stop
+          </Button>
+        ) : null}
+      </div>
+      {availability ? (
+        <div className="space-y-2 px-3 py-2">
+          <Progress value={percent(bufferPercent)} className="h-2" />
+          <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+            <span>{availability.ranges.length} verified range{availability.ranges.length === 1 ? "" : "s"}</span>
+            <span>{mediaSession.priority.total_priority_pieces} priority piece{mediaSession.priority.total_priority_pieces === 1 ? "" : "s"}</span>
+            <span>{availability.complete ? "Ready" : mediaBusy ? "Updating" : "Buffering"}</span>
+          </div>
+        </div>
+      ) : null}
+      {mediaError ? <div className="border-t px-3 py-2 text-sm text-destructive">{mediaError}</div> : null}
     </div>
   );
 }
@@ -1079,6 +1266,12 @@ function logTone(level: LogEntry["level"]) {
   if (level === "Warn") return "text-accent";
   if (level === "Debug") return "text-muted-foreground";
   return "text-primary";
+}
+
+function isPlayableMedia(file: { name: string; components?: string[] }) {
+  const candidate = file.components?.at(-1) ?? file.name;
+  const extension = candidate.split(".").pop()?.toLowerCase();
+  return Boolean(extension && playableExtensions.has(extension));
 }
 
 function statusVariant(state: string): React.ComponentProps<typeof Badge>["variant"] {
