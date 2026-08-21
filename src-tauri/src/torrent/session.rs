@@ -1638,7 +1638,16 @@ impl TorrentSession {
             Ok(()) => {
                 if let Ok(completed) = self.runtime_snapshot(id) {
                     if completed.finished && !completed.trackers_disabled {
-                        let _ = self.announce(id);
+                        if let Err(err) = self.announce_completion_after_verification(id) {
+                            self.log(
+                                LogLevel::Warn,
+                                "tracker",
+                                format!(
+                                    "could not finish post-download tracker announce sequence: {err}"
+                                ),
+                                Some(completed.id),
+                            );
+                        }
                     }
                     if completed.finished && !completed.private {
                         let _ = self.announce_dht_targets(id, Duration::from_secs(4));
@@ -2026,6 +2035,39 @@ impl TorrentSession {
             return Ok(EmptyJsonResponse {});
         }
         self.announce_with_event(id, UdpAnnounceEvent::Stopped)
+    }
+
+    fn announce_completion_after_verification(&self, id: &str) -> Result<(), String> {
+        let needs_started = {
+            let torrents = self.torrents.lock().map_err(|_| "torrent lock poisoned")?;
+            let torrent = torrents
+                .iter()
+                .find(|torrent| torrent.matches_id(id))
+                .ok_or_else(|| format!("torrent not found: {id}"))?;
+            if !torrent.stats.finished
+                || torrent.options.disable_trackers
+                || torrent.trackers.is_empty()
+            {
+                return Ok(());
+            }
+            !torrent.tracker_started
+        };
+        if needs_started {
+            self.announce(id)?;
+        }
+
+        let needs_completed = {
+            let torrents = self.torrents.lock().map_err(|_| "torrent lock poisoned")?;
+            let torrent = torrents
+                .iter()
+                .find(|torrent| torrent.matches_id(id))
+                .ok_or_else(|| format!("torrent not found: {id}"))?;
+            torrent.stats.finished && torrent.tracker_started && !torrent.tracker_completed
+        };
+        if needs_completed {
+            self.announce(id)?;
+        }
+        Ok(())
     }
 
     fn announce_with_event(
@@ -7424,6 +7466,100 @@ mod tests {
             .any(|peer| peer.address == "127.0.0.1" && peer.port == 6881));
         fast_tracker.join().expect("fast tracker exits");
         slow_tracker.join().expect("slow tracker exits");
+
+        fs::remove_dir_all(root).expect("temp dir removes");
+    }
+
+    #[test]
+    fn completion_announce_sends_started_then_completed_when_tracker_was_never_started() {
+        let root = temp_dir("session-completion-announces");
+        let torrent_path = root.join("multi.torrent");
+        fs::write(&torrent_path, build_multi_file_torrent(b"abcdefghi")).expect("fixture writes");
+        let tracker_listener = TcpListener::bind("127.0.0.1:0").expect("tracker binds");
+        let tracker_port = tracker_listener.local_addr().expect("tracker address").port();
+        let tracker_url = format!("http://127.0.0.1:{tracker_port}/announce");
+
+        let tracker = thread::spawn(move || {
+            let mut events = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = tracker_listener.accept().expect("announce connects");
+                let mut buffer = [0u8; 4096];
+                let length = stream.read(&mut buffer).expect("announce request reads");
+                let request = String::from_utf8_lossy(&buffer[..length]);
+                let event = if request.contains("event=started") {
+                    "started"
+                } else if request.contains("event=completed") {
+                    "completed"
+                } else {
+                    "none"
+                };
+                events.push(event.to_string());
+                let body = b"d8:intervali60e5:peers0:e";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).expect("tracker headers write");
+                stream.write_all(body).expect("tracker body writes");
+            }
+            events
+        });
+
+        let session = TorrentSession::new(root.join("out"));
+        let added = session
+            .add(AddTorrentRequest {
+                source: TorrentSource::File(torrent_path.to_string_lossy().into_owned()),
+                destination: Some(root.join("out").to_string_lossy().into_owned()),
+                paused: false,
+                overwrite: true,
+                disable_trackers: false,
+                only_files: None,
+                sub_folder: None,
+            })
+            .expect("torrent adds");
+        let id = added.id.expect("torrent has ID");
+        {
+            let mut torrents = session.torrents.lock().expect("torrent lock");
+            let torrent = torrents
+                .iter_mut()
+                .find(|torrent| torrent.id == id)
+                .expect("torrent exists");
+            torrent.trackers.push(TrackerStatus {
+                url: tracker_url,
+                state: "Not contacted".to_string(),
+                seeders: None,
+                leechers: None,
+                next_announce_seconds: None,
+                message: None,
+            });
+            torrent.stats.progress_bytes = torrent.stats.total_bytes;
+            torrent.general.downloaded = torrent.stats.total_bytes;
+            torrent.stats.finished = true;
+            update_completed_torrent_state(torrent);
+            assert!(!torrent.tracker_started);
+            assert!(!torrent.tracker_completed);
+        }
+        session.set_listen_port(6999);
+        session
+            .announce_completion_after_verification(&id.to_string())
+            .expect("completion announce succeeds");
+        assert_eq!(
+            tracker.join().expect("tracker exits"),
+            vec!["started", "completed"]
+        );
+
+        let details = session.details(&id.to_string()).expect("details load");
+        let stats = details.stats.expect("stats exist");
+        assert_eq!(stats.state, "Seeding");
+        {
+            let torrents = session.torrents.lock().expect("torrent lock");
+            let torrent = torrents
+                .iter()
+                .find(|torrent| torrent.id == id)
+                .expect("torrent exists");
+            assert!(torrent.tracker_started);
+            assert!(torrent.tracker_completed);
+        }
 
         fs::remove_dir_all(root).expect("temp dir removes");
     }
