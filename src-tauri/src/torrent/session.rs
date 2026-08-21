@@ -259,6 +259,16 @@ pub struct DeletedTorrentCleanup {
     pub delete_files: bool,
 }
 
+#[derive(Debug, Clone, Default)]
+struct PeerHealth {
+    connection_attempts: u32,
+    consecutive_failures: u32,
+    last_failure_ms: Option<u128>,
+    last_success_ms: Option<u128>,
+    bytes_downloaded: u64,
+    pieces_downloaded: u64,
+}
+
 #[derive(Debug, Clone)]
 struct TorrentTask {
     id: u64,
@@ -283,6 +293,7 @@ struct TorrentTask {
     upload_gate: peerwire::UploadGate,
     download_limiter: peerwire::BandwidthLimiter,
     upload_limiter: peerwire::BandwidthLimiter,
+    peer_health: HashMap<String, PeerHealth>,
 }
 
 #[derive(Debug, Clone)]
@@ -328,6 +339,8 @@ struct PeerDownloadSnapshot {
     private: bool,
     overwrite: bool,
     cancelled: Arc<AtomicBool>,
+    candidate_peers: usize,
+    deferred_for_backoff: usize,
 }
 
 struct ConnectedPeer {
@@ -2124,6 +2137,11 @@ impl TorrentSession {
                 .find(|torrent| torrent.matches_id(id))
                 .ok_or_else(|| format!("torrent not found: {id}"))?;
             let max_connections = normalized_connection_limit(torrent.options.max_connections);
+            let PeerSchedule {
+                peers,
+                candidate_peers,
+                deferred_for_backoff,
+            } = schedule_peers_for_download(torrent, max_connections);
             PeerDownloadSnapshot {
                 id: torrent.id,
                 name: torrent.name.clone(),
@@ -2133,18 +2151,15 @@ impl TorrentSession {
                 total_length: torrent.stats.total_bytes,
                 piece_length: torrent.general.piece_size,
                 piece_hashes: torrent.piece_hashes.clone(),
-                peers: torrent
-                    .peers
-                    .iter()
-                    .take(max_connections)
-                    .cloned()
-                    .collect(),
+                peers,
                 max_connections,
                 sequential_download: torrent.options.sequential_download,
                 download_limiter: torrent.download_limiter.clone(),
                 private: torrent.general.private,
                 overwrite: torrent.options.overwrite,
                 cancelled: Arc::clone(&torrent.cancelled),
+                candidate_peers,
+                deferred_for_backoff,
             }
         };
 
@@ -2178,6 +2193,19 @@ impl TorrentSession {
             ),
             Some(snapshot.id),
         );
+        if snapshot.deferred_for_backoff > 0 {
+            self.log(
+                LogLevel::Debug,
+                "peer",
+                format!(
+                    "peer scheduler prioritized {} of {} candidates; {} recently failed peers were deferred by backoff",
+                    snapshot.peers.len(),
+                    snapshot.candidate_peers,
+                    snapshot.deferred_for_backoff
+                ),
+                Some(snapshot.id),
+            );
+        }
 
         let store_key = sha1::hex(&snapshot.info_hash);
         let mut partial_store = storage::PartialPieceStore::open(
@@ -2220,6 +2248,7 @@ impl TorrentSession {
             let (connect_sender, connect_receiver) = std::sync::mpsc::channel();
             for peer in peer_batch.iter().cloned() {
                 self.set_peer_connection(id, &peer.address, peer.port, "Connecting", None)?;
+                self.record_peer_attempt(id, &peer.address, peer.port)?;
                 let address = peer.address.clone();
                 let plan = PeerDownloadPlan {
                     info_hash: snapshot.info_hash,
@@ -2283,6 +2312,7 @@ impl TorrentSession {
                 settled_peers.insert((peer.address.clone(), peer.port));
                 match result {
                     Ok(mut connection) => {
+                        self.record_peer_connect_success(id, &peer.address, peer.port)?;
                         if let Some(dht_port) = connection.take_remote_dht_port() {
                             advertised_dht_nodes.push((peer.address.clone(), dht_port));
                         }
@@ -2310,6 +2340,7 @@ impl TorrentSession {
                         connected.push(ConnectedPeer { peer, connection });
                     }
                     Err(err) => {
+                        self.record_peer_failure(id, &peer.address, peer.port)?;
                         self.set_peer_connection(
                             id,
                             &peer.address,
@@ -2367,6 +2398,7 @@ impl TorrentSession {
                 while let Ok((peer, result)) = connect_receiver.try_recv() {
                     match result {
                         Ok(mut connection) => {
+                            self.record_peer_connect_success(id, &peer.address, peer.port)?;
                             if let Some(dht_port) = connection.take_remote_dht_port() {
                                 pending_dht_nodes.push((peer.address.clone(), dht_port));
                             }
@@ -2391,17 +2423,18 @@ impl TorrentSession {
                             connected.push(ConnectedPeer { peer, connection });
                         }
                         Err(err) => {
-                        self.set_peer_connection(
-                            id,
-                            &peer.address,
-                            peer.port,
-                            "Error",
-                            Some(err.clone()),
-                        )?;
-                        errors.push(format!("{}:{}: {err}", peer.address, peer.port));
+                            self.record_peer_failure(id, &peer.address, peer.port)?;
+                            self.set_peer_connection(
+                                id,
+                                &peer.address,
+                                peer.port,
+                                "Error",
+                                Some(err.clone()),
+                            )?;
+                            errors.push(format!("{}:{}: {err}", peer.address, peer.port));
+                        }
                     }
                 }
-            }
             }
 
             if connected.is_empty() {
@@ -2511,6 +2544,7 @@ impl TorrentSession {
                             )?;
                         }
                         for (peer, error) in race_errors {
+                            self.record_peer_failure(id, &peer.address, peer.port)?;
                             self.set_peer_connection(
                                 id,
                                 &peer.address,
@@ -3741,6 +3775,7 @@ impl TorrentSession {
             upload_gate,
             download_limiter,
             upload_limiter,
+            peer_health: HashMap::new(),
         })
     }
 
@@ -3835,6 +3870,7 @@ impl TorrentSession {
             upload_gate,
             download_limiter,
             upload_limiter,
+            peer_health: HashMap::new(),
         })
     }
 
@@ -3983,6 +4019,46 @@ impl TorrentSession {
         Ok(())
     }
 
+    fn record_peer_attempt(&self, id: &str, address: &str, port: u16) -> Result<(), String> {
+        let mut torrents = self.torrents.lock().map_err(|_| "torrent lock poisoned")?;
+        let torrent = torrents
+            .iter_mut()
+            .find(|torrent| torrent.matches_id(id))
+            .ok_or_else(|| format!("torrent not found: {id}"))?;
+        let health = peer_health_entry(torrent, address, port);
+        health.connection_attempts = health.connection_attempts.saturating_add(1);
+        Ok(())
+    }
+
+    fn record_peer_connect_success(
+        &self,
+        id: &str,
+        address: &str,
+        port: u16,
+    ) -> Result<(), String> {
+        let mut torrents = self.torrents.lock().map_err(|_| "torrent lock poisoned")?;
+        let torrent = torrents
+            .iter_mut()
+            .find(|torrent| torrent.matches_id(id))
+            .ok_or_else(|| format!("torrent not found: {id}"))?;
+        let health = peer_health_entry(torrent, address, port);
+        health.consecutive_failures = 0;
+        health.last_success_ms = Some(timestamp_ms());
+        Ok(())
+    }
+
+    fn record_peer_failure(&self, id: &str, address: &str, port: u16) -> Result<(), String> {
+        let mut torrents = self.torrents.lock().map_err(|_| "torrent lock poisoned")?;
+        let torrent = torrents
+            .iter_mut()
+            .find(|torrent| torrent.matches_id(id))
+            .ok_or_else(|| format!("torrent not found: {id}"))?;
+        let health = peer_health_entry(torrent, address, port);
+        health.consecutive_failures = health.consecutive_failures.saturating_add(1);
+        health.last_failure_ms = Some(timestamp_ms());
+        Ok(())
+    }
+
     fn mark_webseed_complete(
         &self,
         id: &str,
@@ -4064,6 +4140,21 @@ impl TorrentSession {
                 None => format!("Contributed {contributed_pieces} verified pieces"),
             };
             peer.download_speed = contributed_bytes;
+        }
+        {
+            let health = peer_health_entry(torrent, address, port);
+            if contributed_pieces > 0 {
+                health.bytes_downloaded = health.bytes_downloaded.saturating_add(contributed_bytes);
+                health.pieces_downloaded = health
+                    .pieces_downloaded
+                    .saturating_add(contributed_pieces as u64);
+                health.consecutive_failures = 0;
+                health.last_success_ms = Some(timestamp_ms());
+            }
+            if error.is_some() {
+                health.consecutive_failures = health.consecutive_failures.saturating_add(1);
+                health.last_failure_ms = Some(timestamp_ms());
+            }
         }
         torrent.stats.progress_bytes = progress_bytes;
         torrent.stats.finished = false;
@@ -4591,6 +4682,124 @@ fn update_tracker_status(status: &mut TrackerStatus, response: &TrackerAnnounceR
     status.message = response.warning.clone();
 }
 
+struct PeerSchedule {
+    peers: Vec<PeerInfo>,
+    candidate_peers: usize,
+    deferred_for_backoff: usize,
+}
+
+fn schedule_peers_for_download(torrent: &TorrentTask, max_connections: usize) -> PeerSchedule {
+    let now = timestamp_ms();
+    let mut ready = Vec::new();
+    let mut backed_off = Vec::new();
+    for peer in torrent.peers.iter().cloned() {
+        let health = torrent.peer_health.get(&peer_key(&peer.address, peer.port));
+        if peer_is_in_backoff(health, now) {
+            backed_off.push(peer);
+        } else {
+            ready.push(peer);
+        }
+    }
+    ready.sort_by(|left, right| {
+        let left_health = torrent.peer_health.get(&peer_key(&left.address, left.port));
+        let right_health = torrent.peer_health.get(&peer_key(&right.address, right.port));
+        peer_success_score(right_health)
+            .cmp(&peer_success_score(left_health))
+            .then_with(|| peer_piece_score(right_health).cmp(&peer_piece_score(left_health)))
+            .then_with(|| peer_byte_score(right_health).cmp(&peer_byte_score(left_health)))
+            .then_with(|| peer_failure_count(left_health).cmp(&peer_failure_count(right_health)))
+            .then_with(|| peer_attempt_count(left_health).cmp(&peer_attempt_count(right_health)))
+            .then_with(|| left.address.cmp(&right.address))
+            .then_with(|| left.port.cmp(&right.port))
+    });
+    backed_off.sort_by(|left, right| {
+        let left_until = peer_backoff_until_ms(
+            torrent.peer_health.get(&peer_key(&left.address, left.port)),
+        )
+        .unwrap_or_default();
+        let right_until = peer_backoff_until_ms(
+            torrent.peer_health.get(&peer_key(&right.address, right.port)),
+        )
+        .unwrap_or_default();
+        left_until
+            .cmp(&right_until)
+            .then_with(|| left.address.cmp(&right.address))
+            .then_with(|| left.port.cmp(&right.port))
+    });
+    let backed_off_count = backed_off.len();
+    let selected_backed_off = max_connections.saturating_sub(ready.len()).min(backed_off_count);
+    if ready.len() < max_connections {
+        ready.extend(backed_off.into_iter().take(selected_backed_off));
+    }
+    ready.truncate(max_connections);
+    PeerSchedule {
+        peers: ready,
+        candidate_peers: torrent.peers.len(),
+        deferred_for_backoff: backed_off_count.saturating_sub(selected_backed_off),
+    }
+}
+
+fn peer_key(address: &str, port: u16) -> String {
+    format!("{address}|{port}")
+}
+
+fn peer_health_entry<'a>(
+    torrent: &'a mut TorrentTask,
+    address: &str,
+    port: u16,
+) -> &'a mut PeerHealth {
+    torrent
+        .peer_health
+        .entry(peer_key(address, port))
+        .or_default()
+}
+
+fn peer_backoff_duration_ms(consecutive_failures: u32) -> u128 {
+    match consecutive_failures {
+        0 => 0,
+        1 => 10_000,
+        2 => 30_000,
+        3 => 120_000,
+        _ => 300_000,
+    }
+}
+
+fn peer_backoff_until_ms(health: Option<&PeerHealth>) -> Option<u128> {
+    let health = health?;
+    let last_failure = health.last_failure_ms?;
+    Some(last_failure.saturating_add(peer_backoff_duration_ms(
+        health.consecutive_failures,
+    )))
+}
+
+fn peer_is_in_backoff(health: Option<&PeerHealth>, now: u128) -> bool {
+    peer_backoff_until_ms(health).is_some_and(|until| until > now)
+}
+
+fn peer_success_score(health: Option<&PeerHealth>) -> u128 {
+    health.and_then(|health| health.last_success_ms).unwrap_or_default()
+}
+
+fn peer_piece_score(health: Option<&PeerHealth>) -> u64 {
+    health.map(|health| health.pieces_downloaded).unwrap_or_default()
+}
+
+fn peer_byte_score(health: Option<&PeerHealth>) -> u64 {
+    health.map(|health| health.bytes_downloaded).unwrap_or_default()
+}
+
+fn peer_failure_count(health: Option<&PeerHealth>) -> u32 {
+    health
+        .map(|health| health.consecutive_failures)
+        .unwrap_or_default()
+}
+
+fn peer_attempt_count(health: Option<&PeerHealth>) -> u32 {
+    health
+        .map(|health| health.connection_attempts)
+        .unwrap_or_default()
+}
+
 fn merge_peers(existing: &mut Vec<PeerInfo>, next: Vec<PeerInfo>) {
     for peer in next {
         let seen = existing
@@ -4698,6 +4907,84 @@ mod tests {
         .expect("assignments build");
 
         assert_eq!(assignments, vec![vec![0], vec![2], vec![1]]);
+    }
+
+    #[test]
+    fn peer_scheduler_prioritizes_success_and_defers_recent_failures() {
+        let root = temp_dir("session-peer-scheduler");
+        let torrent_path = root.join("multi.torrent");
+        let output_dir = root.join("out");
+        fs::write(&torrent_path, build_multi_file_torrent(b"abcdefghi")).expect("fixture writes");
+        let session = TorrentSession::new(root.join("default"));
+        let id = session
+            .add(AddTorrentRequest {
+                source: TorrentSource::File(torrent_path.to_string_lossy().into_owned()),
+                destination: Some(output_dir.to_string_lossy().into_owned()),
+                paused: true,
+                overwrite: true,
+                disable_trackers: true,
+                only_files: None,
+                sub_folder: None,
+            })
+            .expect("torrent adds")
+            .id
+            .expect("id assigned");
+        let now = timestamp_ms();
+        let peer = |address: &str, port| PeerInfo {
+            address: address.to_string(),
+            port,
+            client: None,
+            progress: 0.0,
+            download_speed: 0,
+            upload_speed: 0,
+            connection: "Discovered".to_string(),
+        };
+        let torrents = &mut session.torrents.lock().expect("torrent lock");
+        let torrent = torrents
+            .iter_mut()
+            .find(|torrent| torrent.id == id)
+            .expect("torrent exists");
+        torrent.peers = vec![
+            peer("127.0.0.1", 6001),
+            peer("127.0.0.2", 6002),
+            peer("127.0.0.3", 6003),
+        ];
+        torrent.peer_health.insert(
+            peer_key("127.0.0.1", 6001),
+            PeerHealth {
+                connection_attempts: 3,
+                consecutive_failures: 2,
+                last_failure_ms: Some(now),
+                last_success_ms: None,
+                bytes_downloaded: 0,
+                pieces_downloaded: 0,
+            },
+        );
+        torrent.peer_health.insert(
+            peer_key("127.0.0.3", 6003),
+            PeerHealth {
+                connection_attempts: 1,
+                consecutive_failures: 0,
+                last_failure_ms: None,
+                last_success_ms: Some(now.saturating_sub(1_000)),
+                bytes_downloaded: 32_768,
+                pieces_downloaded: 2,
+            },
+        );
+
+        let schedule = schedule_peers_for_download(torrent, 2);
+
+        assert_eq!(schedule.candidate_peers, 3);
+        assert_eq!(schedule.deferred_for_backoff, 1);
+        assert_eq!(
+            schedule
+                .peers
+                .iter()
+                .map(|peer| peer.port)
+                .collect::<Vec<_>>(),
+            vec![6003, 6002]
+        );
+        fs::remove_dir_all(root).expect("temp dir removes");
     }
 
     #[test]
