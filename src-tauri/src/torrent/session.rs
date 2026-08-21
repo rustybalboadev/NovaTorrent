@@ -354,7 +354,11 @@ struct ConnectedPeer {
     connection: peerwire::PeerDownloadConnection,
 }
 
-type PeerConnectionResult = (PeerInfo, Result<peerwire::PeerDownloadConnection, String>);
+type PeerConnectionResult = (
+    PeerInfo,
+    Result<peerwire::PeerDownloadConnection, String>,
+    Duration,
+);
 
 struct EndgameRaceResult {
     winner: Option<(PeerInfo, peerwire::DownloadedPiece)>,
@@ -2424,6 +2428,7 @@ impl TorrentSession {
         torrent_id: u64,
         peer: PeerInfo,
         result: Result<peerwire::PeerDownloadConnection, String>,
+        elapsed: Duration,
         connected: &mut Vec<ConnectedPeer>,
         pending_dht_nodes: &mut Vec<(String, u16)>,
         errors: &mut Vec<String>,
@@ -2452,9 +2457,23 @@ impl TorrentSession {
                     id,
                     &peer.address,
                     peer.port,
-                    &format!("Ready; {available} pieces available"),
+                    &format!(
+                        "Ready in {} ms; {available} pieces available",
+                        elapsed.as_millis()
+                    ),
                     None,
                 )?;
+                self.log(
+                    LogLevel::Info,
+                    "peer",
+                    format!(
+                        "{}:{} connected in {} ms with {available} available pieces",
+                        peer.address,
+                        peer.port,
+                        elapsed.as_millis()
+                    ),
+                    Some(torrent_id),
+                );
                 connected.push(ConnectedPeer { peer, connection });
                 Ok(pex_added)
             }
@@ -2464,7 +2483,12 @@ impl TorrentSession {
                 self.log(
                     LogLevel::Warn,
                     "peer",
-                    format!("{}:{}: {err}", peer.address, peer.port),
+                    format!(
+                        "{}:{} failed after {} ms: {err}",
+                        peer.address,
+                        peer.port,
+                        elapsed.as_millis()
+                    ),
                     Some(torrent_id),
                 );
                 errors.push(format!("{}:{}: {err}", peer.address, peer.port));
@@ -2484,13 +2508,14 @@ impl TorrentSession {
     ) -> Result<(usize, usize), String> {
         let mut drained = 0usize;
         let mut pex_added = 0usize;
-        while let Ok((peer, result)) = receiver.try_recv() {
+        while let Ok((peer, result, elapsed)) = receiver.try_recv() {
             drained += 1;
             pex_added += self.accept_peer_connection_result(
                 id,
                 torrent_id,
                 peer,
                 result,
+                elapsed,
                 connected,
                 pending_dht_nodes,
                 errors,
@@ -2724,13 +2749,14 @@ impl TorrentSession {
                 let download_limiter = snapshot.download_limiter.clone();
                 let sender = connect_sender.clone();
                 std::thread::spawn(move || {
+                    let started = Instant::now();
                     let result = peerwire::connect_peer_for_download_with_limiter(
                         &address,
                         peer.port,
                         plan,
                         Some(download_limiter),
                     );
-                    let _ = sender.send((peer, result));
+                    let _ = sender.send((peer, result, started.elapsed()));
                 });
             }
             drop(connect_sender);
@@ -2758,7 +2784,7 @@ impl TorrentSession {
                     }
                     remaining.min(Duration::from_millis(500))
                 };
-                let (peer, result) = match connect_receiver.recv_timeout(timeout) {
+                let (peer, result, elapsed) = match connect_receiver.recv_timeout(timeout) {
                     Ok(result) => result,
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                         if first_connected_at.is_some() || Instant::now() >= batch_deadline {
@@ -2776,6 +2802,7 @@ impl TorrentSession {
                     snapshot.id,
                     peer,
                     result,
+                    elapsed,
                     &mut connected,
                     &mut advertised_dht_nodes,
                     &mut errors,
@@ -3014,9 +3041,31 @@ impl TorrentSession {
                     assign_rarest_pieces(&verified, &availability)?
                 };
                 if assignments.iter().all(Vec::is_empty) {
+                    let fresh_candidates = self.untried_peer_count(id, attempted)?;
+                    if fresh_candidates > 0 && refresh_round < MAX_SWARM_REFRESH_ROUNDS {
+                        self.log(
+                            LogLevel::Info,
+                            "peer",
+                            format!(
+                                "piece assignment stalled with {} connected peers and {} missing pieces; refreshing schedule with {fresh_candidates} untried candidate(s)",
+                                connected.len(),
+                                missing.len()
+                            ),
+                            Some(snapshot.id),
+                        );
+                        if !pending_dht_nodes.is_empty() {
+                            self.verify_peer_dht_nodes(pending_dht_nodes, snapshot.id);
+                        }
+                        drop(partial_store);
+                        return self.download_from_peers_refreshing(
+                            id,
+                            attempted,
+                            refresh_round + 1,
+                        );
+                    }
                     if received < peer_batch.len() {
                         match connect_receiver.recv_timeout(Duration::from_millis(900)) {
-                            Ok((peer, result)) => {
+                            Ok((peer, result, elapsed)) => {
                                 received += 1;
                                 let connected_before = connected.len();
                                 pex_candidates_added += self.accept_peer_connection_result(
@@ -3024,6 +3073,7 @@ impl TorrentSession {
                                     snapshot.id,
                                     peer,
                                     result,
+                                    elapsed,
                                     &mut connected,
                                     &mut pending_dht_nodes,
                                     &mut errors,
