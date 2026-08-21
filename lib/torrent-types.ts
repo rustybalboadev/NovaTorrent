@@ -161,6 +161,22 @@ export type TorrentFileAvailability = {
   ranges: VerifiedByteRange[];
 };
 
+export type StreamPriorityRequest = {
+  fileIndex: number;
+  playheadOffset: number;
+  urgentBytes?: number | null;
+  lookaheadBytes?: number | null;
+};
+
+export type StreamPriorityStatus = {
+  file_index: number;
+  name: string;
+  playhead_offset: number;
+  urgent_pieces: number;
+  lookahead_pieces: number;
+  total_priority_pieces: number;
+};
+
 export type TorrentRow = {
   id: string;
   name: string;

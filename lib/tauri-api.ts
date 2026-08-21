@@ -6,6 +6,8 @@ import type {
   AddTorrentResponse,
   LogEntry,
   SafeTestTorrent,
+  StreamPriorityRequest,
+  StreamPriorityStatus,
   TorrentDetails,
   TorrentFileAvailability,
   TorrentFileHash,
@@ -189,6 +191,26 @@ export async function streamFileAvailability(id: string, fileIndex: number): Pro
     };
   }
   return invoke<TorrentFileAvailability>("stream_file_availability", { id, fileIndex });
+}
+
+export async function setStreamPriority(id: string, request: StreamPriorityRequest): Promise<StreamPriorityStatus> {
+  if (!isTauriRuntime()) {
+    const file = mockTorrents[0]?.files?.[request.fileIndex];
+    return {
+      file_index: request.fileIndex,
+      name: file?.name ?? "preview-video.mp4",
+      playhead_offset: request.playheadOffset,
+      urgent_pieces: 3,
+      lookahead_pieces: 8,
+      total_priority_pieces: 11
+    };
+  }
+  return invoke<StreamPriorityStatus>("set_stream_priority", { id, request });
+}
+
+export async function clearStreamPriority(id: string) {
+  if (!isTauriRuntime()) return;
+  await invoke("clear_stream_priority", { id });
 }
 
 export async function openVirusTotalReport(sha256: string) {

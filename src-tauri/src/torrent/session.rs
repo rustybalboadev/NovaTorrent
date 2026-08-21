@@ -43,6 +43,9 @@ const TRACKER_ANNOUNCE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(16);
 const TRACKER_EARLY_PEER_GRACE: Duration = Duration::from_millis(450);
 const MAX_SWARM_REFRESH_ROUNDS: usize = 8;
 const MAX_RUNTIME_RETRY_DELAY: Duration = Duration::from_secs(60);
+const DEFAULT_STREAM_URGENT_BYTES: u64 = 2 * 1024 * 1024;
+const DEFAULT_STREAM_LOOKAHEAD_BYTES: u64 = 24 * 1024 * 1024;
+const MAX_STREAM_LOOKAHEAD_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -248,6 +251,25 @@ pub struct UpdateTorrentOptionsRequest {
     pub seed_ratio_limit: Option<f64>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamPriorityRequest {
+    pub file_index: usize,
+    pub playhead_offset: u64,
+    pub urgent_bytes: Option<u64>,
+    pub lookahead_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StreamPriorityStatus {
+    pub file_index: usize,
+    pub name: String,
+    pub playhead_offset: u64,
+    pub urgent_pieces: usize,
+    pub lookahead_pieces: usize,
+    pub total_priority_pieces: usize,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct LogEntry {
     pub id: u64,
@@ -311,6 +333,7 @@ struct TorrentTask {
     download_limiter: peerwire::BandwidthLimiter,
     upload_limiter: peerwire::BandwidthLimiter,
     peer_health: HashMap<String, PeerHealth>,
+    stream_priority: Option<StreamPriorityState>,
 }
 
 #[derive(Debug, Clone)]
@@ -359,6 +382,22 @@ struct PeerDownloadSnapshot {
     candidate_peers: usize,
     deferred_for_backoff: usize,
     deferred_for_duplicate_ip: usize,
+    stream_priority: Option<StreamPriorityState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StreamPriorityState {
+    file_index: usize,
+    playhead_offset: u64,
+    urgent_bytes: u64,
+    lookahead_bytes: u64,
+    updated_at_ms: u128,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StreamPiecePriorityPlan {
+    urgent: Vec<u32>,
+    lookahead: Vec<u32>,
 }
 
 struct ConnectedPeer {
@@ -2635,6 +2674,7 @@ impl TorrentSession {
                 candidate_peers,
                 deferred_for_backoff,
                 deferred_for_duplicate_ip,
+                stream_priority: torrent.stream_priority.clone(),
             }
         };
 
@@ -3051,7 +3091,19 @@ impl TorrentSession {
                     .iter()
                     .map(|peer| peer.connection.availability().to_vec())
                     .collect::<Vec<_>>();
-                let mut assignments = if snapshot.sequential_download {
+                let stream_priority = self
+                    .current_stream_priority(id)?
+                    .or_else(|| snapshot.stream_priority.clone());
+                let mut assignments = if let Some(stream_priority) = stream_priority.as_ref() {
+                    assign_streaming_pieces(
+                        &verified,
+                        &availability,
+                        &snapshot.files,
+                        snapshot.piece_length,
+                        stream_priority,
+                        snapshot.sequential_download,
+                    )?
+                } else if snapshot.sequential_download {
                     assign_sequential_pieces(&verified, &availability)?
                 } else {
                     assign_rarest_pieces(&verified, &availability)?
@@ -3593,6 +3645,93 @@ impl TorrentSession {
             partial_store_present: partial_store.is_some(),
             ranges,
         })
+    }
+
+    pub fn set_stream_priority(
+        &self,
+        id: &str,
+        request: StreamPriorityRequest,
+    ) -> Result<StreamPriorityStatus, String> {
+        let mut torrents = self.torrents.lock().map_err(|_| "torrent lock poisoned")?;
+        let torrent = torrents
+            .iter_mut()
+            .find(|torrent| torrent.matches_id(id))
+            .ok_or_else(|| format!("torrent not found: {id}"))?;
+        if torrent.files.is_empty() || torrent.piece_hashes.is_empty() {
+            return Err("torrent metadata is not available yet".to_string());
+        }
+        let file = torrent
+            .files
+            .get(request.file_index)
+            .ok_or_else(|| format!("torrent file index is out of range: {}", request.file_index))?;
+        if !file.included {
+            return Err("unchecked torrent files cannot be streamed".to_string());
+        }
+        let file_name = file.name.clone();
+        let file_length = file.length;
+        let playhead_offset = if file_length == 0 {
+            0
+        } else {
+            request.playhead_offset.min(file_length - 1)
+        };
+        let state = StreamPriorityState {
+            file_index: request.file_index,
+            playhead_offset,
+            urgent_bytes: normalize_stream_window_bytes(
+                request.urgent_bytes,
+                DEFAULT_STREAM_URGENT_BYTES,
+            ),
+            lookahead_bytes: normalize_stream_window_bytes(
+                request.lookahead_bytes,
+                DEFAULT_STREAM_LOOKAHEAD_BYTES,
+            ),
+            updated_at_ms: timestamp_ms(),
+        };
+        let plan = stream_priority_piece_plan(&torrent.files, torrent.general.piece_size, &state)?;
+        torrent.stream_priority = Some(state);
+        let status = StreamPriorityStatus {
+            file_index: request.file_index,
+            name: file_name,
+            playhead_offset,
+            urgent_pieces: plan.urgent.len(),
+            lookahead_pieces: plan.lookahead.len(),
+            total_priority_pieces: plan.urgent.len() + plan.lookahead.len(),
+        };
+        self.log(
+            LogLevel::Info,
+            "stream",
+            format!(
+                "prioritizing '{}' at byte {} ({} urgent piece(s), {} lookahead piece(s))",
+                status.name, status.playhead_offset, status.urgent_pieces, status.lookahead_pieces
+            ),
+            Some(torrent.id),
+        );
+        Ok(status)
+    }
+
+    pub fn clear_stream_priority(&self, id: &str) -> Result<EmptyJsonResponse, String> {
+        let mut torrents = self.torrents.lock().map_err(|_| "torrent lock poisoned")?;
+        let torrent = torrents
+            .iter_mut()
+            .find(|torrent| torrent.matches_id(id))
+            .ok_or_else(|| format!("torrent not found: {id}"))?;
+        torrent.stream_priority = None;
+        self.log(
+            LogLevel::Info,
+            "stream",
+            "cleared stream playback priority; normal piece scheduling resumes",
+            Some(torrent.id),
+        );
+        Ok(EmptyJsonResponse {})
+    }
+
+    fn current_stream_priority(&self, id: &str) -> Result<Option<StreamPriorityState>, String> {
+        let torrents = self.torrents.lock().map_err(|_| "torrent lock poisoned")?;
+        let torrent = torrents
+            .iter()
+            .find(|torrent| torrent.matches_id(id))
+            .ok_or_else(|| format!("torrent not found: {id}"))?;
+        Ok(torrent.stream_priority.clone())
     }
 
     pub fn query_dht(&self, id: &str) -> Result<EmptyJsonResponse, String> {
@@ -4445,17 +4584,18 @@ impl TorrentSession {
             stats,
             general,
             options,
-            cancelled,
-            tracker_started: false,
-            dht_announce_targets: Vec::new(),
-            tracker_completed: false,
-            next_announce_at_ms: None,
+                cancelled,
+                tracker_started: false,
+                dht_announce_targets: Vec::new(),
+                tracker_completed: false,
+                next_announce_at_ms: None,
             added_at_ms: timestamp_ms(),
             upload_gate,
-            download_limiter,
-            upload_limiter,
-            peer_health: HashMap::new(),
-        })
+                download_limiter,
+                upload_limiter,
+                peer_health: HashMap::new(),
+                stream_priority: None,
+            })
     }
 
     fn task_from_magnet(
@@ -4550,6 +4690,7 @@ impl TorrentSession {
             download_limiter,
             upload_limiter,
             peer_health: HashMap::new(),
+            stream_priority: None,
         })
     }
 
@@ -5090,6 +5231,169 @@ fn assign_sequential_pieces(
         );
     }
     Ok(assignments)
+}
+
+fn assign_streaming_pieces(
+    verified: &[bool],
+    peer_availability: &[Vec<bool>],
+    files: &[TorrentFile],
+    piece_length: u64,
+    priority: &StreamPriorityState,
+    fallback_sequential: bool,
+) -> Result<Vec<Vec<u32>>, String> {
+    let mut assignments = vec![Vec::new(); peer_availability.len()];
+    let mut assigned = HashSet::<usize>::new();
+    let plan = stream_priority_piece_plan(files, piece_length, priority)?;
+
+    for piece_index in plan.urgent.iter().chain(plan.lookahead.iter()) {
+        let piece_index = *piece_index as usize;
+        if assigned.contains(&piece_index) || verified.get(piece_index).copied().unwrap_or(true) {
+            continue;
+        }
+        if assign_piece_to_best_peer(&mut assignments, peer_availability, piece_index)? {
+            assigned.insert(piece_index);
+        }
+    }
+
+    let mut remaining = verified
+        .iter()
+        .enumerate()
+        .filter(|(piece_index, complete)| !**complete && !assigned.contains(piece_index))
+        .filter_map(|(piece_index, _)| {
+            let rarity = peer_availability
+                .iter()
+                .filter(|availability| availability.get(piece_index).copied().unwrap_or(false))
+                .count();
+            (rarity > 0).then_some((piece_index, rarity))
+        })
+        .collect::<Vec<_>>();
+    if fallback_sequential {
+        remaining.sort_by_key(|(piece_index, _)| *piece_index);
+    } else {
+        remaining.sort_by_key(|(piece_index, rarity)| (*rarity, *piece_index));
+    }
+    for (piece_index, _) in remaining {
+        let _ = assign_piece_to_best_peer(&mut assignments, peer_availability, piece_index)?;
+    }
+    Ok(assignments)
+}
+
+fn assign_piece_to_best_peer(
+    assignments: &mut [Vec<u32>],
+    peer_availability: &[Vec<bool>],
+    piece_index: usize,
+) -> Result<bool, String> {
+    let Some(peer_index) = peer_availability
+        .iter()
+        .enumerate()
+        .filter(|(_, availability)| availability.get(piece_index).copied().unwrap_or(false))
+        .min_by_key(|(peer_index, _)| (assignments[*peer_index].len(), *peer_index))
+        .map(|(peer_index, _)| peer_index)
+    else {
+        return Ok(false);
+    };
+    assignments[peer_index].push(
+        u32::try_from(piece_index).map_err(|_| "torrent has too many pieces".to_string())?,
+    );
+    Ok(true)
+}
+
+fn stream_priority_piece_plan(
+    files: &[TorrentFile],
+    piece_length: u64,
+    priority: &StreamPriorityState,
+) -> Result<StreamPiecePriorityPlan, String> {
+    if piece_length == 0 {
+        return Err("piece length cannot be zero".to_string());
+    }
+    let file = files
+        .get(priority.file_index)
+        .ok_or_else(|| format!("torrent file index is out of range: {}", priority.file_index))?;
+    if file.length == 0 {
+        return Ok(StreamPiecePriorityPlan {
+            urgent: Vec::new(),
+            lookahead: Vec::new(),
+        });
+    }
+    let file_start = files
+        .iter()
+        .take(priority.file_index)
+        .try_fold(0u64, |total, file| {
+            total
+                .checked_add(file.length)
+                .ok_or_else(|| "file offset overflow".to_string())
+        })?;
+    let file_end = file_start
+        .checked_add(file.length)
+        .ok_or_else(|| "file offset overflow".to_string())?;
+    let playhead = file_start
+        .checked_add(priority.playhead_offset.min(file.length - 1))
+        .ok_or_else(|| "stream playhead offset overflow".to_string())?;
+    let urgent_end = playhead
+        .checked_add(priority.urgent_bytes)
+        .unwrap_or(file_end)
+        .min(file_end);
+    let lookahead_end = urgent_end
+        .checked_add(priority.lookahead_bytes)
+        .unwrap_or(file_end)
+        .min(file_end);
+
+    let mut urgent = Vec::new();
+    let mut urgent_seen = HashSet::new();
+    push_piece_range(&mut urgent, &mut urgent_seen, playhead, urgent_end, piece_length)?;
+    push_piece_range(
+        &mut urgent,
+        &mut urgent_seen,
+        file_start,
+        (file_start + 1).min(file_end),
+        piece_length,
+    )?;
+    push_piece_range(
+        &mut urgent,
+        &mut urgent_seen,
+        file_end - 1,
+        file_end,
+        piece_length,
+    )?;
+
+    let mut lookahead = Vec::new();
+    let mut lookahead_seen = urgent_seen;
+    push_piece_range(
+        &mut lookahead,
+        &mut lookahead_seen,
+        urgent_end,
+        lookahead_end,
+        piece_length,
+    )?;
+    Ok(StreamPiecePriorityPlan { urgent, lookahead })
+}
+
+fn push_piece_range(
+    out: &mut Vec<u32>,
+    seen: &mut HashSet<u32>,
+    start: u64,
+    end: u64,
+    piece_length: u64,
+) -> Result<(), String> {
+    if start >= end {
+        return Ok(());
+    }
+    let first = start / piece_length;
+    let last = (end - 1) / piece_length;
+    for piece_index in first..=last {
+        let piece_index =
+            u32::try_from(piece_index).map_err(|_| "torrent has too many pieces".to_string())?;
+        if seen.insert(piece_index) {
+            out.push(piece_index);
+        }
+    }
+    Ok(())
+}
+
+fn normalize_stream_window_bytes(value: Option<u64>, default: u64) -> u64 {
+    value
+        .unwrap_or(default)
+        .clamp(1, MAX_STREAM_LOOKAHEAD_BYTES)
 }
 
 fn limit_piece_assignments(assignments: &mut [Vec<u32>], max_per_peer: usize) {
@@ -5709,6 +6013,43 @@ mod tests {
         let mut assignments = vec![vec![0, 3, 6, 9, 12], vec![1, 4], vec![2, 5, 8, 11]];
         limit_piece_assignments(&mut assignments, 3);
         assert_eq!(assignments, vec![vec![0, 3, 6], vec![1, 4], vec![2, 5, 8]]);
+    }
+
+    #[test]
+    fn stream_priority_assignment_targets_selected_file_and_seek_window() {
+        let files = vec![
+            TorrentFile {
+                name: "extras/trailer.mp4".to_string(),
+                components: vec!["extras".to_string(), "trailer.mp4".to_string()],
+                length: 4,
+                included: true,
+            },
+            TorrentFile {
+                name: "Season 1/Episode 03.mp4".to_string(),
+                components: vec!["Season 1".to_string(), "Episode 03.mp4".to_string()],
+                length: 16,
+                included: true,
+            },
+        ];
+        let priority = StreamPriorityState {
+            file_index: 1,
+            playhead_offset: 8,
+            urgent_bytes: 4,
+            lookahead_bytes: 4,
+            updated_at_ms: 1,
+        };
+
+        let assignments = assign_streaming_pieces(
+            &[false, false, false, false, false],
+            &[vec![true, true, true, true, true]],
+            &files,
+            4,
+            &priority,
+            false,
+        )
+        .expect("stream assignments build");
+
+        assert_eq!(&assignments[0][..3], &[3, 1, 4]);
     }
 
     #[test]

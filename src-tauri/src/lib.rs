@@ -15,8 +15,8 @@ use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
 use crate::torrent::session::{
     AddTorrentRequest, AddTorrentResponse, EmptyJsonResponse, LogEntry, LogLevel, TorrentDetails,
-    TorrentFileAvailability, TorrentFileHash, TorrentListResponse, TorrentSession,
-    UpdateTorrentOptionsRequest,
+    StreamPriorityRequest, StreamPriorityStatus, TorrentFileAvailability, TorrentFileHash,
+    TorrentListResponse, TorrentSession, UpdateTorrentOptionsRequest,
 };
 
 mod torrent;
@@ -770,6 +770,23 @@ async fn stream_file_availability(
 }
 
 #[tauri::command]
+fn set_stream_priority(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    request: StreamPriorityRequest,
+) -> Result<StreamPriorityStatus, String> {
+    state.session.set_stream_priority(&id, request)
+}
+
+#[tauri::command]
+fn clear_stream_priority(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<EmptyJsonResponse, String> {
+    state.session.clear_stream_priority(&id)
+}
+
+#[tauri::command]
 fn open_virustotal_report(sha256: String) -> Result<(), String> {
     if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err("VirusTotal report requires a 64-character SHA-256 hash".to_string());
@@ -1055,6 +1072,8 @@ pub fn run() {
             update_torrent_options,
             hash_torrent_file,
             stream_file_availability,
+            set_stream_priority,
+            clear_stream_priority,
             open_virustotal_report,
             backend_logs,
             open_add_torrent_window
