@@ -45,6 +45,7 @@ export function MediaPlayerWindow() {
   const shouldResumeRef = React.useRef(false);
   const userWantsPlaybackRef = React.useRef(false);
   const lastTimeRef = React.useRef(0);
+  const pendingResumeTimeRef = React.useRef<number | null>(null);
   const lastPriorityOffsetRef = React.useRef<number | null>(null);
   const lastPriorityTimeRef = React.useRef(0);
   const retryingForSeekRef = React.useRef(false);
@@ -65,7 +66,8 @@ export function MediaPlayerWindow() {
   const updateBufferMetrics = React.useCallback(
     (nextAvailability: TorrentFileAvailability | null = availability) => {
       const video = videoRef.current;
-      const offset = estimateByteOffset(lastTimeRef.current, video?.duration, nextAvailability?.length);
+      const targetTime = pendingResumeTimeRef.current ?? lastTimeRef.current;
+      const offset = estimateByteOffset(targetTime, video?.duration, nextAvailability?.length);
       if (!nextAvailability || offset == null) {
         setBufferedAheadSeconds(null);
         return null;
@@ -168,21 +170,40 @@ export function MediaPlayerWindow() {
   function rememberPosition() {
     const video = videoRef.current;
     if (!video || !Number.isFinite(video.currentTime)) return;
-    lastTimeRef.current = Math.max(0, video.currentTime);
+    const time = Math.max(0, video.currentTime);
+    const pendingTime = pendingResumeTimeRef.current;
+    if (pendingTime != null && time + 1 < pendingTime && (retryingForSeekRef.current || video.error)) {
+      return;
+    }
+    lastTimeRef.current = time;
+  }
+
+  function rememberTargetTime(time: number) {
+    if (!Number.isFinite(time) || time < 0) return;
+    lastTimeRef.current = time;
+    pendingResumeTimeRef.current = time;
+  }
+
+  function targetPlaybackTime() {
+    return pendingResumeTimeRef.current ?? lastTimeRef.current;
   }
 
   function resumeWhenReady() {
     const video = videoRef.current;
     if (!video || !shouldResumeRef.current || !streamUrl) return;
-    if (lastTimeRef.current > 0 && Math.abs(video.currentTime - lastTimeRef.current) > 0.35) {
+    const targetTime = pendingResumeTimeRef.current ?? lastTimeRef.current;
+    if (targetTime > 0 && Math.abs(video.currentTime - targetTime) > 0.35) {
       try {
-        video.currentTime = lastTimeRef.current;
+        video.currentTime = targetTime;
       } catch {
         undefined;
       }
     }
     if (video.paused && video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
       void video.play().catch(() => undefined);
+    }
+    if (Math.abs(video.currentTime - targetTime) <= 1 && video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+      pendingResumeTimeRef.current = null;
     }
   }
 
@@ -237,7 +258,7 @@ export function MediaPlayerWindow() {
   }
 
   function handleSeekIntent(video: HTMLVideoElement) {
-    rememberPosition();
+    rememberTargetTime(video.currentTime);
     shouldResumeRef.current = userWantsPlaybackRef.current || !video.paused;
     retryingForSeekRef.current = true;
     setFetchingSeekPoint(true);
@@ -248,7 +269,7 @@ export function MediaPlayerWindow() {
   function handlePlaybackProgress() {
     rememberPosition();
     const currentOffset = updateBufferMetrics();
-    void updateStreamPriorityForTime(lastTimeRef.current);
+    void updateStreamPriorityForTime(targetPlaybackTime());
     if (currentOffset != null && availability && isOffsetVerified(availability, currentOffset)) {
       retryingForSeekRef.current = false;
       setFetchingSeekPoint(false);
@@ -259,9 +280,16 @@ export function MediaPlayerWindow() {
     const video = videoRef.current;
     const mediaError = video?.error;
     if (!video || mediaError?.code === mediaErrorSrcNotSupported) return;
-    if (!shouldResumeRef.current || networkRetries >= networkRetryLimit) return;
-    rememberPosition();
+    if ((!shouldResumeRef.current && !retryingForSeekRef.current) || networkRetries >= networkRetryLimit) return;
+    if (pendingResumeTimeRef.current == null) {
+      rememberPosition();
+      pendingResumeTimeRef.current = lastTimeRef.current;
+    }
     setBuffering(true);
+    setFetchingSeekPoint(true);
+    if (retryTimerRef.current != null) {
+      window.clearTimeout(retryTimerRef.current);
+    }
     retryTimerRef.current = window.setTimeout(() => {
       setNetworkRetries((count) => count + 1);
       setRetryKey((key) => key + 1);
@@ -316,7 +344,7 @@ export function MediaPlayerWindow() {
                   userWantsPlaybackRef.current = true;
                   shouldResumeRef.current = true;
                   setBuffering(false);
-                  void updateStreamPriorityForTime(lastTimeRef.current, true);
+                  void updateStreamPriorityForTime(targetPlaybackTime(), true);
                 }}
                 onPause={(event) => {
                   const video = event.currentTarget;
@@ -335,16 +363,19 @@ export function MediaPlayerWindow() {
                   rememberPosition();
                   shouldResumeRef.current = true;
                   setBuffering(true);
-                  void updateStreamPriorityForTime(lastTimeRef.current, true);
+                  void updateStreamPriorityForTime(targetPlaybackTime(), true);
                 }}
                 onStalled={() => {
                   rememberPosition();
                   shouldResumeRef.current = true;
                   setBuffering(true);
-                  void updateStreamPriorityForTime(lastTimeRef.current, true);
+                  void updateStreamPriorityForTime(targetPlaybackTime(), true);
                 }}
                 onTimeUpdate={handlePlaybackProgress}
-                onLoadedMetadata={resumeWhenReady}
+                onLoadedMetadata={() => {
+                  void updateStreamPriorityForTime(targetPlaybackTime(), true);
+                  resumeWhenReady();
+                }}
                 onCanPlay={() => {
                   setBuffering(false);
                   resumeWhenReady();

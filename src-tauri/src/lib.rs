@@ -40,7 +40,7 @@ struct MediaStreamRoute {
 }
 
 const MEDIA_STREAM_CHUNK_LIMIT: u64 = 2 * 1024 * 1024;
-const MEDIA_STREAM_WAIT_TIMEOUT: Duration = Duration::from_secs(8);
+const MEDIA_STREAM_WAIT_TIMEOUT: Duration = Duration::from_secs(45);
 const MEDIA_STREAM_WAIT_INTERVAL: Duration = Duration::from_millis(150);
 const MEDIA_STREAM_URGENT_PRIORITY_BYTES: u64 = 8 * 1024 * 1024;
 const MEDIA_STREAM_LOOKAHEAD_PRIORITY_BYTES: u64 = 48 * 1024 * 1024;
