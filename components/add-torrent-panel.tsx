@@ -168,7 +168,7 @@ export function AddTorrentPanel({ windowMode, initialSource, onAdded, onCancel }
     try {
       onAdded?.();
       if (windowMode && isTauriRuntime()) {
-        await closeAddTorrentWindow();
+        await closeAddWindowMode();
       }
     } catch {
       setSuccess("Torrent added. You can close this window.");
@@ -182,7 +182,14 @@ export function AddTorrentPanel({ windowMode, initialSource, onAdded, onCancel }
       onCancel();
       return;
     }
-    if (windowMode && isTauriRuntime()) {
+    await closeAddWindowMode();
+  }
+
+  async function closeAddWindowMode() {
+    if (!windowMode || !isTauriRuntime()) return;
+    try {
+      await closeAddTorrentWindow();
+    } catch {
       const { getCurrentWindow } = await import("@tauri-apps/api/window");
       await getCurrentWindow().close();
     }
