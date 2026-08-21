@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { Clapperboard, Loader2, Pause, Play, RotateCw, X } from "lucide-react";
+import { Clapperboard, Crosshair, Loader2, Pause, Play, RotateCw, SkipForward, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import {
@@ -61,6 +61,10 @@ export function MediaPlayerWindow() {
   const [buffering, setBuffering] = React.useState(false);
   const [fetchingSeekPoint, setFetchingSeekPoint] = React.useState(false);
   const [bufferedAheadSeconds, setBufferedAheadSeconds] = React.useState<number | null>(null);
+  const [targetOffset, setTargetOffset] = React.useState<number | null>(null);
+  const [targetReady, setTargetReady] = React.useState(false);
+  const [targetTime, setTargetTime] = React.useState(0);
+  const [nearestReadyTime, setNearestReadyTime] = React.useState<number | null>(null);
   const [error, setError] = React.useState<string | null>(null);
 
   const updateBufferMetrics = React.useCallback(
@@ -68,13 +72,19 @@ export function MediaPlayerWindow() {
       const video = videoRef.current;
       const targetTime = pendingResumeTimeRef.current ?? lastTimeRef.current;
       const offset = estimateByteOffset(targetTime, video?.duration, nextAvailability?.length);
+      setTargetTime(targetTime);
+      setTargetOffset(offset);
       if (!nextAvailability || offset == null) {
         setBufferedAheadSeconds(null);
+        setTargetReady(false);
+        setNearestReadyTime(null);
         return null;
       }
 
       const range = verifiedRangeContaining(nextAvailability, offset);
+      setTargetReady(Boolean(range));
       setBufferedAheadSeconds(secondsBufferedAhead(nextAvailability, offset, video?.duration, range));
+      setNearestReadyTime(range ? null : nearestReadyPlaybackTime(nextAvailability, offset, video?.duration));
       if (range) {
         retryingForSeekRef.current = false;
         setFetchingSeekPoint(false);
@@ -166,6 +176,10 @@ export function MediaPlayerWindow() {
     availability && availability.length > 0 ? percent((availability.verified_bytes / availability.length) * 100) : 0;
   const fileName = availability?.name ?? priority?.name ?? "Media";
   const torrentName = details?.name ?? "NovaTorrent";
+  const targetOffsetLabel =
+    targetOffset != null && availability
+      ? `${formatBytes(targetOffset)} / ${formatBytes(availability.length)}`
+      : "Target pending";
 
   function rememberPosition() {
     const video = videoRef.current;
@@ -255,6 +269,21 @@ export function MediaPlayerWindow() {
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not update stream position.");
     }
+  }
+
+  function jumpToNearestReadyPoint() {
+    const video = videoRef.current;
+    if (!video || nearestReadyTime == null) return;
+    rememberTargetTime(nearestReadyTime);
+    retryingForSeekRef.current = false;
+    setFetchingSeekPoint(false);
+    setBuffering(false);
+    try {
+      video.currentTime = nearestReadyTime;
+    } catch {
+      undefined;
+    }
+    void updateStreamPriorityForTime(nearestReadyTime, true);
   }
 
   function handleSeekIntent(video: HTMLVideoElement) {
@@ -395,6 +424,39 @@ export function MediaPlayerWindow() {
                 {busy ? "Opening" : "Buffering"}
               </div>
             ) : null}
+            {fetchingSeekPoint && !targetReady ? (
+              <div className="absolute bottom-4 left-4 right-4 rounded-md border border-white/10 bg-zinc-950/88 p-3 shadow-2xl backdrop-blur md:left-auto md:w-[25rem]">
+                <div className="flex items-start gap-3">
+                  <div className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-white/10 text-zinc-100">
+                    <Crosshair className="h-4 w-4" />
+                  </div>
+                  <div className="min-w-0 flex-1 space-y-2">
+                    <div>
+                      <p className="text-sm font-medium text-zinc-100">Fetching selected point</p>
+                      <p className="text-xs text-zinc-400">
+                        {formatPlaybackTime(targetTime)} · {targetOffsetLabel}
+                      </p>
+                    </div>
+                    <Progress value={bufferPercent} className="h-1.5 bg-white/10" />
+                    <div className="flex flex-wrap items-center gap-2 text-xs text-zinc-400">
+                      <span>{availability ? `${availability.ranges.length} verified ranges` : "Checking ranges"}</span>
+                      {nearestReadyTime != null ? (
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          className="h-7 border-white/15 bg-white/5 px-2 text-zinc-100 hover:bg-white/10"
+                          onClick={jumpToNearestReadyPoint}
+                        >
+                          <SkipForward className="h-3.5 w-3.5" />
+                          Jump to {formatPlaybackTime(nearestReadyTime)}
+                        </Button>
+                      ) : null}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            ) : null}
           </div>
 
           <footer className="mt-3 grid gap-3 rounded-md border border-white/10 bg-white/[0.04] p-3 text-xs text-zinc-300 md:grid-cols-[1fr_auto] md:items-center">
@@ -403,6 +465,7 @@ export function MediaPlayerWindow() {
                 <span>{availability ? `${formatBytes(availability.verified_bytes)} verified` : "Checking buffer"}</span>
                 <span>{availability ? `${availability.ranges.length} range${availability.ranges.length === 1 ? "" : "s"}` : "0 ranges"}</span>
                 <span>{priority ? `${priority.total_priority_pieces} priority pieces` : "Priority pending"}</span>
+                <span>{targetReady ? "Current point ready" : targetOffsetLabel}</span>
                 <span>
                   {bufferedAheadSeconds != null
                     ? `${Math.floor(bufferedAheadSeconds)}s ready here`
@@ -437,6 +500,43 @@ function estimateByteOffset(time: number, duration: number | undefined, length: 
   if (!duration || !Number.isFinite(duration) || duration <= 0) return 0;
   const ratio = Math.max(0, Math.min(1, time / duration));
   return Math.min(length - 1, Math.floor(length * ratio));
+}
+
+function estimatePlaybackTime(offset: number, duration: number | undefined, length: number | undefined) {
+  if (!length || length <= 0 || !duration || !Number.isFinite(duration) || duration <= 0) return null;
+  const ratio = Math.max(0, Math.min(1, offset / length));
+  return duration * ratio;
+}
+
+function nearestReadyPlaybackTime(
+  availability: TorrentFileAvailability,
+  offset: number,
+  duration: number | undefined
+) {
+  const nearestRange = availability.ranges
+    .filter((range) => range.length > 0)
+    .map((range) => {
+      const end = range.offset + range.length - 1;
+      const nearestOffset = offset < range.offset ? range.offset : Math.min(offset, end);
+      return {
+        offset: nearestOffset,
+        distance: Math.abs(nearestOffset - offset)
+      };
+    })
+    .sort((left, right) => left.distance - right.distance)[0];
+  return nearestRange ? estimatePlaybackTime(nearestRange.offset, duration, availability.length) : null;
+}
+
+function formatPlaybackTime(seconds: number) {
+  if (!Number.isFinite(seconds) || seconds < 0) return "0:00";
+  const totalSeconds = Math.floor(seconds);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const remainder = totalSeconds % 60;
+  if (hours > 0) {
+    return `${hours}:${minutes.toString().padStart(2, "0")}:${remainder.toString().padStart(2, "0")}`;
+  }
+  return `${minutes}:${remainder.toString().padStart(2, "0")}`;
 }
 
 function verifiedRangeContaining(availability: TorrentFileAvailability, offset: number) {
