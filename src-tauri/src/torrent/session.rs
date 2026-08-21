@@ -1635,53 +1635,31 @@ impl TorrentSession {
             }
         }
 
-        let tracker_error = if !snapshot.trackers_disabled && snapshot.tracker_count > 0 {
-            let tracker_started = Instant::now();
-            let error = self.announce(id).err();
-            snapshot = self.runtime_snapshot(id)?;
-            self.log(
-                LogLevel::Info,
-                "runtime",
-                format!(
-                    "tracker discovery finished in {} ms with {} known peers",
-                    tracker_started.elapsed().as_millis(),
-                    snapshot.peer_count
-                ),
-                Some(snapshot.id),
-            );
-            self.ensure_running(&snapshot)?;
-            error
-        } else {
-            None
-        };
+        let mut discovery = self.discover_sources_for_runtime(id, &snapshot);
+        snapshot = self.runtime_snapshot(id)?;
+        self.ensure_running(&snapshot)?;
 
         if !snapshot.metadata_available {
-            let mut metadata_errors = Vec::new();
-            if let Some(err) = tracker_error.as_ref() {
-                metadata_errors.push(format!("tracker discovery: {err}"));
-            }
-
-            if snapshot.peer_count == 0 && !snapshot.private {
+            if snapshot.peer_count == 0 && !snapshot.private && !discovery.dht_ran {
                 let dht_started = Instant::now();
                 if let Err(err) = self.query_dht(id) {
-                    metadata_errors.push(format!("DHT discovery: {err}"));
+                    discovery.dht_error = Some(err);
                 }
+                discovery.dht_ran = true;
                 snapshot = self.runtime_snapshot(id)?;
-                self.log(
-                    LogLevel::Info,
-                    "runtime",
-                    format!(
-                        "metadata DHT discovery finished in {} ms with {} known peers",
-                        dht_started.elapsed().as_millis(),
-                        snapshot.peer_count
-                    ),
-                    Some(snapshot.id),
+                self.log_discovery_finished(
+                    id,
+                    snapshot.id,
+                    "dht",
+                    "metadata DHT discovery",
+                    dht_started.elapsed(),
                 );
             }
 
             snapshot = self.runtime_snapshot(id)?;
             self.ensure_running(&snapshot)?;
             if snapshot.peer_count == 0 {
+                let metadata_errors = discovery.errors();
                 let detail = if metadata_errors.is_empty() {
                     "no peers were discovered".to_string()
                 } else {
@@ -1713,27 +1691,22 @@ impl TorrentSession {
         }
 
         if snapshot.peer_count == 0 {
-            let mut discovery_errors = Vec::new();
-            if let Some(err) = tracker_error.as_ref() {
-                discovery_errors.push(format!("tracker discovery: {err}"));
-            }
-            if snapshot.peer_count == 0 && !snapshot.private {
+            if snapshot.peer_count == 0 && !snapshot.private && !discovery.dht_ran {
                 let dht_started = Instant::now();
                 if let Err(err) = self.query_dht(id) {
-                    discovery_errors.push(format!("DHT discovery: {err}"));
+                    discovery.dht_error = Some(err);
                 }
+                discovery.dht_ran = true;
                 snapshot = self.runtime_snapshot(id)?;
-                self.log(
-                    LogLevel::Info,
-                    "runtime",
-                    format!(
-                        "DHT discovery finished in {} ms with {} known peers",
-                        dht_started.elapsed().as_millis(),
-                        snapshot.peer_count
-                    ),
-                    Some(snapshot.id),
+                self.log_discovery_finished(
+                    id,
+                    snapshot.id,
+                    "dht",
+                    "DHT discovery",
+                    dht_started.elapsed(),
                 );
             }
+            let discovery_errors = discovery.errors();
             if !discovery_errors.is_empty() {
                 self.log(
                     LogLevel::Debug,
@@ -1781,6 +1754,108 @@ impl TorrentSession {
             download_errors.push("no peers or supported webseeds are available".to_string());
         }
         Err(download_errors.join("; "))
+    }
+
+    fn discover_sources_for_runtime(
+        &self,
+        id: &str,
+        snapshot: &RuntimeSnapshot,
+    ) -> DiscoveryOutcome {
+        let tracker_enabled = !snapshot.trackers_disabled && snapshot.tracker_count > 0;
+        let dht_enabled = !snapshot.private && snapshot.webseed_count == 0;
+        let mut outcome = DiscoveryOutcome {
+            dht_ran: dht_enabled,
+            ..DiscoveryOutcome::default()
+        };
+
+        if tracker_enabled && dht_enabled {
+            std::thread::scope(|scope| {
+                let tracker = scope.spawn(|| {
+                    let started = Instant::now();
+                    (self.announce(id).err(), started.elapsed())
+                });
+                let dht = scope.spawn(|| {
+                    let started = Instant::now();
+                    (self.query_dht(id).err(), started.elapsed())
+                });
+                match tracker.join() {
+                    Ok((error, elapsed)) => {
+                        outcome.tracker_error = error;
+                        self.log_discovery_finished(
+                            id,
+                            snapshot.id,
+                            "tracker",
+                            "tracker discovery",
+                            elapsed,
+                        );
+                    }
+                    Err(_) => {
+                        outcome.tracker_error =
+                            Some("tracker discovery worker panicked".to_string());
+                    }
+                }
+                match dht.join() {
+                    Ok((error, elapsed)) => {
+                        outcome.dht_error = error;
+                        self.log_discovery_finished(
+                            id,
+                            snapshot.id,
+                            "dht",
+                            "DHT discovery",
+                            elapsed,
+                        );
+                    }
+                    Err(_) => {
+                        outcome.dht_error = Some("DHT discovery worker panicked".to_string());
+                    }
+                }
+            });
+        } else if tracker_enabled {
+            let started = Instant::now();
+            outcome.tracker_error = self.announce(id).err();
+            self.log_discovery_finished(
+                id,
+                snapshot.id,
+                "tracker",
+                "tracker discovery",
+                started.elapsed(),
+            );
+        } else if dht_enabled {
+            let started = Instant::now();
+            outcome.dht_error = self.query_dht(id).err();
+            self.log_discovery_finished(
+                id,
+                snapshot.id,
+                "dht",
+                "DHT discovery",
+                started.elapsed(),
+            );
+        }
+
+        outcome
+    }
+
+    fn log_discovery_finished(
+        &self,
+        id: &str,
+        torrent_id: u64,
+        scope: &'static str,
+        label: &'static str,
+        elapsed: Duration,
+    ) {
+        let peer_count = self
+            .runtime_snapshot(id)
+            .map(|snapshot| snapshot.peer_count)
+            .unwrap_or_default();
+        self.log(
+            LogLevel::Info,
+            scope,
+            format!(
+                "{label} finished in {} ms with {peer_count} known peers",
+                elapsed.as_millis()
+            ),
+            Some(torrent_id),
+        );
     }
 
     pub fn announce(&self, id: &str) -> Result<EmptyJsonResponse, String> {
@@ -4701,6 +4776,26 @@ struct PeerSchedule {
     candidate_peers: usize,
     deferred_for_backoff: usize,
     deferred_for_duplicate_ip: usize,
+}
+
+#[derive(Debug, Default)]
+struct DiscoveryOutcome {
+    tracker_error: Option<String>,
+    dht_error: Option<String>,
+    dht_ran: bool,
+}
+
+impl DiscoveryOutcome {
+    fn errors(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        if let Some(err) = self.tracker_error.as_ref() {
+            errors.push(format!("tracker discovery: {err}"));
+        }
+        if let Some(err) = self.dht_error.as_ref() {
+            errors.push(format!("DHT discovery: {err}"));
+        }
+        errors
+    }
 }
 
 fn schedule_peers_for_download(torrent: &TorrentTask, max_connections: usize) -> PeerSchedule {
