@@ -19,8 +19,6 @@ import { cn, formatBytes, percent } from "@/lib/utils";
 const networkRetryLimit = 12;
 const streamUrgentBytes = 8 * 1024 * 1024;
 const streamLookaheadBytes = 48 * 1024 * 1024;
-const priorityUpdateThresholdBytes = 2 * 1024 * 1024;
-const priorityUpdateThresholdSeconds = 12;
 const mediaErrorSrcNotSupported = 4;
 
 type ViewerParams = {
@@ -48,8 +46,6 @@ export function MediaPlayerWindow() {
   const userWantsPlaybackRef = React.useRef(false);
   const lastTimeRef = React.useRef(0);
   const pendingResumeTimeRef = React.useRef<number | null>(null);
-  const lastPriorityOffsetRef = React.useRef<number | null>(null);
-  const lastPriorityTimeRef = React.useRef(0);
   const retryingForSeekRef = React.useRef(false);
   const retryTimerRef = React.useRef<number | null>(null);
   const [params, setParams] = React.useState<ViewerParams | null>(null);
@@ -87,7 +83,13 @@ export function MediaPlayerWindow() {
       setTargetReady(Boolean(range));
       setBufferedAheadSeconds(secondsBufferedAhead(nextAvailability, offset, video?.duration, range));
       setNearestReadyTime(range ? null : nearestReadyPlaybackTime(nextAvailability, offset, video?.duration));
-      if (range) {
+      const hasMediaBuffer =
+        video &&
+        (isPlaybackTimeBuffered(video, targetTime) ||
+          (!video.seeking &&
+            Math.abs(video.currentTime - targetTime) <= 0.75 &&
+            video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA));
+      if (range && hasMediaBuffer) {
         retryingForSeekRef.current = false;
         setFetchingSeekPoint(false);
         setBuffering(false);
@@ -236,27 +238,41 @@ export function MediaPlayerWindow() {
     }).catch(() => undefined);
   }
 
-  function verifiedOffsetForTime(time: number) {
+  function estimatedOffsetForTime(time: number) {
     const video = videoRef.current;
-    const offset = estimateByteOffset(time, video?.duration, availability?.length);
-    return availability && offset != null && isOffsetVerified(availability, offset) ? offset : null;
+    return estimateByteOffset(time, video?.duration, availability?.length);
   }
 
-  function markTargetReady(offset: number, message?: string) {
+  function isPlaybackTimeBuffered(video: HTMLVideoElement, time: number) {
+    const buffered = video.buffered;
+    for (let index = 0; index < buffered.length; index += 1) {
+      if (buffered.start(index) <= time + 0.2 && time <= buffered.end(index) + 0.2) return true;
+    }
+    return false;
+  }
+
+  function markTargetReady(offset: number | null, message?: string) {
     retryingForSeekRef.current = false;
     setFetchingSeekPoint(false);
     setBuffering(false);
     setTargetReady(true);
-    setTargetOffset(offset);
+    if (offset != null) setTargetOffset(offset);
     setNearestReadyTime(null);
     setNetworkRetries(0);
     if (message) logPlayerEvent("target-ready", message);
   }
 
   function clearBufferingIfTargetReady(message: string) {
-    const offset = verifiedOffsetForTime(targetPlaybackTime());
-    if (offset == null) return false;
-    markTargetReady(offset, message);
+    const video = videoRef.current;
+    if (!video) return false;
+    const targetTime = targetPlaybackTime();
+    const hasMediaBuffer =
+      isPlaybackTimeBuffered(video, targetTime) ||
+      (!video.seeking &&
+        Math.abs(video.currentTime - targetTime) <= 0.75 &&
+        video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA);
+    if (!hasMediaBuffer) return false;
+    markTargetReady(estimatedOffsetForTime(targetTime), message);
     return true;
   }
 
@@ -312,42 +328,6 @@ export function MediaPlayerWindow() {
     }
   }
 
-  async function updateStreamPriorityForTime(time: number, force = false) {
-    if (!params || !availability) return;
-    const video = videoRef.current;
-    const offset = estimateByteOffset(time, video?.duration, availability.length);
-    if (offset == null) return;
-    const now = Date.now();
-    const lastOffset = lastPriorityOffsetRef.current;
-    if (
-      !force &&
-      lastOffset != null &&
-      Math.abs(offset - lastOffset) < priorityUpdateThresholdBytes &&
-      now - lastPriorityTimeRef.current < priorityUpdateThresholdSeconds * 1000
-    ) {
-      return;
-    }
-
-    lastPriorityOffsetRef.current = offset;
-    lastPriorityTimeRef.current = now;
-    try {
-      const nextPriority = await setStreamPriority(params.id, {
-        fileIndex: params.fileIndex,
-        playheadOffset: offset,
-        urgentBytes: streamUrgentBytes,
-        lookaheadBytes: streamLookaheadBytes
-      });
-      setPriority(nextPriority);
-      const nextAvailability = await refreshAvailability();
-      if (nextAvailability && isOffsetVerified(nextAvailability, offset)) {
-        markTargetReady(offset, "priority target is verified after refresh");
-        resumeWhenReady();
-      }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not update stream position.");
-    }
-  }
-
   function jumpToNearestReadyPoint() {
     const video = videoRef.current;
     if (!video || nearestReadyTime == null) return;
@@ -360,29 +340,26 @@ export function MediaPlayerWindow() {
     } catch {
       undefined;
     }
-    void updateStreamPriorityForTime(nearestReadyTime, true);
+    logPlayerEvent("jump-nearest-ready", "jumped to a browser-ready point");
   }
 
   function handleSeekIntent(video: HTMLVideoElement) {
     rememberTargetTime(video.currentTime);
     shouldResumeRef.current = userWantsPlaybackRef.current || !video.paused;
     const offset = estimateByteOffset(video.currentTime, video.duration, availability?.length);
-    if (availability && offset != null && isOffsetVerified(availability, offset)) {
-      markTargetReady(offset, "seek target already verified");
-      void updateStreamPriorityForTime(video.currentTime, true);
+    if (isPlaybackTimeBuffered(video, video.currentTime)) {
+      markTargetReady(offset, "seek target is already buffered by the media element");
       return;
     }
     retryingForSeekRef.current = true;
     setFetchingSeekPoint(true);
     setBuffering(true);
     logPlayerEvent("seek-fetch", "seek target is not verified yet");
-    void updateStreamPriorityForTime(video.currentTime, true);
   }
 
   function handlePlaybackProgress() {
     rememberPosition();
     const currentOffset = updateBufferMetrics();
-    void updateStreamPriorityForTime(targetPlaybackTime());
     if (currentOffset != null && availability && isOffsetVerified(availability, currentOffset)) {
       markTargetReady(currentOffset);
     }
@@ -459,7 +436,6 @@ export function MediaPlayerWindow() {
                   shouldResumeRef.current = true;
                   setBuffering(false);
                   logPlayerEvent("play");
-                  void updateStreamPriorityForTime(targetPlaybackTime(), true);
                 }}
                 onPause={(event) => {
                   const video = event.currentTarget;
@@ -493,7 +469,6 @@ export function MediaPlayerWindow() {
                   shouldResumeRef.current = true;
                   setBuffering(true);
                   logPlayerEvent("waiting", "media element is waiting for data");
-                  void updateStreamPriorityForTime(targetPlaybackTime(), true);
                 }}
                 onStalled={() => {
                   rememberPosition();
@@ -501,12 +476,10 @@ export function MediaPlayerWindow() {
                   shouldResumeRef.current = true;
                   setBuffering(true);
                   logPlayerEvent("stalled", "media element reported a stalled network load");
-                  void updateStreamPriorityForTime(targetPlaybackTime(), true);
                 }}
                 onTimeUpdate={handlePlaybackProgress}
                 onLoadedMetadata={() => {
                   logPlayerEvent("loaded-metadata");
-                  void updateStreamPriorityForTime(targetPlaybackTime(), true);
                   resumeWhenReady();
                 }}
                 onCanPlay={() => {
