@@ -45,7 +45,7 @@ const MAX_SWARM_REFRESH_ROUNDS: usize = 8;
 const MAX_RUNTIME_RETRY_DELAY: Duration = Duration::from_secs(60);
 const DEFAULT_STREAM_URGENT_BYTES: u64 = 16 * 1024 * 1024;
 const DEFAULT_STREAM_LOOKAHEAD_BYTES: u64 = 192 * 1024 * 1024;
-const MAX_STREAM_LOOKAHEAD_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_STREAM_LOOKAHEAD_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_MEDIA_STREAM_READ_BYTES: u64 = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -5451,6 +5451,9 @@ fn assign_streaming_pieces(
             assigned.insert(piece_index);
         }
     }
+    if !assigned.is_empty() {
+        return Ok(assignments);
+    }
 
     let mut remaining = verified
         .iter()
@@ -6367,7 +6370,19 @@ mod tests {
         )
         .expect("stream assignments skip verified pieces");
 
-        assert_eq!(&assignments[0][..3], &[1, 4, 0]);
+        assert_eq!(assignments, vec![vec![1, 4]]);
+
+        let assignments = assign_streaming_pieces(
+            &[false, true, false, true, true],
+            &[vec![true, true, true, true, true]],
+            &files,
+            4,
+            &priority,
+            false,
+        )
+        .expect("stream assignments resume normal pieces after priority is ready");
+
+        assert_eq!(assignments, vec![vec![0, 2]]);
     }
 
     #[test]
