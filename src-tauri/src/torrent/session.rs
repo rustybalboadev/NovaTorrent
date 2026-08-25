@@ -3888,6 +3888,23 @@ impl TorrentSession {
         Ok(EmptyJsonResponse {})
     }
 
+    pub fn stream_priority_window(
+        &self,
+        id: &str,
+        file_index: usize,
+    ) -> Result<Option<(u64, u64)>, String> {
+        let torrents = self.torrents.lock().map_err(|_| "torrent lock poisoned")?;
+        let torrent = torrents
+            .iter()
+            .find(|torrent| torrent.matches_id(id))
+            .ok_or_else(|| format!("torrent not found: {id}"))?;
+        Ok(torrent
+            .stream_priority
+            .as_ref()
+            .filter(|priority| priority.file_index == file_index)
+            .map(|priority| (priority.urgent_bytes, priority.lookahead_bytes)))
+    }
+
     fn current_stream_priority(&self, id: &str) -> Result<Option<StreamPriorityState>, String> {
         let torrents = self.torrents.lock().map_err(|_| "torrent lock poisoned")?;
         let torrent = torrents

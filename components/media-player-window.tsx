@@ -20,6 +20,29 @@ const networkRetryLimit = 12;
 const streamUrgentBytes = 16 * 1024 * 1024;
 const streamLookaheadBytes = 192 * 1024 * 1024;
 const mediaErrorSrcNotSupported = 4;
+const streamBufferModeStorageKey = "novatorrent.streamBufferMode";
+const streamBufferModes = [
+  {
+    id: "balanced",
+    label: "Balanced",
+    urgentBytes: streamUrgentBytes,
+    lookaheadBytes: streamLookaheadBytes
+  },
+  {
+    id: "aggressive",
+    label: "Aggressive",
+    urgentBytes: 32 * 1024 * 1024,
+    lookaheadBytes: 512 * 1024 * 1024
+  },
+  {
+    id: "maximum",
+    label: "Maximum",
+    urgentBytes: 64 * 1024 * 1024,
+    lookaheadBytes: 1024 * 1024 * 1024
+  }
+] as const;
+
+type StreamBufferModeId = (typeof streamBufferModes)[number]["id"];
 
 type ViewerParams = {
   id: string;
@@ -30,6 +53,10 @@ type InitialViewerState = {
   params: ViewerParams | null;
   error: string | null;
 };
+
+function streamBufferModeFor(id: string | null | undefined) {
+  return streamBufferModes.find((mode) => mode.id === id) ?? streamBufferModes[0];
+}
 
 function parseViewerParams(search: URLSearchParams): InitialViewerState {
   const id = search.get("id") ?? "";
@@ -48,10 +75,12 @@ export function MediaPlayerWindow() {
   const pendingResumeTimeRef = React.useRef<number | null>(null);
   const retryingForSeekRef = React.useRef(false);
   const retryTimerRef = React.useRef<number | null>(null);
+  const streamBufferModeRef = React.useRef<(typeof streamBufferModes)[number]>(streamBufferModes[0]);
   const [params, setParams] = React.useState<ViewerParams | null>(null);
   const [details, setDetails] = React.useState<TorrentDetails | null>(null);
   const [availability, setAvailability] = React.useState<TorrentFileAvailability | null>(null);
   const [priority, setPriority] = React.useState<StreamPriorityStatus | null>(null);
+  const [streamBufferModeId, setStreamBufferModeId] = React.useState<StreamBufferModeId>("balanced");
   const [streamUrl, setStreamUrl] = React.useState("");
   const [retryKey, setRetryKey] = React.useState(0);
   const [networkRetries, setNetworkRetries] = React.useState(0);
@@ -64,6 +93,11 @@ export function MediaPlayerWindow() {
   const [targetTime, setTargetTime] = React.useState(0);
   const [nearestReadyTime, setNearestReadyTime] = React.useState<number | null>(null);
   const [error, setError] = React.useState<string | null>(null);
+  const streamBufferMode = streamBufferModeFor(streamBufferModeId);
+
+  React.useEffect(() => {
+    streamBufferModeRef.current = streamBufferMode;
+  }, [streamBufferMode]);
 
   const updateBufferMetrics = React.useCallback(
     (nextAvailability: TorrentFileAvailability | null = availability) => {
@@ -103,6 +137,7 @@ export function MediaPlayerWindow() {
     let disposed = false;
     window.queueMicrotask(() => {
       if (disposed) return;
+      setStreamBufferModeId(streamBufferModeFor(window.localStorage.getItem(streamBufferModeStorageKey)).id);
       const initialState = parseViewerParams(new URLSearchParams(window.location.search));
       setParams(initialState.params);
       setError(initialState.error);
@@ -119,14 +154,15 @@ export function MediaPlayerWindow() {
     let disposed = false;
 
     async function prepare() {
+      const initialStreamBufferMode = streamBufferModeRef.current;
       try {
         const [nextDetails, nextPriority, nextUrl, nextAvailability] = await Promise.all([
           torrentDetails(viewerParams.id),
           setStreamPriority(viewerParams.id, {
             fileIndex: viewerParams.fileIndex,
             playheadOffset: 0,
-            urgentBytes: streamUrgentBytes,
-            lookaheadBytes: streamLookaheadBytes
+            urgentBytes: initialStreamBufferMode.urgentBytes,
+            lookaheadBytes: initialStreamBufferMode.lookaheadBytes
           }),
           streamFileUrl(viewerParams.id, viewerParams.fileIndex),
           streamFileAvailability(viewerParams.id, viewerParams.fileIndex)
@@ -143,7 +179,7 @@ export function MediaPlayerWindow() {
           targetTime: 0,
           targetOffset: 0,
           targetReady: nextAvailability.ranges.some((range) => range.offset === 0 && range.length > 0),
-          message: `${nextAvailability.verified_bytes} verified byte(s) across ${nextAvailability.ranges.length} range(s)`
+          message: `${nextAvailability.verified_bytes} verified byte(s) across ${nextAvailability.ranges.length} range(s); buffer=${initialStreamBufferMode.label}`
         }).catch(() => undefined);
       } catch (err) {
         const message = err instanceof Error ? err.message : "Could not prepare media playback.";
@@ -325,6 +361,29 @@ export function MediaPlayerWindow() {
       return nextAvailability;
     } catch {
       return null;
+    }
+  }
+
+  async function selectStreamBufferMode(nextModeId: StreamBufferModeId) {
+    const nextMode = streamBufferModeFor(nextModeId);
+    setStreamBufferModeId(nextMode.id);
+    window.localStorage.setItem(streamBufferModeStorageKey, nextMode.id);
+    if (!params) return;
+    const playheadOffset = targetOffset ?? estimatedOffsetForTime(targetPlaybackTime()) ?? 0;
+    try {
+      const nextPriority = await setStreamPriority(params.id, {
+        fileIndex: params.fileIndex,
+        playheadOffset,
+        urgentBytes: nextMode.urgentBytes,
+        lookaheadBytes: nextMode.lookaheadBytes
+      });
+      setPriority(nextPriority);
+      logPlayerEvent(
+        "buffer-mode",
+        `${nextMode.label}: urgent=${nextMode.urgentBytes} lookahead=${nextMode.lookaheadBytes}`
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not update stream buffer mode.");
     }
   }
 
@@ -549,6 +608,7 @@ export function MediaPlayerWindow() {
                 <span>{availability ? `${formatBytes(availability.verified_bytes)} verified` : "Checking buffer"}</span>
                 <span>{availability ? `${availability.ranges.length} range${availability.ranges.length === 1 ? "" : "s"}` : "0 ranges"}</span>
                 <span>{priority ? `${priority.total_priority_pieces} priority pieces` : "Priority pending"}</span>
+                <span>{streamBufferMode.label} buffer</span>
                 <span>{targetReady ? "Current point ready" : targetOffsetLabel}</span>
                 <span>
                   {bufferedAheadSeconds != null
@@ -558,7 +618,24 @@ export function MediaPlayerWindow() {
               </div>
               <Progress value={bufferPercent} className="h-2 bg-white/10" />
             </div>
-            <div className="flex items-center gap-2 text-zinc-400">
+            <div className="flex flex-wrap items-center justify-end gap-2 text-zinc-400">
+              <div className="flex rounded-md border border-white/10 bg-black/25 p-0.5">
+                {streamBufferModes.map((mode) => (
+                  <Button
+                    key={mode.id}
+                    type="button"
+                    variant={streamBufferMode.id === mode.id ? "secondary" : "ghost"}
+                    size="sm"
+                    className={cn(
+                      "h-7 px-2 text-xs text-zinc-100 hover:bg-white/10",
+                      streamBufferMode.id === mode.id ? "bg-white/15" : "text-zinc-400"
+                    )}
+                    onClick={() => void selectStreamBufferMode(mode.id)}
+                  >
+                    {mode.label}
+                  </Button>
+                ))}
+              </div>
               {buffering ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4" />}
               <span className={cn(error && "text-red-300")}>
                 {error ??

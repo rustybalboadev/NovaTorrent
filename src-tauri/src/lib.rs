@@ -767,13 +767,21 @@ fn handle_media_stream_connection(
         ),
         parse_torrent_log_id(&route.id),
     );
+    let (urgent_bytes, lookahead_bytes) = session
+        .stream_priority_window(&route.id, route.file_index)
+        .ok()
+        .flatten()
+        .unwrap_or((
+            MEDIA_STREAM_URGENT_PRIORITY_BYTES,
+            MEDIA_STREAM_LOOKAHEAD_PRIORITY_BYTES,
+        ));
     let _ = session.update_stream_priority_quietly(
         &route.id,
         StreamPriorityRequest {
             file_index: route.file_index,
             playhead_offset: start,
-            urgent_bytes: Some(MEDIA_STREAM_URGENT_PRIORITY_BYTES),
-            lookahead_bytes: Some(MEDIA_STREAM_LOOKAHEAD_PRIORITY_BYTES),
+            urgent_bytes: Some(urgent_bytes),
+            lookahead_bytes: Some(lookahead_bytes),
         },
     );
     match read_media_stream_range_with_wait(&session, &route, start, end) {
