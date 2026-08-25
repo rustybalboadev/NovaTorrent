@@ -418,6 +418,15 @@ struct PeerSchedulingHint {
     attempt_count: u32,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SwarmCoverageSummary {
+    missing_pieces: usize,
+    coverable_pieces: usize,
+    unavailable_pieces: usize,
+    single_peer_pieces: usize,
+    connected_peers: usize,
+}
+
 struct ConnectedPeer {
     peer: PeerInfo,
     connection: peerwire::PeerDownloadConnection,
@@ -2813,6 +2822,7 @@ impl TorrentSession {
         let mut errors = Vec::new();
         let mut pending_dht_nodes = Vec::new();
         let mut pex_candidates_added = 0usize;
+        let mut last_coverage = SwarmCoverageSummary::default();
         for peer_batch in snapshot
             .peers
             .chunks(snapshot.max_connections.min(MAX_PARALLEL_PEERS))
@@ -3133,6 +3143,8 @@ impl TorrentSession {
                     .iter()
                     .map(|peer| peer.connection.availability().to_vec())
                     .collect::<Vec<_>>();
+                let coverage = swarm_coverage_summary(&verified, &availability);
+                last_coverage = coverage;
                 let stream_priority = self
                     .current_stream_priority(id)?
                     .or_else(|| snapshot.stream_priority.clone());
@@ -3173,9 +3185,8 @@ impl TorrentSession {
                             LogLevel::Info,
                             "peer",
                             format!(
-                                "piece assignment stalled with {} connected peers and {} missing pieces; refreshing schedule with {fresh_candidates} untried candidate(s)",
-                                connected.len(),
-                                missing.len()
+                                "piece assignment stalled: {}; refreshing schedule with {fresh_candidates} untried candidate(s)",
+                                format_swarm_coverage(coverage)
                             ),
                             Some(snapshot.id),
                         );
@@ -3218,6 +3229,15 @@ impl TorrentSession {
                             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
                         }
                     }
+                    self.log(
+                        LogLevel::Warn,
+                        "peer",
+                        format!(
+                            "piece assignment stopped: {}; no immediately usable peer candidates remain in this batch",
+                            format_swarm_coverage(coverage)
+                        ),
+                        Some(snapshot.id),
+                    );
                     break;
                 }
 
@@ -3316,6 +3336,15 @@ impl TorrentSession {
                 pending_dht_nodes.extend(advertised_dht_nodes);
                 connected = idle;
                 if round_progress == 0 && !peer_failed {
+                    self.log(
+                        LogLevel::Warn,
+                        "peer",
+                        format!(
+                            "peer round made no verified progress after assigning pieces; {}",
+                            format_swarm_coverage(last_coverage)
+                        ),
+                        Some(snapshot.id),
+                    );
                     break;
                 }
             }
@@ -3381,10 +3410,18 @@ impl TorrentSession {
         }
 
         let missing = verified.iter().filter(|piece| !**piece).count();
-        let detail = if errors.is_empty() {
-            format!("swarm is missing {missing} pieces")
+        let coverage_detail = if last_coverage.connected_peers > 0 || last_coverage.missing_pieces > 0 {
+            format!("; {}", format_swarm_coverage(last_coverage))
         } else {
-            format!("swarm is missing {missing} pieces; {}", errors.join("; "))
+            String::new()
+        };
+        let detail = if errors.is_empty() {
+            format!("swarm is missing {missing} pieces{coverage_detail}")
+        } else {
+            format!(
+                "swarm is missing {missing} pieces{coverage_detail}; {}",
+                errors.join("; ")
+            )
         };
         self.set_torrent_state(
             id,
@@ -5485,6 +5522,46 @@ fn assign_sequential_pieces(
     Ok(assignments)
 }
 
+fn swarm_coverage_summary(
+    verified: &[bool],
+    peer_availability: &[Vec<bool>],
+) -> SwarmCoverageSummary {
+    let mut summary = SwarmCoverageSummary {
+        connected_peers: peer_availability.len(),
+        ..SwarmCoverageSummary::default()
+    };
+    for (piece_index, complete) in verified.iter().enumerate() {
+        if *complete {
+            continue;
+        }
+        summary.missing_pieces += 1;
+        let covering_peers = peer_availability
+            .iter()
+            .filter(|availability| availability.get(piece_index).copied().unwrap_or(false))
+            .count();
+        if covering_peers == 0 {
+            summary.unavailable_pieces += 1;
+        } else {
+            summary.coverable_pieces += 1;
+            if covering_peers == 1 {
+                summary.single_peer_pieces += 1;
+            }
+        }
+    }
+    summary
+}
+
+fn format_swarm_coverage(summary: SwarmCoverageSummary) -> String {
+    format!(
+        "{} missing piece(s), {} coverable by {} connected peer(s), {} unavailable, {} only on one peer",
+        summary.missing_pieces,
+        summary.coverable_pieces,
+        summary.connected_peers,
+        summary.unavailable_pieces,
+        summary.single_peer_pieces
+    )
+}
+
 fn assign_streaming_pieces(
     verified: &[bool],
     peer_availability: &[Vec<bool>],
@@ -6441,6 +6518,32 @@ mod tests {
         let mut assignments = vec![vec![0, 3, 6, 9, 12], vec![1, 4], vec![2, 5, 8, 11]];
         limit_piece_assignments(&mut assignments, 3);
         assert_eq!(assignments, vec![vec![0, 3, 6], vec![1, 4], vec![2, 5, 8]]);
+    }
+
+    #[test]
+    fn swarm_coverage_summary_counts_missing_piece_availability() {
+        let summary = swarm_coverage_summary(
+            &[true, false, false, false],
+            &[
+                vec![false, true, false, false],
+                vec![false, true, true, false],
+            ],
+        );
+
+        assert_eq!(
+            summary,
+            SwarmCoverageSummary {
+                missing_pieces: 3,
+                coverable_pieces: 2,
+                unavailable_pieces: 1,
+                single_peer_pieces: 1,
+                connected_peers: 2,
+            }
+        );
+        assert_eq!(
+            format_swarm_coverage(summary),
+            "3 missing piece(s), 2 coverable by 2 connected peer(s), 1 unavailable, 1 only on one peer"
+        );
     }
 
     #[test]
