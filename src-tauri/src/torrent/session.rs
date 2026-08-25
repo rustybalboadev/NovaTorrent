@@ -407,6 +407,15 @@ struct StreamPiecePriorityPlan {
     lookahead: Vec<u32>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PeerSchedulingHint {
+    success_score: u128,
+    piece_score: u64,
+    byte_score: u64,
+    failure_count: u32,
+    attempt_count: u32,
+}
+
 struct ConnectedPeer {
     peer: PeerInfo,
     connection: peerwire::PeerDownloadConnection,
@@ -3125,12 +3134,14 @@ impl TorrentSession {
                     .current_stream_priority(id)?
                     .or_else(|| snapshot.stream_priority.clone());
                 let mut assignments = if let Some(stream_priority) = stream_priority.as_ref() {
+                    let peer_hints = self.peer_scheduling_hints(id, &connected)?;
                     assign_streaming_pieces(
                         &verified,
                         &availability,
                         &snapshot.files,
                         snapshot.piece_length,
                         stream_priority,
+                        &peer_hints,
                         snapshot.sequential_download,
                     )?
                 } else if snapshot.sequential_download {
@@ -3928,6 +3939,33 @@ impl TorrentSession {
             .find(|torrent| torrent.matches_id(id))
             .ok_or_else(|| format!("torrent not found: {id}"))?;
         Ok(torrent.stream_priority.clone())
+    }
+
+    fn peer_scheduling_hints(
+        &self,
+        id: &str,
+        connected: &[ConnectedPeer],
+    ) -> Result<Vec<PeerSchedulingHint>, String> {
+        let torrents = self.torrents.lock().map_err(|_| "torrent lock poisoned")?;
+        let torrent = torrents
+            .iter()
+            .find(|torrent| torrent.matches_id(id))
+            .ok_or_else(|| format!("torrent not found: {id}"))?;
+        Ok(connected
+            .iter()
+            .map(|connected| {
+                let health = torrent
+                    .peer_health
+                    .get(&peer_key(&connected.peer.address, connected.peer.port));
+                PeerSchedulingHint {
+                    success_score: peer_success_score(health),
+                    piece_score: peer_piece_score(health),
+                    byte_score: peer_byte_score(health),
+                    failure_count: peer_failure_count(health),
+                    attempt_count: peer_attempt_count(health),
+                }
+            })
+            .collect())
     }
 
     pub fn query_dht(&self, id: &str) -> Result<EmptyJsonResponse, String> {
@@ -5436,6 +5474,7 @@ fn assign_streaming_pieces(
     files: &[TorrentFile],
     piece_length: u64,
     priority: &StreamPriorityState,
+    peer_hints: &[PeerSchedulingHint],
     fallback_sequential: bool,
 ) -> Result<Vec<Vec<u32>>, String> {
     let mut assignments = vec![Vec::new(); peer_availability.len()];
@@ -5447,7 +5486,12 @@ fn assign_streaming_pieces(
         if assigned.contains(&piece_index) || verified.get(piece_index).copied().unwrap_or(true) {
             continue;
         }
-        if assign_piece_to_best_peer(&mut assignments, peer_availability, piece_index)? {
+        if assign_piece_to_best_stream_peer(
+            &mut assignments,
+            peer_availability,
+            peer_hints,
+            piece_index,
+        )? {
             assigned.insert(piece_index);
         }
     }
@@ -5488,6 +5532,39 @@ fn assign_piece_to_best_peer(
         .enumerate()
         .filter(|(_, availability)| availability.get(piece_index).copied().unwrap_or(false))
         .min_by_key(|(peer_index, _)| (assignments[*peer_index].len(), *peer_index))
+        .map(|(peer_index, _)| peer_index)
+    else {
+        return Ok(false);
+    };
+    assignments[peer_index].push(
+        u32::try_from(piece_index).map_err(|_| "torrent has too many pieces".to_string())?,
+    );
+    Ok(true)
+}
+
+fn assign_piece_to_best_stream_peer(
+    assignments: &mut [Vec<u32>],
+    peer_availability: &[Vec<bool>],
+    peer_hints: &[PeerSchedulingHint],
+    piece_index: usize,
+) -> Result<bool, String> {
+    let Some(peer_index) = peer_availability
+        .iter()
+        .enumerate()
+        .filter(|(_, availability)| availability.get(piece_index).copied().unwrap_or(false))
+        .min_by_key(|(peer_index, _)| {
+            let hint = peer_hints.get(*peer_index).copied().unwrap_or_default();
+            (
+                usize::from(hint.success_score == 0 && hint.piece_score == 0),
+                assignments[*peer_index].len(),
+                hint.failure_count,
+                std::cmp::Reverse(hint.success_score),
+                std::cmp::Reverse(hint.piece_score),
+                std::cmp::Reverse(hint.byte_score),
+                hint.attempt_count,
+                *peer_index,
+            )
+        })
         .map(|(peer_index, _)| peer_index)
     else {
         return Ok(false);
@@ -6354,6 +6431,7 @@ mod tests {
             &files,
             4,
             &priority,
+            &[],
             false,
         )
         .expect("stream assignments build");
@@ -6366,6 +6444,7 @@ mod tests {
             &files,
             4,
             &priority,
+            &[],
             false,
         )
         .expect("stream assignments skip verified pieces");
@@ -6378,11 +6457,37 @@ mod tests {
             &files,
             4,
             &priority,
+            &[],
             false,
         )
         .expect("stream assignments resume normal pieces after priority is ready");
 
         assert_eq!(assignments, vec![vec![0, 2]]);
+
+        let assignments = assign_streaming_pieces(
+            &[false, false, false, false, false],
+            &[
+                vec![true, true, true, true, true],
+                vec![true, true, true, true, true],
+            ],
+            &files,
+            4,
+            &priority,
+            &[
+                PeerSchedulingHint::default(),
+                PeerSchedulingHint {
+                    success_score: 100,
+                    piece_score: 8,
+                    byte_score: 32,
+                    failure_count: 0,
+                    attempt_count: 1,
+                },
+            ],
+            false,
+        )
+        .expect("stream assignments prefer proven peers");
+
+        assert_eq!(assignments, vec![vec![], vec![3, 1, 4]]);
     }
 
     #[test]
