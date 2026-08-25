@@ -313,6 +313,7 @@ struct PeerHealth {
     last_success_ms: Option<u128>,
     bytes_downloaded: u64,
     pieces_downloaded: u64,
+    recent_bytes_per_second: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -412,6 +413,7 @@ struct PeerSchedulingHint {
     success_score: u128,
     piece_score: u64,
     byte_score: u64,
+    rate_score: u64,
     failure_count: u32,
     attempt_count: u32,
 }
@@ -3110,6 +3112,7 @@ impl TorrentSession {
                                 snapshot.total_length,
                                 snapshot.piece_length,
                                 None,
+                                None,
                             )?;
                             self.log(
                                 LogLevel::Info,
@@ -3227,8 +3230,9 @@ impl TorrentSession {
                     }
                     let label = format!("{}:{}", connected_peer.peer.address, connected_peer.peer.port);
                     let worker = std::thread::spawn(move || {
+                        let started = Instant::now();
                         let result = connected_peer.connection.download_pieces(&wanted);
-                        (connected_peer, result)
+                        (connected_peer, result, started.elapsed())
                     });
                     download_workers.push((label, worker));
                 }
@@ -3237,7 +3241,7 @@ impl TorrentSession {
                 let mut peer_failed = false;
                 let mut advertised_dht_nodes = Vec::new();
                 for (label, worker) in download_workers {
-                    let (mut connected_peer, result) = match worker.join() {
+                    let (mut connected_peer, result, download_elapsed) = match worker.join() {
                         Ok(value) => value,
                         Err(_) => {
                             peer_failed = true;
@@ -3279,13 +3283,15 @@ impl TorrentSession {
                         &verified,
                         snapshot.total_length,
                         snapshot.piece_length,
+                        Some(download_elapsed),
                         result.error.as_deref(),
                     )?;
+                    let download_rate = transfer_rate_bytes_per_second(contributed_bytes, download_elapsed);
                     self.log(
                         LogLevel::Info,
                         "peer",
                         format!(
-                            "{}:{} contributed {} verified pieces ({} bytes); {} pieces remain",
+                            "{}:{} contributed {} verified pieces ({} bytes at {download_rate} B/s); {} pieces remain",
                             peer.address,
                             peer.port,
                             contributed_pieces,
@@ -3961,6 +3967,7 @@ impl TorrentSession {
                     success_score: peer_success_score(health),
                     piece_score: peer_piece_score(health),
                     byte_score: peer_byte_score(health),
+                    rate_score: peer_rate_score(health),
                     failure_count: peer_failure_count(health),
                     attempt_count: peer_attempt_count(health),
                 }
@@ -5172,6 +5179,7 @@ impl TorrentSession {
         verified: &[bool],
         total_length: u64,
         piece_length: u64,
+        download_elapsed: Option<Duration>,
         error: Option<&str>,
     ) -> Result<(), String> {
         let mut torrents = self.torrents.lock().map_err(|_| "torrent lock poisoned")?;
@@ -5181,6 +5189,9 @@ impl TorrentSession {
             .ok_or_else(|| format!("torrent not found: {id}"))?;
         let progress_bytes = verified_piece_bytes(total_length, piece_length, verified)?;
         let file_progress = storage::file_progress_from_pieces(&torrent.files, piece_length, verified)?;
+        let transfer_rate =
+            download_elapsed.map(|elapsed| transfer_rate_bytes_per_second(contributed_bytes, elapsed));
+        let displayed_download_speed = transfer_rate.unwrap_or(contributed_bytes);
         if let Some(peer) = torrent
             .peers
             .iter_mut()
@@ -5194,7 +5205,7 @@ impl TorrentSession {
                 None if contributed_pieces == 0 => "No needed pieces".to_string(),
                 None => format!("Contributed {contributed_pieces} verified pieces"),
             };
-            peer.download_speed = contributed_bytes;
+            peer.download_speed = displayed_download_speed;
         }
         {
             let health = peer_health_entry(torrent, address, port);
@@ -5205,6 +5216,12 @@ impl TorrentSession {
                     .saturating_add(contributed_pieces as u64);
                 health.consecutive_failures = 0;
                 health.last_success_ms = Some(timestamp_ms());
+                if let Some(rate) = transfer_rate {
+                    health.recent_bytes_per_second = smooth_transfer_rate(
+                        health.recent_bytes_per_second,
+                        rate,
+                    );
+                }
             }
             if error.is_some() {
                 health.consecutive_failures = health.consecutive_failures.saturating_add(1);
@@ -5217,7 +5234,7 @@ impl TorrentSession {
         torrent.stats.error = None;
         torrent.stats.file_progress = file_progress;
         if let Some(live) = torrent.stats.live.as_mut() {
-            live.download_speed = contributed_bytes;
+            live.download_speed = displayed_download_speed;
             live.time_remaining = None;
         }
         torrent.general.downloaded = progress_bytes;
@@ -5558,6 +5575,7 @@ fn assign_piece_to_best_stream_peer(
                 usize::from(hint.success_score == 0 && hint.piece_score == 0),
                 assignments[*peer_index].len(),
                 hint.failure_count,
+                std::cmp::Reverse(hint.rate_score),
                 std::cmp::Reverse(hint.success_score),
                 std::cmp::Reverse(hint.piece_score),
                 std::cmp::Reverse(hint.byte_score),
@@ -6244,6 +6262,12 @@ fn peer_byte_score(health: Option<&PeerHealth>) -> u64 {
     health.map(|health| health.bytes_downloaded).unwrap_or_default()
 }
 
+fn peer_rate_score(health: Option<&PeerHealth>) -> u64 {
+    health
+        .map(|health| health.recent_bytes_per_second)
+        .unwrap_or_default()
+}
+
 fn peer_failure_count(health: Option<&PeerHealth>) -> u32 {
     health
         .map(|health| health.consecutive_failures)
@@ -6254,6 +6278,24 @@ fn peer_attempt_count(health: Option<&PeerHealth>) -> u32 {
     health
         .map(|health| health.connection_attempts)
         .unwrap_or_default()
+}
+
+fn transfer_rate_bytes_per_second(bytes: u64, elapsed: Duration) -> u64 {
+    if bytes == 0 {
+        return 0;
+    }
+    let millis = elapsed.as_millis().max(1);
+    let rate = u128::from(bytes).saturating_mul(1000) / millis;
+    rate.min(u128::from(u64::MAX)) as u64
+}
+
+fn smooth_transfer_rate(previous: u64, current: u64) -> u64 {
+    if previous == 0 {
+        return current;
+    }
+    ((u128::from(previous) * 3) + u128::from(current))
+        .saturating_div(4)
+        .min(u128::from(u64::MAX)) as u64
 }
 
 fn merge_peers(existing: &mut Vec<PeerInfo>, next: Vec<PeerInfo>) {
@@ -6402,6 +6444,16 @@ mod tests {
     }
 
     #[test]
+    fn peer_transfer_rate_is_measured_and_smoothed() {
+        assert_eq!(
+            transfer_rate_bytes_per_second(32 * 1024, Duration::from_millis(500)),
+            64 * 1024
+        );
+        assert_eq!(smooth_transfer_rate(0, 80), 80);
+        assert_eq!(smooth_transfer_rate(40, 80), 50);
+    }
+
+    #[test]
     fn stream_priority_assignment_targets_selected_file_and_seek_window() {
         let files = vec![
             TorrentFile {
@@ -6479,6 +6531,7 @@ mod tests {
                     success_score: 100,
                     piece_score: 8,
                     byte_score: 32,
+                    rate_score: 64,
                     failure_count: 0,
                     attempt_count: 1,
                 },
@@ -6488,6 +6541,39 @@ mod tests {
         .expect("stream assignments prefer proven peers");
 
         assert_eq!(assignments, vec![vec![], vec![3, 1, 4]]);
+
+        let assignments = assign_streaming_pieces(
+            &[false, false, false, false, false],
+            &[
+                vec![true, true, true, true, true],
+                vec![true, true, true, true, true],
+            ],
+            &files,
+            4,
+            &priority,
+            &[
+                PeerSchedulingHint {
+                    success_score: 100,
+                    piece_score: 8,
+                    byte_score: 32,
+                    rate_score: 32,
+                    failure_count: 0,
+                    attempt_count: 1,
+                },
+                PeerSchedulingHint {
+                    success_score: 100,
+                    piece_score: 8,
+                    byte_score: 32,
+                    rate_score: 256,
+                    failure_count: 0,
+                    attempt_count: 1,
+                },
+            ],
+            false,
+        )
+        .expect("stream assignments prefer faster proven peers");
+
+        assert_eq!(assignments[1][0], 3);
     }
 
     #[test]
@@ -6540,6 +6626,7 @@ mod tests {
                 last_success_ms: None,
                 bytes_downloaded: 0,
                 pieces_downloaded: 0,
+                recent_bytes_per_second: 0,
             },
         );
         torrent.peer_health.insert(
@@ -6551,6 +6638,7 @@ mod tests {
                 last_success_ms: Some(now.saturating_sub(1_000)),
                 bytes_downloaded: 32_768,
                 pieces_downloaded: 2,
+                recent_bytes_per_second: 16_384,
             },
         );
 
