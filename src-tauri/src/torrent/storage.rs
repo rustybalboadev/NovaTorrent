@@ -203,6 +203,38 @@ impl PartialPieceStore {
         Ok(bytes)
     }
 
+    pub fn read_verified_range(&mut self, offset: u64, length: u64) -> Result<Vec<u8>, String> {
+        let end = offset
+            .checked_add(length)
+            .ok_or_else(|| "partial torrent byte range overflow".to_string())?;
+        if end > self.state.total_length {
+            return Err("partial torrent byte range exceeds total length".to_string());
+        }
+        let start_piece = offset / self.state.piece_length;
+        let end_piece = end.saturating_sub(1) / self.state.piece_length;
+        for piece_index in start_piece..=end_piece {
+            if !self
+                .state
+                .pieces
+                .get(piece_index as usize)
+                .copied()
+                .unwrap_or(false)
+            {
+                return Err("partial torrent byte range is not verified yet".to_string());
+            }
+        }
+        let read_len = usize::try_from(length)
+            .map_err(|_| "partial torrent byte range is too large for this platform".to_string())?;
+        let mut bytes = vec![0u8; read_len];
+        self.data_file
+            .seek(SeekFrom::Start(offset))
+            .map_err(|err| format!("could not seek partial torrent data: {err}"))?;
+        self.data_file
+            .read_exact(&mut bytes)
+            .map_err(|err| format!("could not read partial torrent data: {err}"))?;
+        Ok(bytes)
+    }
+
     pub fn read_verified_file_range(
         &mut self,
         files: &[TorrentFile],
@@ -484,6 +516,71 @@ pub fn read_torrent_bytes(
                 file.name, file.length
             ));
         }
+    }
+    Ok(out)
+}
+
+pub fn read_torrent_range(
+    output_root: &Path,
+    torrent_name: &str,
+    files: &[TorrentFile],
+    offset: u64,
+    length: u64,
+) -> Result<Vec<u8>, String> {
+    let total_length = total_file_length(files)?;
+    let end = offset
+        .checked_add(length)
+        .ok_or_else(|| "torrent byte range overflow".to_string())?;
+    if end > total_length {
+        return Err("torrent byte range exceeds total length".to_string());
+    }
+    let read_len = usize::try_from(length)
+        .map_err(|_| "torrent byte range is too large for this platform".to_string())?;
+    let multi_file = is_multi_file_torrent(files);
+    validate_path_component(torrent_name)?;
+
+    let mut out = Vec::with_capacity(read_len);
+    let mut cursor = 0u64;
+    for file in files {
+        let file_start = cursor;
+        let file_end = file_start
+            .checked_add(file.length)
+            .ok_or_else(|| "torrent file offset overflow".to_string())?;
+        cursor = file_end;
+        let overlap_start = offset.max(file_start);
+        let overlap_end = end.min(file_end);
+        if overlap_start >= overlap_end {
+            continue;
+        }
+        let path = output_path_for_file(output_root, torrent_name, file, multi_file)?;
+        let metadata = fs::metadata(&path)
+            .map_err(|err| format!("could not inspect torrent file {}: {err}", path.to_string_lossy()))?;
+        if metadata.len() != file.length {
+            return Err(format!(
+                "stored file length mismatch for {}: expected {}, got {}",
+                file.name,
+                file.length,
+                metadata.len()
+            ));
+        }
+        let mut input = File::open(&path)
+            .map_err(|err| format!("could not open torrent file {}: {err}", path.to_string_lossy()))?;
+        input
+            .seek(SeekFrom::Start(overlap_start - file_start))
+            .map_err(|err| format!("could not seek torrent file {}: {err}", path.to_string_lossy()))?;
+        let chunk_len = usize::try_from(overlap_end - overlap_start)
+            .map_err(|_| "torrent file range is too large for this platform".to_string())?;
+        let before = out.len();
+        out.resize(before + chunk_len, 0);
+        input
+            .read_exact(&mut out[before..])
+            .map_err(|err| format!("could not read torrent file {}: {err}", path.to_string_lossy()))?;
+    }
+    if out.len() != read_len {
+        return Err(format!(
+            "torrent byte range read returned {} byte(s), expected {read_len}",
+            out.len()
+        ));
     }
     Ok(out)
 }
@@ -777,6 +874,11 @@ mod tests {
             read_torrent_bytes(&root, "Example", &files).expect("torrent reads"),
             b"abcdefg"
         );
+        assert_eq!(
+            read_torrent_range(&root, "Example", &files, 2, 4).expect("cross-file range reads"),
+            b"cdef"
+        );
+        assert!(read_torrent_range(&root, "Example", &files, 6, 2).is_err());
         remove_temp_dir(root);
     }
 

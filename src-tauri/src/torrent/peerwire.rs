@@ -422,6 +422,23 @@ pub struct PeerSeedPlan {
     pub block_response_delay: Option<Duration>,
 }
 
+pub type SeedBlockReader = Arc<dyn Fn(u64, u64) -> Result<Vec<u8>, String> + Send + Sync>;
+
+#[derive(Clone)]
+pub struct PeerSeedReadPlan {
+    pub info_hash: [u8; 20],
+    pub peer_id: [u8; 20],
+    pub dht_port: Option<u16>,
+    pub enable_pex: bool,
+    pub pex_peers: Vec<peer::PeerInfo>,
+    pub piece_length: u64,
+    pub total_length: u64,
+    pub read_block: SeedBlockReader,
+    pub available_pieces: Option<Vec<bool>>,
+    pub disconnect_after_blocks: Option<usize>,
+    pub block_response_delay: Option<Duration>,
+}
+
 #[derive(Debug, Clone)]
 pub struct PeerSeedResult {
     pub peer_id: [u8; 20],
@@ -731,14 +748,61 @@ pub fn seed_connected_peer(
 }
 
 pub fn seed_connected_peer_with_gate(
-    mut stream: TcpStream,
+    stream: TcpStream,
     handshake: peer::PeerHandshake,
     plan: PeerSeedPlan,
     upload_gate: Option<&UploadGate>,
     upload_limiter: Option<&BandwidthLimiter>,
 ) -> Result<PeerSeedResult, String> {
+    let bytes = Arc::new(plan.bytes);
+    let total_length = bytes.len() as u64;
+    seed_connected_peer_with_reader_and_gate(
+        stream,
+        handshake,
+        PeerSeedReadPlan {
+            info_hash: plan.info_hash,
+            peer_id: plan.peer_id,
+            dht_port: plan.dht_port,
+            enable_pex: plan.enable_pex,
+            pex_peers: plan.pex_peers,
+            piece_length: plan.piece_length,
+            total_length,
+            read_block: {
+                let bytes = Arc::clone(&bytes);
+                Arc::new(move |offset, length| {
+                    let start = usize::try_from(offset)
+                        .map_err(|_| "seed block offset is too large for this platform".to_string())?;
+                    let length = usize::try_from(length)
+                        .map_err(|_| "seed block length is too large for this platform".to_string())?;
+                    let end = start
+                        .checked_add(length)
+                        .ok_or_else(|| "seed block range overflowed".to_string())?;
+                    bytes
+                        .get(start..end)
+                        .map(|block| block.to_vec())
+                        .ok_or_else(|| "leecher requested bytes outside the torrent".to_string())
+                })
+            },
+            available_pieces: plan.available_pieces,
+            disconnect_after_blocks: plan.disconnect_after_blocks,
+            block_response_delay: plan.block_response_delay,
+        },
+        upload_gate,
+        upload_limiter,
+    )
+}
+
+pub fn seed_connected_peer_with_reader_and_gate(
+    mut stream: TcpStream,
+    handshake: peer::PeerHandshake,
+    plan: PeerSeedReadPlan,
+    upload_gate: Option<&UploadGate>,
+    upload_limiter: Option<&BandwidthLimiter>,
+) -> Result<PeerSeedResult, String> {
     let piece_length = checked_piece_length(plan.piece_length)?;
-    let piece_count = plan.bytes.len().div_ceil(piece_length);
+    let total_length = usize::try_from(plan.total_length)
+        .map_err(|_| "seed torrent is too large for this platform".to_string())?;
+    let piece_count = total_length.div_ceil(piece_length);
     let available_pieces = plan
         .available_pieces
         .clone()
@@ -755,7 +819,7 @@ pub fn seed_connected_peer_with_gate(
         .filter(|(_, available)| **available)
         .map(|(index, _)| {
             let start = index * piece_length;
-            plan.bytes.len().saturating_sub(start).min(piece_length) as u64
+            total_length.saturating_sub(start).min(piece_length) as u64
         })
         .sum::<u64>();
     stream
@@ -860,7 +924,7 @@ pub fn seed_connected_peer_with_gate(
                     .ok_or_else(|| "leecher piece offset overflowed".to_string())?;
                 let piece_end = piece_start
                     .checked_add(piece_length)
-                    .map(|end| end.min(plan.bytes.len()))
+                    .map(|end| end.min(total_length))
                     .ok_or_else(|| "leecher piece end overflowed".to_string())?;
                 let absolute = piece_start
                     .checked_add(begin as usize)
@@ -871,10 +935,13 @@ pub fn seed_connected_peer_with_gate(
                 if absolute < piece_start || end > piece_end {
                     return Err("leecher request crosses a piece boundary".to_string());
                 }
-                let block = plan
-                    .bytes
-                    .get(absolute..end)
-                    .ok_or_else(|| "leecher requested bytes outside the torrent".to_string())?;
+                let block = (plan.read_block)(absolute as u64, length as u64)?;
+                if block.len() != length as usize {
+                    return Err(format!(
+                        "seed block reader returned {} byte(s), expected {length}",
+                        block.len()
+                    ));
+                }
                 if let Some(limiter) = upload_limiter {
                     limiter.throttle(block.len(), None)?;
                 }
@@ -882,7 +949,7 @@ pub fn seed_connected_peer_with_gate(
                     std::thread::sleep(delay);
                 }
                 stream
-                    .write_all(&peer::build_piece(index, begin, block))
+                    .write_all(&peer::build_piece(index, begin, &block))
                     .map_err(|err| format!("could not send piece block: {err}"))?;
                 bytes_uploaded += block.len() as u64;
                 blocks_served += 1;

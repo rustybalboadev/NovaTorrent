@@ -1499,7 +1499,7 @@ impl TorrentSession {
             ));
         }
 
-        let bytes = self.load_seed_bytes(&snapshot)?;
+        let read_block = self.seed_block_reader(&snapshot)?;
         self.log(
             LogLevel::Info,
             "seed",
@@ -1512,10 +1512,10 @@ impl TorrentSession {
             ),
             Some(snapshot.id),
         );
-        let result = peerwire::seed_connected_peer_with_gate(
+        let result = peerwire::seed_connected_peer_with_reader_and_gate(
             stream,
             handshake,
-            peerwire::PeerSeedPlan {
+            peerwire::PeerSeedReadPlan {
                 info_hash: snapshot.info_hash,
                 peer_id: peer_id_for(snapshot.id),
                 dht_port: (!snapshot.private)
@@ -1524,7 +1524,8 @@ impl TorrentSession {
                 enable_pex: !snapshot.private,
                 pex_peers: pex_seed_candidates(&snapshot.peers, remote),
                 piece_length: snapshot.piece_length,
-                bytes,
+                total_length: snapshot.total_length,
+                read_block,
                 available_pieces: None,
                 disconnect_after_blocks: None,
                 block_response_delay: None,
@@ -1562,10 +1563,32 @@ impl TorrentSession {
         Ok(result)
     }
 
-    fn load_seed_bytes(&self, snapshot: &IncomingSeedSnapshot) -> Result<Vec<u8>, String> {
-        let bytes = if snapshot.files.iter().all(|file| file.included) {
-            storage::read_torrent_bytes(&snapshot.output_folder, &snapshot.name, &snapshot.files)?
-        } else {
+    fn seed_block_reader(
+        &self,
+        snapshot: &IncomingSeedSnapshot,
+    ) -> Result<peerwire::SeedBlockReader, String> {
+        let output_folder = snapshot.output_folder.clone();
+        let torrent_name = snapshot.name.clone();
+        let files = snapshot.files.clone();
+        let piece_length = snapshot.piece_length;
+        let total_length = snapshot.total_length;
+        let piece_hashes = snapshot.piece_hashes.clone();
+        if files.iter().all(|file| file.included) {
+            return Ok(Arc::new(move |offset, length| {
+                read_verified_seed_block_from_files(
+                    &output_folder,
+                    &torrent_name,
+                    &files,
+                    piece_length,
+                    total_length,
+                    &piece_hashes,
+                    offset,
+                    length,
+                )
+            }));
+        }
+
+        {
             let key = sha1::hex(&snapshot.info_hash);
             let state_path = snapshot
                 .output_folder
@@ -1574,26 +1597,19 @@ impl TorrentSession {
             if !state_path.is_file() {
                 return Err("complete partial store is unavailable for unchecked files".to_string());
             }
-            let mut store = storage::PartialPieceStore::open(
-                &snapshot.output_folder,
+        }
+        let key = sha1::hex(&snapshot.info_hash);
+        Ok(Arc::new(move |offset, length| {
+            read_verified_seed_block_from_partial_store(
+                &output_folder,
                 &key,
-                snapshot.total_length,
-                snapshot.piece_length,
-                &snapshot.piece_hashes,
-            )?;
-            store.read_complete()?
-        };
-        if bytes.len() as u64 != snapshot.total_length {
-            return Err("stored seed data length does not match torrent metadata".to_string());
-        }
-        for (index, expected_hash) in snapshot.piece_hashes.iter().enumerate() {
-            let start = index as u64 * snapshot.piece_length;
-            let end = (start + snapshot.piece_length).min(snapshot.total_length);
-            if sha1::digest(&bytes[start as usize..end as usize]) != *expected_hash {
-                return Err(format!("stored seed piece {index} failed SHA-1 verification"));
-            }
-        }
-        Ok(bytes)
+                piece_length,
+                total_length,
+                &piece_hashes,
+                offset,
+                length,
+            )
+        }))
     }
 
     fn record_upload(
@@ -5753,6 +5769,115 @@ fn update_completed_torrent_state(torrent: &mut TorrentTask) {
     if torrent.stats.finished {
         torrent.stats.state = completed_torrent_state(torrent);
     }
+}
+
+fn read_verified_seed_block_from_files(
+    output_folder: &Path,
+    torrent_name: &str,
+    files: &[TorrentFile],
+    piece_length: u64,
+    total_length: u64,
+    piece_hashes: &[[u8; 20]],
+    offset: u64,
+    length: u64,
+) -> Result<Vec<u8>, String> {
+    let (piece_index, piece_start, piece_end, relative_start) =
+        seed_piece_bounds(piece_length, total_length, piece_hashes, offset, length)?;
+    let piece = storage::read_torrent_range(
+        output_folder,
+        torrent_name,
+        files,
+        piece_start,
+        piece_end - piece_start,
+    )?;
+    verified_seed_block(piece_index, piece_hashes, piece, relative_start, length)
+}
+
+fn read_verified_seed_block_from_partial_store(
+    output_folder: &Path,
+    key: &str,
+    piece_length: u64,
+    total_length: u64,
+    piece_hashes: &[[u8; 20]],
+    offset: u64,
+    length: u64,
+) -> Result<Vec<u8>, String> {
+    let (piece_index, piece_start, piece_end, relative_start) =
+        seed_piece_bounds(piece_length, total_length, piece_hashes, offset, length)?;
+    let mut store = storage::PartialPieceStore::open_existing(
+        output_folder,
+        key,
+        total_length,
+        piece_length,
+        piece_hashes,
+    )?
+    .ok_or_else(|| "complete partial store is unavailable for unchecked files".to_string())?;
+    let piece = store.read_verified_range(piece_start, piece_end - piece_start)?;
+    verified_seed_block(piece_index, piece_hashes, piece, relative_start, length)
+}
+
+fn seed_piece_bounds(
+    piece_length: u64,
+    total_length: u64,
+    piece_hashes: &[[u8; 20]],
+    offset: u64,
+    length: u64,
+) -> Result<(usize, u64, u64, u64), String> {
+    if piece_length == 0 {
+        return Err("seed piece length cannot be zero".to_string());
+    }
+    if length == 0 {
+        return Err("seed block length cannot be zero".to_string());
+    }
+    let end = offset
+        .checked_add(length)
+        .ok_or_else(|| "seed block range overflow".to_string())?;
+    if end > total_length {
+        return Err("seed block range exceeds torrent length".to_string());
+    }
+    let piece_index = offset / piece_length;
+    let piece_start = piece_index
+        .checked_mul(piece_length)
+        .ok_or_else(|| "seed piece offset overflow".to_string())?;
+    let piece_end = piece_start
+        .checked_add(piece_length)
+        .unwrap_or(total_length)
+        .min(total_length);
+    if end > piece_end {
+        return Err("seed block crosses a piece boundary".to_string());
+    }
+    let piece_index = usize::try_from(piece_index)
+        .map_err(|_| "seed piece index is too large for this platform".to_string())?;
+    if piece_index >= piece_hashes.len() {
+        return Err(format!("seed piece index is out of range: {piece_index}"));
+    }
+    Ok((piece_index, piece_start, piece_end, offset - piece_start))
+}
+
+fn verified_seed_block(
+    piece_index: usize,
+    piece_hashes: &[[u8; 20]],
+    piece: Vec<u8>,
+    relative_start: u64,
+    length: u64,
+) -> Result<Vec<u8>, String> {
+    let expected_hash = piece_hashes
+        .get(piece_index)
+        .ok_or_else(|| format!("seed piece index is out of range: {piece_index}"))?;
+    if sha1::digest(&piece) != *expected_hash {
+        return Err(format!("stored seed piece {piece_index} failed SHA-1 verification"));
+    }
+    let start = usize::try_from(relative_start)
+        .map_err(|_| "seed block offset is too large for this platform".to_string())?;
+    let length = usize::try_from(length)
+        .map_err(|_| "seed block length is too large for this platform".to_string())?;
+    let end = start
+        .checked_add(length)
+        .ok_or_else(|| "seed block range overflow".to_string())?;
+    piece
+        .get(start..end)
+        .map(|block| block.to_vec())
+        .ok_or_else(|| "seed block range exceeds verified piece".to_string())
 }
 
 fn format_optional_rate(limit: Option<u64>) -> String {
