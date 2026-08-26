@@ -4912,6 +4912,7 @@ impl TorrentSession {
                 .collect()
         };
         let web_seeds = webseed::initial_statuses(&magnet.web_seeds);
+        let peers = magnet.peers;
         let stats = TorrentStats {
             state: if options.paused {
                 TorrentState::Paused
@@ -4960,7 +4961,7 @@ impl TorrentSession {
             files: Vec::new(),
             trackers,
             web_seeds,
-            peers: Vec::new(),
+            peers,
             piece_hashes: Vec::new(),
             stats,
             general,

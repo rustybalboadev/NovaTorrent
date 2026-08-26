@@ -1,4 +1,4 @@
-use crate::torrent::sha1;
+use crate::torrent::{peer::PeerInfo, sha1};
 
 #[derive(Debug, Clone)]
 pub struct MagnetLink {
@@ -6,6 +6,7 @@ pub struct MagnetLink {
     pub info_hash: [u8; 20],
     pub trackers: Vec<String>,
     pub web_seeds: Vec<String>,
+    pub peers: Vec<PeerInfo>,
 }
 
 impl MagnetLink {
@@ -18,6 +19,7 @@ impl MagnetLink {
         let mut info_hash = None;
         let mut trackers = Vec::new();
         let mut web_seeds = Vec::new();
+        let mut peers = Vec::new();
 
         for pair in input["magnet:?".len()..].split('&') {
             let Some((key, value)) = pair.split_once('=') else {
@@ -28,6 +30,7 @@ impl MagnetLink {
                 "dn" => display_name = Some(decoded),
                 "tr" => trackers.push(decoded),
                 "ws" => web_seeds.push(decoded),
+                "x.pe" => peers.push(parse_exact_peer(&decoded)?),
                 "xt" => {
                     if let Some(hash) = decoded.strip_prefix("urn:btih:") {
                         info_hash = Some(parse_btih(hash)?);
@@ -42,6 +45,7 @@ impl MagnetLink {
             info_hash: info_hash.ok_or_else(|| "magnet link is missing xt=urn:btih".to_string())?,
             trackers,
             web_seeds,
+            peers,
         })
     }
 }
@@ -108,6 +112,41 @@ fn base32_decode_20(value: &str) -> Result<[u8; 20], String> {
         .map_err(|_| "base32 btih did not decode to 20 bytes".to_string())
 }
 
+fn parse_exact_peer(value: &str) -> Result<PeerInfo, String> {
+    let (address, port) = if let Some(rest) = value.strip_prefix('[') {
+        let end = rest
+            .find(']')
+            .ok_or_else(|| "magnet x.pe IPv6 address is missing closing bracket".to_string())?;
+        let address = &rest[..end];
+        let port = rest[end + 1..]
+            .strip_prefix(':')
+            .ok_or_else(|| "magnet x.pe IPv6 address is missing port".to_string())?;
+        (address, port)
+    } else {
+        value
+            .rsplit_once(':')
+            .ok_or_else(|| "magnet x.pe peer must include host:port".to_string())?
+    };
+    if address.is_empty() {
+        return Err("magnet x.pe peer host is empty".to_string());
+    }
+    let port = port
+        .parse::<u16>()
+        .map_err(|err| format!("magnet x.pe peer port is invalid: {err}"))?;
+    if port == 0 {
+        return Err("magnet x.pe peer port cannot be zero".to_string());
+    }
+    Ok(PeerInfo {
+        address: address.to_string(),
+        port,
+        client: None,
+        progress: 0.0,
+        download_speed: 0,
+        upload_speed: 0,
+        connection: "Magnet peer".to_string(),
+    })
+}
+
 fn hex_value(value: u8) -> Result<u8, String> {
     match value {
         b'0'..=b'9' => Ok(value - b'0'),
@@ -124,12 +163,14 @@ mod tests {
     #[test]
     fn parses_hex_magnet() {
         let magnet = MagnetLink::parse(
-            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=Example&tr=http%3A%2F%2Ftracker.test%2Fannounce&ws=https%3A%2F%2Fmirror.test%2Ffile.bin",
+            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=Example&tr=http%3A%2F%2Ftracker.test%2Fannounce&ws=https%3A%2F%2Fmirror.test%2Ffile.bin&x.pe=127.0.0.1%3A6881",
         )
         .expect("magnet parses");
         assert_eq!(magnet.display_name.as_deref(), Some("Example"));
         assert_eq!(magnet.trackers, vec!["http://tracker.test/announce"]);
         assert_eq!(magnet.web_seeds, vec!["https://mirror.test/file.bin"]);
+        assert_eq!(magnet.peers[0].address, "127.0.0.1");
+        assert_eq!(magnet.peers[0].port, 6881);
         assert_eq!(sha1::hex(&magnet.info_hash), "0123456789abcdef0123456789abcdef01234567");
     }
 }
