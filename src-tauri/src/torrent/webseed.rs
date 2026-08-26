@@ -18,6 +18,8 @@ use crate::torrent::{
     sha1, storage,
 };
 
+const MAX_WEBSEED_REDIRECTS: usize = 3;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebSeedStatus {
     pub url: String,
@@ -257,27 +259,10 @@ pub fn parse_http_url(url: &str) -> Result<HttpEndpoint, String> {
 }
 
 pub fn parse_http_response(response: &[u8]) -> Result<Vec<u8>, String> {
-    let header_end = response
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .ok_or_else(|| "HTTP webseed response is missing header terminator".to_string())?;
-    let headers = std::str::from_utf8(&response[..header_end])
-        .map_err(|_| "HTTP webseed headers are not valid UTF-8".to_string())?;
-    let status_line = headers
-        .lines()
-        .next()
-        .ok_or_else(|| "HTTP webseed response is missing status line".to_string())?;
-    let status = status_line
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| "HTTP webseed response is missing status code".to_string())?
-        .parse::<u16>()
-        .map_err(|err| format!("HTTP webseed status code is invalid: {err}"))?;
+    let (status, headers, body) = parse_http_response_parts(response)?;
     if !(200..300).contains(&status) {
         return Err(format!("HTTP webseed returned status {status}"));
     }
-
-    let body = &response[header_end + 4..];
     if headers
         .lines()
         .any(|line| line.to_ascii_lowercase() == "transfer-encoding: chunked")
@@ -329,6 +314,40 @@ fn get_http_body(
     cancelled: &AtomicBool,
     download_limiter: Option<&BandwidthLimiter>,
 ) -> Result<Vec<u8>, String> {
+    let mut endpoint = endpoint.clone();
+    for redirect_count in 0..=MAX_WEBSEED_REDIRECTS {
+        let response = get_http_response(&endpoint, expected_length, cancelled, download_limiter)?;
+        let (status, headers, body) = parse_http_response_parts(&response)?;
+        if (300..400).contains(&status) {
+            if redirect_count == MAX_WEBSEED_REDIRECTS {
+                return Err("HTTP webseed redirected too many times".to_string());
+            }
+            let location = http_header(headers, "location").ok_or_else(|| {
+                format!("HTTP webseed returned redirect status {status} without Location")
+            })?;
+            endpoint = parse_http_url(&location)?;
+            continue;
+        }
+        if !(200..300).contains(&status) {
+            return Err(format!("HTTP webseed returned status {status}"));
+        }
+        if headers
+            .lines()
+            .any(|line| line.to_ascii_lowercase() == "transfer-encoding: chunked")
+        {
+            return decode_chunked_body(body);
+        }
+        return Ok(body.to_vec());
+    }
+    Err("HTTP webseed redirected too many times".to_string())
+}
+
+fn get_http_response(
+    endpoint: &HttpEndpoint,
+    expected_length: u64,
+    cancelled: &AtomicBool,
+    download_limiter: Option<&BandwidthLimiter>,
+) -> Result<Vec<u8>, String> {
     let address = (endpoint.host.as_str(), endpoint.port)
         .to_socket_addrs()
         .map_err(|err| format!("could not resolve webseed host: {err}"))?
@@ -370,7 +389,35 @@ fn get_http_body(
             Err(err) => return Err(format!("could not read HTTP webseed response: {err}")),
         }
     }
-    parse_http_response(&response)
+    Ok(response)
+}
+
+fn parse_http_response_parts(response: &[u8]) -> Result<(u16, &str, &[u8]), String> {
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| "HTTP webseed response is missing header terminator".to_string())?;
+    let headers = std::str::from_utf8(&response[..header_end])
+        .map_err(|_| "HTTP webseed headers are not valid UTF-8".to_string())?;
+    let status_line = headers
+        .lines()
+        .next()
+        .ok_or_else(|| "HTTP webseed response is missing status line".to_string())?;
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| "HTTP webseed response is missing status code".to_string())?
+        .parse::<u16>()
+        .map_err(|err| format!("HTTP webseed status code is invalid: {err}"))?;
+    Ok((status, headers, &response[header_end + 4..]))
+}
+
+fn http_header(headers: &str, name: &str) -> Option<String> {
+    headers.lines().skip(1).find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        key.eq_ignore_ascii_case(name)
+            .then(|| value.trim().to_string())
+    })
 }
 
 fn ensure_not_cancelled(cancelled: &AtomicBool) -> Result<(), String> {
@@ -599,6 +646,44 @@ mod tests {
             parse_http_response(response).expect("chunked response parses"),
             b"hello".to_vec()
         );
+    }
+
+    #[test]
+    fn follows_http_webseed_redirect() {
+        let target = TcpListener::bind("127.0.0.1:0").expect("target webseed binds");
+        let target_port = target.local_addr().expect("target address").port();
+        let redirect = TcpListener::bind("127.0.0.1:0").expect("redirect webseed binds");
+        let redirect_port = redirect.local_addr().expect("redirect address").port();
+
+        let target_server = thread::spawn(move || {
+            let (mut stream, _) = target.accept().expect("target accepts");
+            let mut request = [0u8; 512];
+            let length = stream.read(&mut request).expect("target request reads");
+            assert!(
+                String::from_utf8_lossy(&request[..length]).starts_with("GET /payload.bin ")
+            );
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+                .expect("target response writes");
+        });
+        let redirect_server = thread::spawn(move || {
+            let (mut stream, _) = redirect.accept().expect("redirect accepts");
+            let mut request = [0u8; 512];
+            let _ = stream.read(&mut request).expect("redirect request reads");
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{target_port}/payload.bin\r\nContent-Length: 0\r\n\r\n"
+            );
+            stream.write_all(response.as_bytes()).expect("redirect response writes");
+        });
+
+        let endpoint = parse_http_url(&format!("http://127.0.0.1:{redirect_port}/old.bin"))
+            .expect("redirect URL parses");
+        assert_eq!(
+            get_http_body(&endpoint, 5, &AtomicBool::new(false), None).expect("redirect follows"),
+            b"hello".to_vec()
+        );
+        redirect_server.join().expect("redirect exits");
+        target_server.join().expect("target exits");
     }
 
     #[test]
