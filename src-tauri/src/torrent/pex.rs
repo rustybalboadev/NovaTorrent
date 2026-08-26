@@ -165,6 +165,9 @@ fn compact_ipv4_peers(peers: &[PexPeer]) -> Result<(Vec<u8>, Vec<u8>), String> {
     let mut compact = Vec::with_capacity(peers.len() * 6);
     let mut flags = Vec::with_capacity(peers.len());
     for peer in peers {
+        if peer.port == 0 {
+            return Err("PEX peer port cannot be zero".to_string());
+        }
         let address = peer
             .address
             .parse::<std::net::Ipv4Addr>()
@@ -218,6 +221,20 @@ mod tests {
         assert!(parse_pex_message(payload)
             .expect_err("mismatched flags fail")
             .contains("flags length"));
+    }
+
+    #[test]
+    fn rejects_zero_port_pex_build_peer() {
+        let err = build_pex_message(
+            &[PexPeer {
+                address: "203.0.113.7".to_string(),
+                port: 0,
+                flags: 0,
+            }],
+            &[],
+        )
+        .expect_err("zero-port PEX peer fails");
+        assert!(err.contains("port cannot be zero"));
     }
 
     #[test]
