@@ -28,9 +28,9 @@ impl MagnetLink {
             let decoded = percent_decode(value)?;
             match key {
                 "dn" => display_name = Some(decoded),
-                "tr" => trackers.push(decoded),
-                "ws" => web_seeds.push(decoded),
-                "x.pe" => peers.push(parse_exact_peer(&decoded)?),
+                "tr" => push_unique_string(&mut trackers, decoded),
+                "ws" => push_unique_string(&mut web_seeds, decoded),
+                "x.pe" => push_unique_peer(&mut peers, parse_exact_peer(&decoded)?),
                 "xt" => {
                     if let Some(hash) = decoded.strip_prefix("urn:btih:") {
                         info_hash = Some(parse_btih(hash)?);
@@ -47,6 +47,21 @@ impl MagnetLink {
             web_seeds,
             peers,
         })
+    }
+}
+
+fn push_unique_string(values: &mut Vec<String>, value: String) {
+    if !values.iter().any(|existing| existing == &value) {
+        values.push(value);
+    }
+}
+
+fn push_unique_peer(peers: &mut Vec<PeerInfo>, peer: PeerInfo) {
+    if !peers
+        .iter()
+        .any(|existing| existing.address == peer.address && existing.port == peer.port)
+    {
+        peers.push(peer);
     }
 }
 
@@ -172,5 +187,19 @@ mod tests {
         assert_eq!(magnet.peers[0].address, "127.0.0.1");
         assert_eq!(magnet.peers[0].port, 6881);
         assert_eq!(sha1::hex(&magnet.info_hash), "0123456789abcdef0123456789abcdef01234567");
+    }
+
+    #[test]
+    fn deduplicates_magnet_sources() {
+        let magnet = MagnetLink::parse(concat!(
+            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
+            "&tr=udp%3A%2F%2Ft.test%3A80&tr=udp%3A%2F%2Ft.test%3A80",
+            "&ws=https%3A%2F%2Fm.test%2Ff&ws=https%3A%2F%2Fm.test%2Ff",
+            "&x.pe=127.0.0.1%3A6881&x.pe=127.0.0.1%3A6881",
+        ))
+        .expect("magnet parses");
+        assert_eq!(magnet.trackers.len(), 1);
+        assert_eq!(magnet.web_seeds.len(), 1);
+        assert_eq!(magnet.peers.len(), 1);
     }
 }
