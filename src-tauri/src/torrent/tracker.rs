@@ -1,6 +1,6 @@
 use std::{
     io::{Read, Write},
-    net::{TcpStream, ToSocketAddrs, UdpSocket},
+    net::{Ipv6Addr, TcpStream, ToSocketAddrs, UdpSocket},
     time::Duration,
 };
 
@@ -200,10 +200,13 @@ pub fn parse_http_announce_response(input: &[u8]) -> Result<TrackerAnnounceRespo
     let warning = root
         .dict_get(b"warning message")
         .and_then(BencodeNode::as_str_lossy);
-    let peers = match root.dict_get(b"peers") {
+    let mut peers = match root.dict_get(b"peers") {
         Some(node) => parse_tracker_peers(node)?,
         None => Vec::new(),
     };
+    if let Some(node) = root.dict_get(b"peers6") {
+        peers.extend(parse_tracker_peers6(node)?);
+    }
 
     Ok(TrackerAnnounceResponse {
         interval_seconds,
@@ -223,6 +226,25 @@ pub fn parse_compact_peers(bytes: &[u8]) -> Result<Vec<PeerInfo>, String> {
         .map(|chunk| PeerInfo {
             address: format!("{}.{}.{}.{}", chunk[0], chunk[1], chunk[2], chunk[3]),
             port: u16::from_be_bytes([chunk[4], chunk[5]]),
+            client: None,
+            progress: 0.0,
+            download_speed: 0,
+            upload_speed: 0,
+            connection: "Discovered".to_string(),
+        })
+        .collect())
+}
+
+pub fn parse_compact_peers6(bytes: &[u8]) -> Result<Vec<PeerInfo>, String> {
+    if bytes.len() % 18 != 0 {
+        return Err("compact IPv6 peer list length must be a multiple of 18".to_string());
+    }
+    Ok(bytes
+        .chunks_exact(18)
+        .map(|chunk| PeerInfo {
+            address: Ipv6Addr::from(<[u8; 16]>::try_from(&chunk[..16]).expect("IPv6 slice"))
+                .to_string(),
+            port: u16::from_be_bytes([chunk[16], chunk[17]]),
             client: None,
             progress: 0.0,
             download_speed: 0,
@@ -618,6 +640,13 @@ fn parse_tracker_peers(node: &BencodeNode) -> Result<Vec<PeerInfo>, String> {
     }
 }
 
+fn parse_tracker_peers6(node: &BencodeNode) -> Result<Vec<PeerInfo>, String> {
+    match &node.value {
+        BencodeValue::Bytes(bytes) => parse_compact_peers6(bytes),
+        _ => Err("tracker peers6 value is not compact bytes".to_string()),
+    }
+}
+
 fn parse_peer_dictionary(node: &BencodeNode) -> Result<PeerInfo, String> {
     let address = node
         .dict_get(b"ip")
@@ -695,6 +724,18 @@ mod tests {
         assert_eq!(parsed.seeders, Some(12));
         assert_eq!(parsed.leechers, Some(3));
         assert_eq!(parsed.peers[0].address, "127.0.0.1");
+        assert_eq!(parsed.peers[0].port, 6881);
+    }
+
+    #[test]
+    fn parses_http_tracker_peers6_response() {
+        let mut response = b"d8:intervali1800e5:peers0:6:peers618:".to_vec();
+        response.extend_from_slice(&[
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0x1a, 0xe1,
+        ]);
+        response.push(b'e');
+        let parsed = parse_http_announce_response(&response).expect("tracker response parses");
+        assert_eq!(parsed.peers[0].address, "2001:db8::5");
         assert_eq!(parsed.peers[0].port, 6881);
     }
 
