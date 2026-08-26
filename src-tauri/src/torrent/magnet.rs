@@ -11,7 +11,10 @@ pub struct MagnetLink {
 
 impl MagnetLink {
     pub fn parse(input: &str) -> Result<Self, String> {
-        if !input.starts_with("magnet:?") {
+        if !input
+            .get(.."magnet:?".len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("magnet:?"))
+        {
             return Err("magnet link must start with magnet:?".to_string());
         }
 
@@ -26,13 +29,13 @@ impl MagnetLink {
                 continue;
             };
             let decoded = percent_decode(value)?;
-            match key {
+            match key.to_ascii_lowercase().as_str() {
                 "dn" => display_name = Some(decoded),
                 "tr" => push_unique_string(&mut trackers, decoded),
                 "ws" => push_unique_string(&mut web_seeds, decoded),
                 "x.pe" => push_unique_peer(&mut peers, parse_exact_peer(&decoded)?),
                 "xt" => {
-                    if let Some(hash) = decoded.strip_prefix("urn:btih:") {
+                    if let Some(hash) = strip_ascii_prefix(&decoded, "urn:btih:") {
                         info_hash = Some(parse_btih(hash)?);
                     }
                 }
@@ -48,6 +51,13 @@ impl MagnetLink {
             peers,
         })
     }
+}
+
+fn strip_ascii_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    value
+        .get(..prefix.len())
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
+        .then(|| &value[prefix.len()..])
 }
 
 fn push_unique_string(values: &mut Vec<String>, value: String) {
@@ -201,5 +211,14 @@ mod tests {
         assert_eq!(magnet.trackers.len(), 1);
         assert_eq!(magnet.web_seeds.len(), 1);
         assert_eq!(magnet.peers.len(), 1);
+    }
+
+    #[test]
+    fn parses_case_insensitive_magnet_parts() {
+        let magnet = MagnetLink::parse(
+            "MAGNET:?XT=URN:BTIH:0123456789abcdef0123456789abcdef01234567&TR=http%3A%2F%2Ft.test%2Fannounce",
+        )
+        .expect("magnet parses");
+        assert_eq!(magnet.trackers, vec!["http://t.test/announce"]);
     }
 }
