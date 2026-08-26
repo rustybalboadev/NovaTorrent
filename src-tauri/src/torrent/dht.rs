@@ -1211,18 +1211,24 @@ fn parse_peer_values(values: &[BencodeNode]) -> Result<Vec<PeerInfo>, String> {
 fn parse_compact_peer_value(bytes: &[u8]) -> Result<Vec<PeerInfo>, String> {
     match bytes.len() {
         6 => tracker::parse_compact_peers(bytes),
-        18 => Ok(vec![PeerInfo {
-            address: Ipv6Addr::from(
-                <[u8; 16]>::try_from(&bytes[..16]).expect("sixteen-byte IPv6 peer slice"),
-            )
-            .to_string(),
-            port: u16::from_be_bytes([bytes[16], bytes[17]]),
-            client: None,
-            progress: 0.0,
-            download_speed: 0,
-            upload_speed: 0,
-            connection: "DHT discovered".to_string(),
-        }]),
+        18 => {
+            let port = u16::from_be_bytes([bytes[16], bytes[17]]);
+            if port == 0 {
+                return Ok(Vec::new());
+            }
+            Ok(vec![PeerInfo {
+                address: Ipv6Addr::from(
+                    <[u8; 16]>::try_from(&bytes[..16]).expect("sixteen-byte IPv6 peer slice"),
+                )
+                .to_string(),
+                port,
+                client: None,
+                progress: 0.0,
+                download_speed: 0,
+                upload_speed: 0,
+                connection: "DHT discovered".to_string(),
+            }])
+        }
         len if len % 6 == 0 => tracker::parse_compact_peers(bytes),
         _ => Err("DHT compact peer value must be 6-byte IPv4 or 18-byte IPv6 contact data".to_string()),
     }
@@ -1406,12 +1412,19 @@ mod tests {
         );
 
         let ipv4_peer = vec![127, 0, 0, 1, 0x1a, 0xe1];
+        let zero_port_ipv4_peer = vec![127, 0, 0, 2, 0, 0];
         let mut ipv6_peer = "2001:db8::5"
             .parse::<Ipv6Addr>()
             .expect("IPv6 peer address parses")
             .octets()
             .to_vec();
         ipv6_peer.extend_from_slice(&51413u16.to_be_bytes());
+        let mut zero_port_ipv6_peer = "2001:db8::6"
+            .parse::<Ipv6Addr>()
+            .expect("IPv6 peer address parses")
+            .octets()
+            .to_vec();
+        zero_port_ipv6_peer.extend_from_slice(&0u16.to_be_bytes());
 
         let mut response = b"d1:rd2:id".to_vec();
         write_bytes(&mut response, b"abcdefghij0123456789");
@@ -1419,7 +1432,9 @@ mod tests {
         write_bytes(&mut response, &compact_node6);
         response.extend_from_slice(b"5:token2:tk6:valuesl");
         write_bytes(&mut response, &ipv4_peer);
+        write_bytes(&mut response, &zero_port_ipv4_peer);
         write_bytes(&mut response, &ipv6_peer);
+        write_bytes(&mut response, &zero_port_ipv6_peer);
         response.extend_from_slice(b"ee1:t2:aa1:y1:re");
 
         let parsed = parse_dht_response(&response).expect("BEP 32 response parses");
