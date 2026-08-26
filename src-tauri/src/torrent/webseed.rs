@@ -325,7 +325,7 @@ fn get_http_body(
             let location = http_header(headers, "location").ok_or_else(|| {
                 format!("HTTP webseed returned redirect status {status} without Location")
             })?;
-            endpoint = parse_http_url(&location)?;
+            endpoint = resolve_http_redirect(&endpoint, &location)?;
             continue;
         }
         if !(200..300).contains(&status) {
@@ -418,6 +418,21 @@ fn http_header(headers: &str, name: &str) -> Option<String> {
         key.eq_ignore_ascii_case(name)
             .then(|| value.trim().to_string())
     })
+}
+
+fn resolve_http_redirect(current: &HttpEndpoint, location: &str) -> Result<HttpEndpoint, String> {
+    if location.starts_with("http://") || location.starts_with("https://") {
+        return parse_http_url(location);
+    }
+    if location.starts_with('/') {
+        return Ok(HttpEndpoint {
+            host: current.host.clone(),
+            port: current.port,
+            path_and_query: location.to_string(),
+            use_tls: current.use_tls,
+        });
+    }
+    Err("HTTP webseed redirect Location must be absolute or root-relative".to_string())
 }
 
 fn ensure_not_cancelled(cancelled: &AtomicBool) -> Result<(), String> {
@@ -650,13 +665,21 @@ mod tests {
 
     #[test]
     fn follows_http_webseed_redirect() {
-        let target = TcpListener::bind("127.0.0.1:0").expect("target webseed binds");
-        let target_port = target.local_addr().expect("target address").port();
-        let redirect = TcpListener::bind("127.0.0.1:0").expect("redirect webseed binds");
-        let redirect_port = redirect.local_addr().expect("redirect address").port();
+        let server = TcpListener::bind("127.0.0.1:0").expect("webseed binds");
+        let port = server.local_addr().expect("server address").port();
 
-        let target_server = thread::spawn(move || {
-            let (mut stream, _) = target.accept().expect("target accepts");
+        let server_thread = thread::spawn(move || {
+            let (mut stream, _) = server.accept().expect("redirect accepts");
+            let mut request = [0u8; 512];
+            let _ = stream.read(&mut request).expect("redirect request reads");
+            stream
+                .write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: /payload.bin\r\nContent-Length: 0\r\n\r\n",
+                )
+                .expect("redirect response writes");
+            drop(stream);
+
+            let (mut stream, _) = server.accept().expect("target accepts");
             let mut request = [0u8; 512];
             let length = stream.read(&mut request).expect("target request reads");
             assert!(
@@ -666,24 +689,14 @@ mod tests {
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
                 .expect("target response writes");
         });
-        let redirect_server = thread::spawn(move || {
-            let (mut stream, _) = redirect.accept().expect("redirect accepts");
-            let mut request = [0u8; 512];
-            let _ = stream.read(&mut request).expect("redirect request reads");
-            let response = format!(
-                "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{target_port}/payload.bin\r\nContent-Length: 0\r\n\r\n"
-            );
-            stream.write_all(response.as_bytes()).expect("redirect response writes");
-        });
 
-        let endpoint = parse_http_url(&format!("http://127.0.0.1:{redirect_port}/old.bin"))
+        let endpoint = parse_http_url(&format!("http://127.0.0.1:{port}/old.bin"))
             .expect("redirect URL parses");
         assert_eq!(
             get_http_body(&endpoint, 5, &AtomicBool::new(false), None).expect("redirect follows"),
             b"hello".to_vec()
         );
-        redirect_server.join().expect("redirect exits");
-        target_server.join().expect("target exits");
+        server_thread.join().expect("server exits");
     }
 
     #[test]
