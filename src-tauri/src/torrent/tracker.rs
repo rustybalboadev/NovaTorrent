@@ -641,7 +641,15 @@ fn find_crlf(input: &[u8], start: usize) -> Option<usize> {
 fn parse_tracker_peers(node: &BencodeNode) -> Result<Vec<PeerInfo>, String> {
     match &node.value {
         BencodeValue::Bytes(bytes) => parse_compact_peers(bytes),
-        BencodeValue::List(items) => items.iter().map(parse_peer_dictionary).collect(),
+        BencodeValue::List(items) => {
+            let mut peers = Vec::new();
+            for item in items {
+                if let Some(peer) = parse_peer_dictionary(item)? {
+                    peers.push(peer);
+                }
+            }
+            Ok(peers)
+        }
         _ => Err("tracker peers value is neither compact bytes nor a list".to_string()),
     }
 }
@@ -653,7 +661,7 @@ fn parse_tracker_peers6(node: &BencodeNode) -> Result<Vec<PeerInfo>, String> {
     }
 }
 
-fn parse_peer_dictionary(node: &BencodeNode) -> Result<PeerInfo, String> {
+fn parse_peer_dictionary(node: &BencodeNode) -> Result<Option<PeerInfo>, String> {
     let address = node
         .dict_get(b"ip")
         .and_then(BencodeNode::as_str_lossy)
@@ -663,7 +671,10 @@ fn parse_peer_dictionary(node: &BencodeNode) -> Result<PeerInfo, String> {
         .and_then(BencodeNode::as_i64)
         .ok_or_else(|| "tracker peer entry is missing port".to_string())?;
     let port = u16::try_from(port).map_err(|_| "tracker peer port is out of range".to_string())?;
-    Ok(PeerInfo {
+    if port == 0 {
+        return Ok(None);
+    }
+    Ok(Some(PeerInfo {
         address,
         port,
         client: node
@@ -674,7 +685,7 @@ fn parse_peer_dictionary(node: &BencodeNode) -> Result<PeerInfo, String> {
         download_speed: 0,
         upload_speed: 0,
         connection: "Discovered".to_string(),
-    })
+    }))
 }
 
 fn optional_u32(node: Option<&BencodeNode>, label: &str) -> Result<Option<u32>, String> {
@@ -755,9 +766,10 @@ mod tests {
 
     #[test]
     fn parses_dictionary_peer_ids_as_client_names() {
-        let response = b"d8:intervali1800e5:peersld2:ip9:127.0.0.17:peer id20:-qB4520-abcdefghijkl4:porti6881eeee";
+        let response = b"d8:intervali1800e5:peersld2:ip9:127.0.0.24:porti0eed2:ip9:127.0.0.17:peer id20:-qB4520-abcdefghijkl4:porti6881eeee";
         let parsed = parse_http_announce_response(response).expect("tracker response parses");
 
+        assert_eq!(parsed.peers.len(), 1);
         assert_eq!(parsed.peers[0].client.as_deref(), Some("qBittorrent 4.5.2"));
         assert_eq!(parsed.peers[0].connection, "Discovered");
     }
