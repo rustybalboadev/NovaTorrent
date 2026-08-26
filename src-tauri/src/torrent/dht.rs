@@ -1006,34 +1006,36 @@ pub fn parse_compact_nodes(bytes: &[u8]) -> Result<Vec<DhtNode>, String> {
     if bytes.len() % 26 != 0 {
         return Err("compact DHT node list length must be a multiple of 26".to_string());
     }
-    bytes
-        .chunks_exact(26)
-        .map(|chunk| {
-            let id = bytes_to_20(&chunk[..20])?;
-            let address = format!("{}.{}.{}.{}", chunk[20], chunk[21], chunk[22], chunk[23]);
-            let port = u16::from_be_bytes([chunk[24], chunk[25]]);
-            Ok(DhtNode { id, address, port })
-        })
-        .collect()
+    let mut nodes = Vec::new();
+    for chunk in bytes.chunks_exact(26) {
+        let id = bytes_to_20(&chunk[..20])?;
+        let address = format!("{}.{}.{}.{}", chunk[20], chunk[21], chunk[22], chunk[23]);
+        let port = u16::from_be_bytes([chunk[24], chunk[25]]);
+        if port != 0 {
+            nodes.push(DhtNode { id, address, port });
+        }
+    }
+    Ok(nodes)
 }
 
 pub fn parse_compact_nodes6(bytes: &[u8]) -> Result<Vec<DhtNode>, String> {
     if bytes.len() % 38 != 0 {
         return Err("compact IPv6 DHT node list length must be a multiple of 38".to_string());
     }
-    bytes
-        .chunks_exact(38)
-        .map(|chunk| {
-            let id = bytes_to_20(&chunk[..20])?;
-            let address = Ipv6Addr::from(
-                <[u8; 16]>::try_from(&chunk[20..36])
-                    .expect("sixteen-byte IPv6 compact node slice"),
-            )
-            .to_string();
-            let port = u16::from_be_bytes([chunk[36], chunk[37]]);
-            Ok(DhtNode { id, address, port })
-        })
-        .collect()
+    let mut nodes = Vec::new();
+    for chunk in bytes.chunks_exact(38) {
+        let id = bytes_to_20(&chunk[..20])?;
+        let address = Ipv6Addr::from(
+            <[u8; 16]>::try_from(&chunk[20..36])
+                .expect("sixteen-byte IPv6 compact node slice"),
+        )
+        .to_string();
+        let port = u16::from_be_bytes([chunk[36], chunk[37]]);
+        if port != 0 {
+            nodes.push(DhtNode { id, address, port });
+        }
+    }
+    Ok(nodes)
 }
 
 pub fn build_compact_node(node: &DhtNode) -> Result<Vec<u8>, String> {
@@ -1393,7 +1395,10 @@ mod tests {
             address: "127.0.0.1".to_string(),
             port: 6881,
         };
-        let compact = build_compact_node(&node).expect("node compacts");
+        let mut compact = [9; 20].to_vec();
+        compact.extend_from_slice(&[127, 0, 0, 2]);
+        compact.extend_from_slice(&0u16.to_be_bytes());
+        compact.extend_from_slice(&build_compact_node(&node).expect("node compacts"));
 
         assert_eq!(parse_compact_nodes(&compact).expect("nodes parse"), vec![node]);
     }
@@ -1406,8 +1411,18 @@ mod tests {
             port: 49002,
         };
         let compact_node6 = build_compact_node6(&node6).expect("IPv6 node compacts");
+        let mut zero_port_node6 = [9; 20].to_vec();
+        zero_port_node6.extend_from_slice(
+            &"2001:db8::2"
+                .parse::<Ipv6Addr>()
+                .expect("IPv6 parses")
+                .octets(),
+        );
+        zero_port_node6.extend_from_slice(&0u16.to_be_bytes());
+        let mut compact_nodes6 = zero_port_node6;
+        compact_nodes6.extend_from_slice(&compact_node6);
         assert_eq!(
-            parse_compact_nodes6(&compact_node6).expect("nodes6 parses"),
+            parse_compact_nodes6(&compact_nodes6).expect("nodes6 parses"),
             vec![node6.clone()]
         );
 
