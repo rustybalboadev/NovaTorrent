@@ -223,14 +223,17 @@ pub fn parse_compact_peers(bytes: &[u8]) -> Result<Vec<PeerInfo>, String> {
     }
     Ok(bytes
         .chunks_exact(6)
-        .map(|chunk| PeerInfo {
-            address: format!("{}.{}.{}.{}", chunk[0], chunk[1], chunk[2], chunk[3]),
-            port: u16::from_be_bytes([chunk[4], chunk[5]]),
-            client: None,
-            progress: 0.0,
-            download_speed: 0,
-            upload_speed: 0,
-            connection: "Discovered".to_string(),
+        .filter_map(|chunk| {
+            let port = u16::from_be_bytes([chunk[4], chunk[5]]);
+            (port != 0).then(|| PeerInfo {
+                address: format!("{}.{}.{}.{}", chunk[0], chunk[1], chunk[2], chunk[3]),
+                port,
+                client: None,
+                progress: 0.0,
+                download_speed: 0,
+                upload_speed: 0,
+                connection: "Discovered".to_string(),
+            })
         })
         .collect())
 }
@@ -241,15 +244,18 @@ pub fn parse_compact_peers6(bytes: &[u8]) -> Result<Vec<PeerInfo>, String> {
     }
     Ok(bytes
         .chunks_exact(18)
-        .map(|chunk| PeerInfo {
-            address: Ipv6Addr::from(<[u8; 16]>::try_from(&chunk[..16]).expect("IPv6 slice"))
-                .to_string(),
-            port: u16::from_be_bytes([chunk[16], chunk[17]]),
-            client: None,
-            progress: 0.0,
-            download_speed: 0,
-            upload_speed: 0,
-            connection: "Discovered".to_string(),
+        .filter_map(|chunk| {
+            let port = u16::from_be_bytes([chunk[16], chunk[17]]);
+            (port != 0).then(|| PeerInfo {
+                address: Ipv6Addr::from(<[u8; 16]>::try_from(&chunk[..16]).expect("IPv6 slice"))
+                    .to_string(),
+                port,
+                client: None,
+                progress: 0.0,
+                download_speed: 0,
+                upload_speed: 0,
+                connection: "Discovered".to_string(),
+            })
         })
         .collect())
 }
@@ -714,6 +720,14 @@ mod tests {
         let peers = parse_compact_peers(&[127, 0, 0, 1, 0x1a, 0xe1]).expect("peers parse");
         assert_eq!(peers[0].address, "127.0.0.1");
         assert_eq!(peers[0].port, 6881);
+    }
+
+    #[test]
+    fn ignores_compact_peers_with_zero_port() {
+        let peers = parse_compact_peers(&[127, 0, 0, 1, 0, 0, 127, 0, 0, 2, 0x1a, 0xe1])
+            .expect("peers parse");
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].address, "127.0.0.2");
     }
 
     #[test]
