@@ -17,6 +17,7 @@ const HTTP_TRACKER_READ_TIMEOUT: Duration = Duration::from_secs(6);
 const HTTP_TRACKER_WRITE_TIMEOUT: Duration = Duration::from_secs(4);
 const UDP_TRACKER_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const UDP_TRACKER_WRITE_TIMEOUT: Duration = Duration::from_secs(4);
+const MAX_HTTP_TRACKER_REDIRECTS: usize = 3;
 
 pub const UDP_PROTOCOL_ID: u64 = 0x41727101980;
 pub const UDP_ACTION_CONNECT: u32 = 0;
@@ -128,7 +129,37 @@ pub fn announce_http(
         left,
         event,
     );
-    let endpoint = parse_http_tracker_url(&announce_url)?;
+    let mut endpoint = parse_http_tracker_url(&announce_url)?;
+    for redirect_count in 0..=MAX_HTTP_TRACKER_REDIRECTS {
+        let response = read_http_tracker_response(&endpoint)?;
+        let (status, headers, body) = parse_http_tracker_response_parts(&response)?;
+        if (300..400).contains(&status) {
+            if redirect_count == MAX_HTTP_TRACKER_REDIRECTS {
+                return Err("HTTP tracker redirected too many times".to_string());
+            }
+            let location = http_header(headers, "location").ok_or_else(|| {
+                format!("HTTP tracker returned redirect status {status} without Location")
+            })?;
+            endpoint = resolve_http_tracker_redirect(&endpoint, &location)?;
+            continue;
+        }
+        if !(200..300).contains(&status) {
+            return Err(format!("HTTP tracker returned status {status}"));
+        }
+        let body = if headers
+            .lines()
+            .any(|line| line.to_ascii_lowercase() == "transfer-encoding: chunked")
+        {
+            decode_chunked_body(body)?
+        } else {
+            body.to_vec()
+        };
+        return parse_http_announce_response(&body);
+    }
+    Err("HTTP tracker redirected too many times".to_string())
+}
+
+fn read_http_tracker_response(endpoint: &HttpTrackerEndpoint) -> Result<Vec<u8>, String> {
     let address = (endpoint.host.as_str(), endpoint.port)
         .to_socket_addrs()
         .map_err(|err| format!("could not resolve tracker host: {err}"))?
@@ -149,7 +180,7 @@ pub fn announce_http(
     if response.len() as u64 > MAX_TRACKER_RESPONSE {
         return Err("HTTP tracker response exceeded 4 MiB".to_string());
     }
-    parse_http_tracker_response(&response)
+    Ok(response)
 }
 
 pub fn parse_http_announce_response(input: &[u8]) -> Result<TrackerAnnounceResponse, String> {
@@ -373,6 +404,23 @@ pub fn build_http_tracker_request(endpoint: &HttpTrackerEndpoint) -> String {
 }
 
 pub fn parse_http_tracker_response(response: &[u8]) -> Result<TrackerAnnounceResponse, String> {
+    let (status, headers, body) = parse_http_tracker_response_parts(response)?;
+    if !(200..300).contains(&status) {
+        return Err(format!("HTTP tracker returned status {status}"));
+    }
+
+    let body = if headers
+        .lines()
+        .any(|line| line.to_ascii_lowercase() == "transfer-encoding: chunked")
+    {
+        decode_chunked_body(body)?
+    } else {
+        body.to_vec()
+    };
+    parse_http_announce_response(&body)
+}
+
+fn parse_http_tracker_response_parts(response: &[u8]) -> Result<(u16, &str, &[u8]), String> {
     let header_end = response
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
@@ -389,20 +437,7 @@ pub fn parse_http_tracker_response(response: &[u8]) -> Result<TrackerAnnounceRes
         .ok_or_else(|| "HTTP tracker response is missing status code".to_string())?
         .parse::<u16>()
         .map_err(|err| format!("HTTP tracker status code is invalid: {err}"))?;
-    if !(200..300).contains(&status) {
-        return Err(format!("HTTP tracker returned status {status}"));
-    }
-
-    let body = &response[header_end + 4..];
-    let body = if headers
-        .lines()
-        .any(|line| line.to_ascii_lowercase() == "transfer-encoding: chunked")
-    {
-        decode_chunked_body(body)?
-    } else {
-        body.to_vec()
-    };
-    parse_http_announce_response(&body)
+    Ok((status, headers, &response[header_end + 4..]))
 }
 
 pub fn percent_encode_bytes(bytes: &[u8]) -> String {
@@ -445,6 +480,32 @@ fn connect_http_tracker_stream(
     } else {
         Ok(Box::new(stream))
     }
+}
+
+fn http_header(headers: &str, name: &str) -> Option<String> {
+    headers.lines().skip(1).find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        key.eq_ignore_ascii_case(name)
+            .then(|| value.trim().to_string())
+    })
+}
+
+fn resolve_http_tracker_redirect(
+    current: &HttpTrackerEndpoint,
+    location: &str,
+) -> Result<HttpTrackerEndpoint, String> {
+    if location.starts_with("http://") || location.starts_with("https://") {
+        return parse_http_tracker_url(location);
+    }
+    if location.starts_with('/') {
+        return Ok(HttpTrackerEndpoint {
+            host: current.host.clone(),
+            port: current.port,
+            path_and_query: location.to_string(),
+            use_tls: current.use_tls,
+        });
+    }
+    Err("HTTP tracker redirect Location must be absolute or root-relative".to_string())
 }
 
 fn parse_http_authority(authority: &str, default_port: u16) -> Result<(String, u16), String> {
@@ -708,6 +769,54 @@ mod tests {
         let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n36\r\nd8:completei1e10:incompletei2e8:intervali30e5:peers0:e\r\n0\r\n\r\n";
         let parsed = parse_http_tracker_response(response).expect("chunked tracker response parses");
         assert_eq!(parsed.interval_seconds, 30);
+    }
+
+    #[test]
+    fn follows_http_tracker_redirect() {
+        let target = std::net::TcpListener::bind("127.0.0.1:0").expect("target tracker binds");
+        let target_port = target.local_addr().expect("target address").port();
+        let redirect = std::net::TcpListener::bind("127.0.0.1:0").expect("redirect tracker binds");
+        let redirect_port = redirect.local_addr().expect("redirect address").port();
+
+        let target_server = std::thread::spawn(move || {
+            let (mut stream, _) = target.accept().expect("target accepts");
+            let mut request = [0u8; 1024];
+            let length = stream.read(&mut request).expect("target request reads");
+            assert!(
+                String::from_utf8_lossy(&request[..length]).starts_with("GET /new-announce ")
+            );
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 54\r\n\r\nd8:completei1e10:incompletei2e8:intervali30e5:peers0:e",
+                )
+                .expect("target response writes");
+        });
+        let redirect_server = std::thread::spawn(move || {
+            let (mut stream, _) = redirect.accept().expect("redirect accepts");
+            let mut request = [0u8; 1024];
+            let length = stream.read(&mut request).expect("redirect request reads");
+            assert!(String::from_utf8_lossy(&request[..length]).starts_with("GET /announce?"));
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{target_port}/new-announce\r\nContent-Length: 0\r\n\r\n"
+            );
+            stream.write_all(response.as_bytes()).expect("redirect response writes");
+        });
+
+        let parsed = announce_http(
+            &format!("http://127.0.0.1:{redirect_port}/announce"),
+            [1; 20],
+            [2; 20],
+            6881,
+            0,
+            0,
+            0,
+            Some("started"),
+        )
+        .expect("redirected tracker announces");
+        assert_eq!(parsed.interval_seconds, 30);
+        assert_eq!(parsed.seeders, Some(1));
+        redirect_server.join().expect("redirect exits");
+        target_server.join().expect("target exits");
     }
 
     #[test]
