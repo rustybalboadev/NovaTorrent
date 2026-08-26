@@ -5,6 +5,7 @@ pub struct MagnetLink {
     pub display_name: Option<String>,
     pub info_hash: [u8; 20],
     pub trackers: Vec<String>,
+    pub web_seeds: Vec<String>,
 }
 
 impl MagnetLink {
@@ -16,6 +17,7 @@ impl MagnetLink {
         let mut display_name = None;
         let mut info_hash = None;
         let mut trackers = Vec::new();
+        let mut web_seeds = Vec::new();
 
         for pair in input["magnet:?".len()..].split('&') {
             let Some((key, value)) = pair.split_once('=') else {
@@ -25,6 +27,7 @@ impl MagnetLink {
             match key {
                 "dn" => display_name = Some(decoded),
                 "tr" => trackers.push(decoded),
+                "ws" => web_seeds.push(decoded),
                 "xt" => {
                     if let Some(hash) = decoded.strip_prefix("urn:btih:") {
                         info_hash = Some(parse_btih(hash)?);
@@ -38,6 +41,7 @@ impl MagnetLink {
             display_name,
             info_hash: info_hash.ok_or_else(|| "magnet link is missing xt=urn:btih".to_string())?,
             trackers,
+            web_seeds,
         })
     }
 }
@@ -120,11 +124,12 @@ mod tests {
     #[test]
     fn parses_hex_magnet() {
         let magnet = MagnetLink::parse(
-            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=Example&tr=http%3A%2F%2Ftracker.test%2Fannounce",
+            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=Example&tr=http%3A%2F%2Ftracker.test%2Fannounce&ws=https%3A%2F%2Fmirror.test%2Ffile.bin",
         )
         .expect("magnet parses");
         assert_eq!(magnet.display_name.as_deref(), Some("Example"));
         assert_eq!(magnet.trackers, vec!["http://tracker.test/announce"]);
+        assert_eq!(magnet.web_seeds, vec!["https://mirror.test/file.bin"]);
         assert_eq!(sha1::hex(&magnet.info_hash), "0123456789abcdef0123456789abcdef01234567");
     }
 }
