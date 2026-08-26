@@ -314,6 +314,7 @@ struct PeerHealth {
     bytes_downloaded: u64,
     pieces_downloaded: u64,
     recent_bytes_per_second: u64,
+    unavailable_pieces: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -414,6 +415,7 @@ struct PeerSchedulingHint {
     piece_score: u64,
     byte_score: u64,
     rate_score: u64,
+    unavailable_score: u64,
     failure_count: u32,
     attempt_count: u32,
 }
@@ -3121,6 +3123,7 @@ impl TorrentSession {
                                 &verified,
                                 snapshot.total_length,
                                 snapshot.piece_length,
+                                0,
                                 None,
                                 None,
                             )?;
@@ -3303,6 +3306,7 @@ impl TorrentSession {
                         &verified,
                         snapshot.total_length,
                         snapshot.piece_length,
+                        result.unavailable.len(),
                         Some(download_elapsed),
                         result.error.as_deref(),
                     )?;
@@ -3311,11 +3315,12 @@ impl TorrentSession {
                         LogLevel::Info,
                         "peer",
                         format!(
-                            "{}:{} contributed {} verified pieces ({} bytes at {download_rate} B/s); {} pieces remain",
+                            "{}:{} contributed {} verified pieces ({} bytes at {download_rate} B/s, {} unavailable); {} pieces remain",
                             peer.address,
                             peer.port,
                             contributed_pieces,
                             contributed_bytes,
+                            result.unavailable.len(),
                             verified.iter().filter(|piece| !**piece).count()
                         ),
                         Some(snapshot.id),
@@ -4005,6 +4010,7 @@ impl TorrentSession {
                     piece_score: peer_piece_score(health),
                     byte_score: peer_byte_score(health),
                     rate_score: peer_rate_score(health),
+                    unavailable_score: peer_unavailable_count(health),
                     failure_count: peer_failure_count(health),
                     attempt_count: peer_attempt_count(health),
                 }
@@ -5216,6 +5222,7 @@ impl TorrentSession {
         verified: &[bool],
         total_length: u64,
         piece_length: u64,
+        unavailable_pieces: usize,
         download_elapsed: Option<Duration>,
         error: Option<&str>,
     ) -> Result<(), String> {
@@ -5239,6 +5246,9 @@ impl TorrentSession {
                     format!("Contributed {contributed_pieces} pieces; stopped: {error}")
                 }
                 Some(error) => format!("Error: {error}"),
+                None if contributed_pieces == 0 && unavailable_pieces > 0 => {
+                    format!("No requested pieces available; {unavailable_pieces} unavailable")
+                }
                 None if contributed_pieces == 0 => "No needed pieces".to_string(),
                 None => format!("Contributed {contributed_pieces} verified pieces"),
             };
@@ -5259,6 +5269,11 @@ impl TorrentSession {
                         rate,
                     );
                 }
+            }
+            if unavailable_pieces > 0 {
+                health.unavailable_pieces = health
+                    .unavailable_pieces
+                    .saturating_add(unavailable_pieces as u64);
             }
             if error.is_some() {
                 health.consecutive_failures = health.consecutive_failures.saturating_add(1);
@@ -5652,6 +5667,7 @@ fn assign_piece_to_best_stream_peer(
                 usize::from(hint.success_score == 0 && hint.piece_score == 0),
                 assignments[*peer_index].len(),
                 hint.failure_count,
+                hint.unavailable_score,
                 std::cmp::Reverse(hint.rate_score),
                 std::cmp::Reverse(hint.success_score),
                 std::cmp::Reverse(hint.piece_score),
@@ -6202,6 +6218,7 @@ fn schedule_peers_for_download(torrent: &TorrentTask, max_connections: usize) ->
             .then_with(|| peer_piece_score(right_health).cmp(&peer_piece_score(left_health)))
             .then_with(|| peer_byte_score(right_health).cmp(&peer_byte_score(left_health)))
             .then_with(|| peer_failure_count(left_health).cmp(&peer_failure_count(right_health)))
+            .then_with(|| peer_unavailable_count(left_health).cmp(&peer_unavailable_count(right_health)))
             .then_with(|| peer_attempt_count(left_health).cmp(&peer_attempt_count(right_health)))
             .then_with(|| left.address.cmp(&right.address))
             .then_with(|| left.port.cmp(&right.port))
@@ -6349,6 +6366,10 @@ fn peer_failure_count(health: Option<&PeerHealth>) -> u32 {
     health
         .map(|health| health.consecutive_failures)
         .unwrap_or_default()
+}
+
+fn peer_unavailable_count(health: Option<&PeerHealth>) -> u64 {
+    health.map(|health| health.unavailable_pieces).unwrap_or_default()
 }
 
 fn peer_attempt_count(health: Option<&PeerHealth>) -> u32 {
@@ -6635,6 +6656,7 @@ mod tests {
                     piece_score: 8,
                     byte_score: 32,
                     rate_score: 64,
+                    unavailable_score: 0,
                     failure_count: 0,
                     attempt_count: 1,
                 },
@@ -6660,6 +6682,7 @@ mod tests {
                     piece_score: 8,
                     byte_score: 32,
                     rate_score: 32,
+                    unavailable_score: 0,
                     failure_count: 0,
                     attempt_count: 1,
                 },
@@ -6668,6 +6691,7 @@ mod tests {
                     piece_score: 8,
                     byte_score: 32,
                     rate_score: 256,
+                    unavailable_score: 0,
                     failure_count: 0,
                     attempt_count: 1,
                 },
@@ -6675,6 +6699,41 @@ mod tests {
             false,
         )
         .expect("stream assignments prefer faster proven peers");
+
+        assert_eq!(assignments[1][0], 3);
+
+        let assignments = assign_streaming_pieces(
+            &[false, false, false, false, false],
+            &[
+                vec![true, true, true, true, true],
+                vec![true, true, true, true, true],
+            ],
+            &files,
+            4,
+            &priority,
+            &[
+                PeerSchedulingHint {
+                    success_score: 100,
+                    piece_score: 8,
+                    byte_score: 32,
+                    rate_score: 128,
+                    unavailable_score: 5,
+                    failure_count: 0,
+                    attempt_count: 1,
+                },
+                PeerSchedulingHint {
+                    success_score: 100,
+                    piece_score: 8,
+                    byte_score: 32,
+                    rate_score: 128,
+                    unavailable_score: 0,
+                    failure_count: 0,
+                    attempt_count: 1,
+                },
+            ],
+            false,
+        )
+        .expect("stream assignments avoid stale availability peers");
 
         assert_eq!(assignments[1][0], 3);
     }
@@ -6730,6 +6789,7 @@ mod tests {
                 bytes_downloaded: 0,
                 pieces_downloaded: 0,
                 recent_bytes_per_second: 0,
+                unavailable_pieces: 0,
             },
         );
         torrent.peer_health.insert(
@@ -6742,6 +6802,7 @@ mod tests {
                 bytes_downloaded: 32_768,
                 pieces_downloaded: 2,
                 recent_bytes_per_second: 16_384,
+                unavailable_pieces: 0,
             },
         );
 
