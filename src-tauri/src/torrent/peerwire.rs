@@ -629,7 +629,7 @@ pub fn fetch_metadata_from_peer(
     let mut stream = TcpStream::connect_timeout(&socket_addr, PEER_CONNECT_TIMEOUT)
         .map_err(|err| format!("could not connect to metadata peer: {err}"))?;
     stream
-        .set_read_timeout(Some(Duration::from_secs(20)))
+        .set_read_timeout(Some(Duration::from_secs(8)))
         .map_err(|err| format!("could not set metadata peer read timeout: {err}"))?;
     stream
         .set_write_timeout(Some(Duration::from_secs(10)))
