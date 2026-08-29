@@ -2816,6 +2816,8 @@ impl TorrentSession {
         let mut pending_dht_nodes = Vec::new();
         let mut pex_candidates_added = 0usize;
         let mut last_coverage = SwarmCoverageSummary::default();
+        let peer_download_started = Instant::now();
+        let mut first_piece_logged = false;
         for peer_batch in snapshot
             .peers
             .chunks(snapshot.max_connections.min(MAX_PARALLEL_PEERS))
@@ -3286,6 +3288,18 @@ impl TorrentSession {
                         verified[index] = true;
                         contributed_bytes += downloaded.bytes.len() as u64;
                         contributed_pieces += 1;
+                    }
+                    if contributed_pieces > 0 && !first_piece_logged {
+                        first_piece_logged = true;
+                        self.log(
+                            LogLevel::Info,
+                            "peer",
+                            format!(
+                                "first verified peer piece arrived after {} ms",
+                                peer_download_started.elapsed().as_millis()
+                            ),
+                            Some(snapshot.id),
+                        );
                     }
                     round_progress += contributed_pieces;
                     self.mark_peer_piece_progress(
