@@ -43,6 +43,7 @@ const TRACKER_ANNOUNCE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(16);
 const TRACKER_EARLY_PEER_GRACE: Duration = Duration::from_millis(450);
 const MAX_SWARM_REFRESH_ROUNDS: usize = 8;
 const MAX_RUNTIME_RETRY_DELAY: Duration = Duration::from_secs(60);
+const MAX_PARALLEL_METADATA_PEERS: usize = 8;
 const DEFAULT_STREAM_URGENT_BYTES: u64 = 16 * 1024 * 1024;
 const DEFAULT_STREAM_LOOKAHEAD_BYTES: u64 = 192 * 1024 * 1024;
 const MAX_STREAM_LOOKAHEAD_BYTES: u64 = 1024 * 1024 * 1024;
@@ -4269,24 +4270,45 @@ impl TorrentSession {
         self.log(
             LogLevel::Info,
             "metadata",
-            format!("trying {} discovered peers for metadata", snapshot.peers.len()),
+            format!(
+                "trying up to {} of {} discovered peers for metadata",
+                snapshot.peers.len().min(MAX_PARALLEL_METADATA_PEERS),
+                snapshot.peers.len()
+            ),
             Some(snapshot.id),
         );
 
-        let mut last_error = None;
-        for peer in &snapshot.peers {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut started = 0usize;
+        for peer in snapshot.peers.iter().take(MAX_PARALLEL_METADATA_PEERS).cloned() {
             self.set_peer_connection(id, &peer.address, peer.port, "Fetching metadata", None)?;
-            match peerwire::fetch_metadata_from_peer(
-                &peer.address,
-                peer.port,
-                MetadataFetchPlan {
-                    info_hash: snapshot.info_hash,
-                    peer_id: peer_id_for(snapshot.id),
-                    dht_port: (!snapshot.private)
-                        .then(|| self.dht_port())
-                        .filter(|port| *port != 0),
-                },
-            ) {
+            let sender = sender.clone();
+            let info_hash = snapshot.info_hash;
+            let private = snapshot.private;
+            let peer_id = peer_id_for(snapshot.id);
+            let dht_port = (!private).then(|| self.dht_port()).filter(|port| *port != 0);
+            std::thread::spawn(move || {
+                let result = peerwire::fetch_metadata_from_peer(
+                    &peer.address,
+                    peer.port,
+                    MetadataFetchPlan {
+                        info_hash,
+                        peer_id,
+                        dht_port,
+                    },
+                );
+                let _ = sender.send((peer, result));
+            });
+            started += 1;
+        }
+        drop(sender);
+
+        let mut last_error = None;
+        for _ in 0..started {
+            let (peer, result) = receiver
+                .recv()
+                .map_err(|_| "metadata workers stopped before reporting a result".to_string())?;
+            match result {
                 Ok(result) => {
                     if let Some(client) =
                         self.set_peer_client(id, &peer.address, peer.port, &result.peer_id)?
