@@ -4271,98 +4271,99 @@ impl TorrentSession {
             LogLevel::Info,
             "metadata",
             format!(
-                "trying up to {} of {} discovered peers for metadata",
-                snapshot.peers.len().min(MAX_PARALLEL_METADATA_PEERS),
+                "trying {} discovered peers for metadata in batches of up to {}",
+                snapshot.peers.len(),
                 snapshot.peers.len()
+                    .min(MAX_PARALLEL_METADATA_PEERS)
             ),
             Some(snapshot.id),
         );
 
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let mut started = 0usize;
-        for peer in snapshot.peers.iter().take(MAX_PARALLEL_METADATA_PEERS).cloned() {
-            self.set_peer_connection(id, &peer.address, peer.port, "Fetching metadata", None)?;
-            let sender = sender.clone();
-            let info_hash = snapshot.info_hash;
-            let private = snapshot.private;
-            let peer_id = peer_id_for(snapshot.id);
-            let dht_port = (!private).then(|| self.dht_port()).filter(|port| *port != 0);
-            std::thread::spawn(move || {
-                let result = peerwire::fetch_metadata_from_peer(
-                    &peer.address,
-                    peer.port,
-                    MetadataFetchPlan {
-                        info_hash,
-                        peer_id,
-                        dht_port,
-                    },
-                );
-                let _ = sender.send((peer, result));
-            });
-            started += 1;
-        }
-        drop(sender);
-
         let mut last_error = None;
-        for _ in 0..started {
-            let (peer, result) = receiver
-                .recv()
-                .map_err(|_| "metadata workers stopped before reporting a result".to_string())?;
-            match result {
-                Ok(result) => {
-                    if let Some(client) =
-                        self.set_peer_client(id, &peer.address, peer.port, &result.peer_id)?
-                    {
-                        self.log(
-                            LogLevel::Debug,
-                            "metadata",
-                            format!("{}:{} identified as {client}", peer.address, peer.port),
-                            Some(snapshot.id),
-                        );
-                    }
-                    let meta = Metainfo::from_info_bytes(&result.info_bytes, None, Vec::new(), Vec::new())?;
-                    if !meta.private {
-                        if let Some(dht_port) = result.remote_dht_port {
-                            if let Err(err) =
-                                self.learn_peer_dht_node(&peer.address, dht_port, snapshot.id)
-                            {
-                                self.log(
-                                    LogLevel::Debug,
-                                    "dht",
-                                    format!(
-                                        "could not verify DHT port {dht_port} from metadata peer {}: {err}",
-                                        peer.address
-                                    ),
-                                    Some(snapshot.id),
-                                );
+        for peer_batch in snapshot.peers.chunks(MAX_PARALLEL_METADATA_PEERS) {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            for peer in peer_batch.iter().cloned() {
+                self.set_peer_connection(id, &peer.address, peer.port, "Fetching metadata", None)?;
+                let sender = sender.clone();
+                let info_hash = snapshot.info_hash;
+                let private = snapshot.private;
+                let peer_id = peer_id_for(snapshot.id);
+                let dht_port = (!private).then(|| self.dht_port()).filter(|port| *port != 0);
+                std::thread::spawn(move || {
+                    let result = peerwire::fetch_metadata_from_peer(
+                        &peer.address,
+                        peer.port,
+                        MetadataFetchPlan {
+                            info_hash,
+                            peer_id,
+                            dht_port,
+                        },
+                    );
+                    let _ = sender.send((peer, result));
+                });
+            }
+            drop(sender);
+
+            for _ in 0..peer_batch.len() {
+                let (peer, result) = receiver
+                    .recv()
+                    .map_err(|_| "metadata workers stopped before reporting a result".to_string())?;
+                match result {
+                    Ok(result) => {
+                        if let Some(client) =
+                            self.set_peer_client(id, &peer.address, peer.port, &result.peer_id)?
+                        {
+                            self.log(
+                                LogLevel::Debug,
+                                "metadata",
+                                format!("{}:{} identified as {client}", peer.address, peer.port),
+                                Some(snapshot.id),
+                            );
+                        }
+                        let meta = Metainfo::from_info_bytes(&result.info_bytes, None, Vec::new(), Vec::new())?;
+                        if !meta.private {
+                            if let Some(dht_port) = result.remote_dht_port {
+                                if let Err(err) =
+                                    self.learn_peer_dht_node(&peer.address, dht_port, snapshot.id)
+                                {
+                                    self.log(
+                                        LogLevel::Debug,
+                                        "dht",
+                                        format!(
+                                            "could not verify DHT port {dht_port} from metadata peer {}: {err}",
+                                            peer.address
+                                        ),
+                                        Some(snapshot.id),
+                                    );
+                                }
                             }
                         }
+                        self.apply_fetched_metadata(id, meta)?;
+                        self.set_peer_connection(id, &peer.address, peer.port, "Metadata received", None)?;
+                        self.log(
+                            LogLevel::Info,
+                            "metadata",
+                            format!(
+                                "fetched {} metadata bytes from {}:{} in {} pieces",
+                                result.info_bytes.len(),
+                                peer.address,
+                                peer.port,
+                                result.pieces_received
+                            ),
+                            Some(snapshot.id),
+                        );
+                        return Ok(EmptyJsonResponse {});
                     }
-                    self.apply_fetched_metadata(id, meta)?;
-                    self.set_peer_connection(id, &peer.address, peer.port, "Metadata received", None)?;
-                    self.log(
-                        LogLevel::Info,
-                        "metadata",
-                        format!(
-                            "fetched {} metadata bytes from {}:{} in {} pieces",
-                            result.info_bytes.len(),
-                            peer.address,
-                            peer.port,
-                            result.pieces_received
-                        ),
-                        Some(snapshot.id),
-                    );
-                    return Ok(EmptyJsonResponse {});
-                }
-                Err(err) => {
-                    self.set_peer_connection(id, &peer.address, peer.port, "Error", Some(err.clone()))?;
-                    self.log(
-                        LogLevel::Warn,
-                        "metadata",
-                        format!("{}:{}: {err}", peer.address, peer.port),
-                        Some(snapshot.id),
-                    );
-                    last_error = Some(err);
+                    Err(err) => {
+                        self.set_peer_connection(id, &peer.address, peer.port, "Error", Some(err.clone()))?;
+                        self.log(
+                            LogLevel::Warn,
+                            "metadata",
+                            format!("{}:{}: {err}", peer.address, peer.port),
+                            Some(snapshot.id),
+                        );
+                        last_error = Some(err);
+                    }
                 }
             }
         }
