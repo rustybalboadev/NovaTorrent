@@ -554,6 +554,8 @@ struct PersistedTorrent {
     #[serde(default)]
     sequential_download: bool,
     seed_ratio_limit: Option<f64>,
+    #[serde(default)]
+    completed_at_ms: Option<u128>,
 }
 
 pub struct TorrentSession {
@@ -4715,6 +4717,7 @@ impl TorrentSession {
             match self.build_task(request, Some(persisted.id)) {
                 Ok(mut task) => {
                     apply_runtime_options(&mut task, &runtime_options);
+                    task.completed_at_ms = persisted.completed_at_ms;
                     highest_id = highest_id.max(task.id);
                     restored.push(task);
                 }
@@ -4778,6 +4781,7 @@ impl TorrentSession {
                             max_upload_speed: torrent.options.max_upload_speed,
                             sequential_download: torrent.options.sequential_download,
                             seed_ratio_limit: torrent.options.seed_ratio_limit,
+                            completed_at_ms: torrent.completed_at_ms,
                         }
                     })
                     .collect(),
@@ -8026,6 +8030,15 @@ mod tests {
                     },
                 )
                 .expect("runtime options update");
+            {
+                let mut torrents = session.torrents.lock().expect("torrent lock");
+                let torrent = torrents
+                    .iter_mut()
+                    .find(|torrent| torrent.id == id)
+                    .expect("torrent exists");
+                torrent.completed_at_ms = Some(123_456);
+            }
+            session.persist_session().expect("completion time persists");
             id
         };
 
@@ -8043,6 +8056,7 @@ mod tests {
         assert_eq!(restored[0].options.max_upload_speed, Some(64 * 1024));
         assert!(restored[0].options.sequential_download);
         assert_eq!(restored[0].options.seed_ratio_limit, Some(2.5));
+        assert_eq!(session.torrents.lock().expect("torrent lock")[0].completed_at_ms, Some(123_456));
         assert_eq!(
             restored[0]
                 .files
