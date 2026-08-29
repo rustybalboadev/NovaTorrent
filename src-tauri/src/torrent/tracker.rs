@@ -94,11 +94,12 @@ pub fn build_announce_url(
     uploaded: u64,
     downloaded: u64,
     left: u64,
+    num_want: i32,
     event: Option<&str>,
 ) -> String {
     let separator = if announce.contains('?') { '&' } else { '?' };
     let mut url = format!(
-        "{announce}{separator}info_hash={}&peer_id={}&port={port}&uploaded={uploaded}&downloaded={downloaded}&left={left}&compact=1",
+        "{announce}{separator}info_hash={}&peer_id={}&port={port}&uploaded={uploaded}&downloaded={downloaded}&left={left}&compact=1&numwant={num_want}",
         percent_encode_bytes(&info_hash),
         percent_encode_bytes(&peer_id)
     );
@@ -117,6 +118,7 @@ pub fn announce_http(
     uploaded: u64,
     downloaded: u64,
     left: u64,
+    num_want: i32,
     event: Option<&str>,
 ) -> Result<TrackerAnnounceResponse, String> {
     let announce_url = build_announce_url(
@@ -127,6 +129,7 @@ pub fn announce_http(
         uploaded,
         downloaded,
         left,
+        num_want,
         event,
     );
     let mut endpoint = parse_http_tracker_url(&announce_url)?;
@@ -877,6 +880,7 @@ mod tests {
             0,
             0,
             0,
+            50,
             Some("started"),
         )
         .expect("redirected tracker announces");

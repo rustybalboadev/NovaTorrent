@@ -2272,6 +2272,7 @@ impl TorrentSession {
                         request.uploaded,
                         request.downloaded,
                         request.left,
+                        request.num_want,
                         http_event.as_deref(),
                     )
                 } else if url.starts_with("udp://") {
