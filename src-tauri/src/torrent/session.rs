@@ -30,13 +30,13 @@ use crate::torrent::{
 };
 
 const RUN_PAUSED: &str = "torrent was paused";
-const MAX_PARALLEL_PEERS: usize = 8;
+const MAX_PARALLEL_PEERS: usize = 16;
 const DEFAULT_CONNECTION_LIMIT: usize = 50;
 const MAX_CONNECTION_LIMIT: usize = 500;
 const MAX_UPLOAD_SLOTS: usize = 4;
 const MAX_INBOUND_PEER_CONNECTIONS: usize = 64;
 const MAX_ENDGAME_PIECES: usize = 8;
-const MAX_PIECES_PER_PEER_ROUND: usize = 4;
+const MAX_PIECES_PER_PEER_ROUND: usize = 16;
 const MIN_RATE_LIMIT: u64 = 1024;
 const MAX_RATE_LIMIT: u64 = 10 * 1024 * 1024 * 1024;
 const TRACKER_ANNOUNCE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(16);
