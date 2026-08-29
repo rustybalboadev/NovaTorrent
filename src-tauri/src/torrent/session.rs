@@ -2015,7 +2015,7 @@ impl TorrentSession {
         snapshot: &RuntimeSnapshot,
     ) -> DiscoveryOutcome {
         let tracker_enabled = !snapshot.trackers_disabled && snapshot.tracker_count > 0;
-        let dht_enabled = !snapshot.private && snapshot.webseed_count == 0;
+        let dht_enabled = !snapshot.private;
         let mut outcome = DiscoveryOutcome {
             dht_ran: dht_enabled,
             ..DiscoveryOutcome::default()
