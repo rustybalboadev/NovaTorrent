@@ -339,6 +339,7 @@ struct TorrentTask {
     tracker_completed: bool,
     next_announce_at_ms: Option<u128>,
     added_at_ms: u128,
+    completed_at_ms: Option<u128>,
     upload_gate: peerwire::UploadGate,
     download_limiter: peerwire::BandwidthLimiter,
     upload_limiter: peerwire::BandwidthLimiter,
@@ -1654,7 +1655,10 @@ impl TorrentSession {
         } else {
             torrent.general.uploaded as f64 / torrent.general.downloaded as f64
         };
-        torrent.general.seeding_time_seconds = ((timestamp_ms() - torrent.added_at_ms) / 1_000) as u64;
+        torrent.general.seeding_time_seconds = torrent
+            .completed_at_ms
+            .map(|completed_at_ms| ((timestamp_ms().saturating_sub(completed_at_ms)) / 1_000) as u64)
+            .unwrap_or_default();
         if let Some(live) = torrent.stats.live.as_mut() {
             live.upload_speed = bytes_uploaded;
         }
@@ -4933,6 +4937,7 @@ impl TorrentSession {
                 tracker_completed: false,
                 next_announce_at_ms: None,
             added_at_ms: timestamp_ms(),
+            completed_at_ms: None,
             upload_gate,
                 download_limiter,
                 upload_limiter,
@@ -5031,6 +5036,7 @@ impl TorrentSession {
             tracker_completed: false,
             next_announce_at_ms: None,
             added_at_ms: timestamp_ms(),
+            completed_at_ms: None,
             upload_gate,
             download_limiter,
             upload_limiter,
@@ -5424,7 +5430,12 @@ impl TorrentTask {
             time_remaining: None,
         }));
         let mut general = self.general.clone();
-        general.active_time_seconds = ((timestamp_ms() - self.added_at_ms) / 1_000) as u64;
+        let now = timestamp_ms();
+        general.active_time_seconds = ((now.saturating_sub(self.added_at_ms)) / 1_000) as u64;
+        general.seeding_time_seconds = self
+            .completed_at_ms
+            .map(|completed_at_ms| ((now.saturating_sub(completed_at_ms)) / 1_000) as u64)
+            .unwrap_or_default();
 
         TorrentDetails {
             id: Some(self.id).filter(|id| *id != 0),
@@ -6019,6 +6030,9 @@ fn completed_torrent_state(torrent: &TorrentTask) -> TorrentState {
 
 fn update_completed_torrent_state(torrent: &mut TorrentTask) {
     if torrent.stats.finished {
+        if torrent.completed_at_ms.is_none() {
+            torrent.completed_at_ms = Some(timestamp_ms());
+        }
         torrent.stats.state = completed_torrent_state(torrent);
     }
 }
