@@ -808,7 +808,14 @@ fn handle_media_stream_connection(
             } else {
                 ("500 Internal Server Error", false)
             };
-            let mut headers = vec![("Content-Type", "text/plain; charset=utf-8")];
+            let content_range = format!("bytes */{}", availability.length);
+            let mut headers = vec![
+                ("Accept-Ranges", "bytes"),
+                ("Access-Control-Allow-Origin", "*"),
+                ("Cache-Control", "no-store"),
+                ("Content-Range", content_range.as_str()),
+                ("Content-Type", "text/plain; charset=utf-8"),
+            ];
             if retry {
                 headers.push(("Retry-After", "1"));
             }
@@ -816,7 +823,7 @@ fn handle_media_stream_connection(
                 LogLevel::Debug,
                 "stream",
                 format!("media stream range {start}-{end} unavailable: {err}"),
-                None,
+                parse_torrent_log_id(&route.id),
             );
             let _ = write_media_response(&mut stream, status, &headers, err.as_bytes());
         }

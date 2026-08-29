@@ -78,6 +78,57 @@ export function AddTorrentPanel({ windowMode, initialSource, onAdded, onCancel }
   const totalSize = preview?.files?.reduce((sum, file) => sum + file.length, 0) ?? 0;
   const selectedSize = preview?.files?.reduce((sum, file, index) => (selectedFileIds.has(index) ? sum + file.length : sum), 0) ?? 0;
 
+  function clearPreviewState() {
+    setPreview(null);
+    setSelectedFileIds(new Set());
+  }
+
+  const previewSelectedSource = React.useCallback(
+    async (kind: "file" | "magnet", value: string, automatic: boolean) => {
+      if (!value.trim()) {
+        if (automatic) return;
+        setError("Choose a torrent file or paste a magnet link.");
+        return;
+      }
+      setBusy("preview");
+      if (!automatic) setError(null);
+      setSuccess(null);
+      try {
+        const response = await previewTorrent({
+          source: {
+            kind,
+            value: value.trim()
+          },
+          destination: destination.trim() || null,
+          paused,
+          overwrite,
+          disableTrackers,
+          onlyFiles: null,
+          subFolder: subFolder.trim() || null
+        });
+        setPreview(response.details);
+        setSelectedFileIds(
+          new Set((response.details.files ?? []).map((file, index) => (file.included ? index : -1)).filter((index) => index >= 0))
+        );
+        if (response.output_folder) setDestination(response.output_folder);
+      } catch (err) {
+        if (!automatic) setError(err instanceof Error ? err.message : "Could not preview this torrent.");
+      } finally {
+        setBusy(null);
+      }
+    },
+    [destination, disableTrackers, overwrite, paused, subFolder]
+  );
+
+  React.useEffect(() => {
+    const value = sourceValue.trim();
+    if (!value) return;
+    const timer = window.setTimeout(() => {
+      void previewSelectedSource(sourceType, value, true);
+    }, 650);
+    return () => window.clearTimeout(timer);
+  }, [previewSelectedSource, sourceType, sourceValue]);
+
   async function chooseTorrentFile() {
     setError(null);
     try {
@@ -90,6 +141,7 @@ export function AddTorrentPanel({ windowMode, initialSource, onAdded, onCancel }
       if (typeof picked === "string") {
         setSourceType("file");
         setTorrentPath(picked);
+        clearPreviewState();
         void previewSelectedSource("file", picked, true);
       }
     } catch (err) {
@@ -114,8 +166,7 @@ export function AddTorrentPanel({ windowMode, initialSource, onAdded, onCancel }
   function applySafeSource(source: SafeTestTorrent) {
     setSourceType("file");
     setTorrentPath(source.path);
-    setPreview(null);
-    setSelectedFileIds(new Set());
+    clearPreviewState();
     setError(null);
     setSuccess(null);
     void previewSelectedSource("file", source.path, true);
@@ -123,29 +174,6 @@ export function AddTorrentPanel({ windowMode, initialSource, onAdded, onCancel }
 
   async function handlePreview() {
     await previewSelectedSource(sourceType, sourceValue, false);
-  }
-
-  async function previewSelectedSource(kind: "file" | "magnet", value: string, automatic: boolean) {
-    if (!value.trim()) {
-      if (automatic) return;
-      setError("Choose a torrent file or paste a magnet link.");
-      return;
-    }
-    setBusy("preview");
-    if (!automatic) setError(null);
-    setSuccess(null);
-    try {
-      const response = await previewTorrent(buildRequest(kind, value, null));
-      setPreview(response.details);
-      setSelectedFileIds(
-        new Set((response.details.files ?? []).map((file, index) => (file.included ? index : -1)).filter((index) => index >= 0))
-      );
-      if (response.output_folder) setDestination(response.output_folder);
-    } catch (err) {
-      if (!automatic) setError(err instanceof Error ? err.message : "Could not preview this torrent.");
-    } finally {
-      setBusy(null);
-    }
   }
 
   async function handleAdd() {
@@ -232,7 +260,10 @@ export function AddTorrentPanel({ windowMode, initialSource, onAdded, onCancel }
             <button
               type="button"
               className={cn("flex h-8 items-center justify-center gap-2 rounded text-sm font-medium", sourceType === "file" && "bg-background shadow-sm")}
-              onClick={() => setSourceType("file")}
+              onClick={() => {
+                setSourceType("file");
+                clearPreviewState();
+              }}
             >
               <FileUp className="h-4 w-4" />
               File
@@ -240,7 +271,10 @@ export function AddTorrentPanel({ windowMode, initialSource, onAdded, onCancel }
             <button
               type="button"
               className={cn("flex h-8 items-center justify-center gap-2 rounded text-sm font-medium", sourceType === "magnet" && "bg-background shadow-sm")}
-              onClick={() => setSourceType("magnet")}
+              onClick={() => {
+                setSourceType("magnet");
+                clearPreviewState();
+              }}
             >
               <Link2 className="h-4 w-4" />
               Magnet
@@ -251,7 +285,15 @@ export function AddTorrentPanel({ windowMode, initialSource, onAdded, onCancel }
             <div className="space-y-2">
               <Label htmlFor="torrent-file">Torrent file</Label>
               <div className="flex gap-2">
-                <Input id="torrent-file" value={torrentPath} onChange={(event) => setTorrentPath(event.target.value)} placeholder="C:/Downloads/file.torrent" />
+                <Input
+                  id="torrent-file"
+                  value={torrentPath}
+                  onChange={(event) => {
+                    setTorrentPath(event.target.value);
+                    if (!event.target.value.trim()) clearPreviewState();
+                  }}
+                  placeholder="C:/Downloads/file.torrent"
+                />
                 <Button type="button" variant="outline" size="icon" aria-label="Choose torrent file" onClick={chooseTorrentFile}>
                   <FileUp />
                 </Button>
@@ -263,7 +305,10 @@ export function AddTorrentPanel({ windowMode, initialSource, onAdded, onCancel }
               <Textarea
                 id="magnet-link"
                 value={magnet}
-                onChange={(event) => setMagnet(event.target.value)}
+                onChange={(event) => {
+                  setMagnet(event.target.value);
+                  if (!event.target.value.trim()) clearPreviewState();
+                }}
                 placeholder="magnet:?xt=urn:btih:..."
                 className="min-h-28"
               />
@@ -372,7 +417,11 @@ export function AddTorrentPanel({ windowMode, initialSource, onAdded, onCancel }
               <FileTree files={preview.files} selectedFileIds={selectedFileIds} onSelectionChange={setSelectedFileIds} />
             ) : (
               <div className="flex h-full min-h-72 items-center justify-center rounded-md border border-dashed p-8 text-center text-sm text-muted-foreground">
-                {busy === "preview" ? "Loading file tree..." : "Choose a torrent file or safe test torrent."}
+                {busy === "preview"
+                  ? "Loading file tree..."
+                  : sourceType === "magnet" && preview
+                    ? "Magnet file metadata appears after NovaTorrent connects to peers."
+                    : "Choose a torrent file or safe test torrent."}
               </div>
             )}
           </div>
