@@ -2341,6 +2341,31 @@ impl TorrentSession {
             }
             results.push((url, result));
         }
+        while let Ok((url, result, elapsed)) = tracker_receiver.try_recv() {
+            self.log(
+                match &result {
+                    Ok(_) => LogLevel::Debug,
+                    Err(_) => LogLevel::Warn,
+                },
+                "tracker",
+                match &result {
+                    Ok(response) => format!(
+                        "{} answered in {} ms with {} peers",
+                        url,
+                        elapsed.as_millis(),
+                        response.peers.len()
+                    ),
+                    Err(err) => format!(
+                        "{} failed in {} ms: {}",
+                        url,
+                        elapsed.as_millis(),
+                        err
+                    ),
+                },
+                Some(snapshot.id),
+            );
+            results.push((url, result));
+        }
         let pending_workers = snapshot.trackers.len().saturating_sub(results.len());
         let using_early_peers = can_use_early_peers && first_peer_result_at.is_some() && pending_workers > 0;
         if using_early_peers {
