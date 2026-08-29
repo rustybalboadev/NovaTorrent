@@ -2016,53 +2016,41 @@ impl TorrentSession {
     ) -> DiscoveryOutcome {
         let tracker_enabled = !snapshot.trackers_disabled && snapshot.tracker_count > 0;
         let dht_enabled = !snapshot.private;
-        let mut outcome = DiscoveryOutcome {
-            dht_ran: dht_enabled,
-            ..DiscoveryOutcome::default()
-        };
+        let mut outcome = DiscoveryOutcome::default();
 
         if tracker_enabled && dht_enabled {
-            std::thread::scope(|scope| {
-                let tracker = scope.spawn(|| {
-                    let started = Instant::now();
-                    (self.announce(id).err(), started.elapsed())
-                });
-                let dht = scope.spawn(|| {
-                    let started = Instant::now();
-                    (self.query_dht(id).err(), started.elapsed())
-                });
-                match tracker.join() {
-                    Ok((error, elapsed)) => {
-                        outcome.tracker_error = error;
-                        self.log_discovery_finished(
-                            id,
-                            snapshot.id,
-                            "tracker",
-                            "tracker discovery",
-                            elapsed,
-                        );
-                    }
-                    Err(_) => {
-                        outcome.tracker_error =
-                            Some("tracker discovery worker panicked".to_string());
-                    }
-                }
-                match dht.join() {
-                    Ok((error, elapsed)) => {
-                        outcome.dht_error = error;
-                        self.log_discovery_finished(
-                            id,
-                            snapshot.id,
-                            "dht",
-                            "DHT discovery",
-                            elapsed,
-                        );
-                    }
-                    Err(_) => {
-                        outcome.dht_error = Some("DHT discovery worker panicked".to_string());
-                    }
-                }
-            });
+            let started = Instant::now();
+            outcome.tracker_error = self.announce(id).err();
+            self.log_discovery_finished(
+                id,
+                snapshot.id,
+                "tracker",
+                "tracker discovery",
+                started.elapsed(),
+            );
+            let peer_count = self
+                .runtime_snapshot(id)
+                .map(|snapshot| snapshot.peer_count)
+                .unwrap_or_default();
+            if peer_count == 0 {
+                let started = Instant::now();
+                outcome.dht_error = self.query_dht(id).err();
+                outcome.dht_ran = true;
+                self.log_discovery_finished(
+                    id,
+                    snapshot.id,
+                    "dht",
+                    "DHT discovery",
+                    started.elapsed(),
+                );
+            } else {
+                self.log(
+                    LogLevel::Debug,
+                    "dht",
+                    format!("deferred startup DHT lookup because trackers produced {peer_count} peer(s)"),
+                    Some(snapshot.id),
+                );
+            }
         } else if tracker_enabled {
             let started = Instant::now();
             outcome.tracker_error = self.announce(id).err();
@@ -2076,6 +2064,7 @@ impl TorrentSession {
         } else if dht_enabled {
             let started = Instant::now();
             outcome.dht_error = self.query_dht(id).err();
+            outcome.dht_ran = true;
             self.log_discovery_finished(
                 id,
                 snapshot.id,
