@@ -2178,6 +2178,13 @@ impl TorrentSession {
                 .iter()
                 .find(|torrent| torrent.matches_id(id))
                 .ok_or_else(|| format!("torrent not found: {id}"))?;
+            let mut tracker_urls = Vec::new();
+            let mut seen_trackers = HashSet::new();
+            for tracker in &torrent.trackers {
+                if seen_trackers.insert(tracker.url.clone()) {
+                    tracker_urls.push(tracker.url.clone());
+                }
+            }
             AnnounceSnapshot {
                 id: torrent.id,
                 info_hash: torrent.info_hash,
@@ -2186,7 +2193,7 @@ impl TorrentSession {
                 left: torrent.stats.total_bytes.saturating_sub(torrent.stats.progress_bytes),
                 port: self.listen_port(),
                 event,
-                trackers: torrent.trackers.iter().map(|tracker| tracker.url.clone()).collect(),
+                trackers: tracker_urls,
             }
         };
 
