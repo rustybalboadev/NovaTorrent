@@ -6206,6 +6206,7 @@ fn schedule_peers_for_download(torrent: &TorrentTask, max_connections: usize) ->
         let right_health = torrent.peer_health.get(&peer_key(&right.address, right.port));
         peer_success_score(right_health)
             .cmp(&peer_success_score(left_health))
+            .then_with(|| peer_rate_score(right_health).cmp(&peer_rate_score(left_health)))
             .then_with(|| peer_piece_score(right_health).cmp(&peer_piece_score(left_health)))
             .then_with(|| peer_byte_score(right_health).cmp(&peer_byte_score(left_health)))
             .then_with(|| peer_failure_count(left_health).cmp(&peer_failure_count(right_health)))
