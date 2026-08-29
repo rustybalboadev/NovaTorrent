@@ -1039,6 +1039,9 @@ pub fn parse_compact_nodes6(bytes: &[u8]) -> Result<Vec<DhtNode>, String> {
 }
 
 pub fn build_compact_node(node: &DhtNode) -> Result<Vec<u8>, String> {
+    if node.port == 0 {
+        return Err("DHT node port cannot be zero".to_string());
+    }
     let mut out = Vec::with_capacity(26);
     out.extend_from_slice(&node.id);
     let octets = node
@@ -1059,6 +1062,9 @@ pub fn build_compact_node(node: &DhtNode) -> Result<Vec<u8>, String> {
 
 #[cfg(test)]
 fn build_compact_node6(node: &DhtNode) -> Result<Vec<u8>, String> {
+    if node.port == 0 {
+        return Err("DHT node port cannot be zero".to_string());
+    }
     let mut out = Vec::with_capacity(38);
     out.extend_from_slice(&node.id);
     let address = node
