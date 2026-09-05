@@ -37,11 +37,11 @@ jobs:
       - name: Audit npm dependencies
         run: npm audit --audit-level=high
 
-      - name: Select stable Rust
-        run: rustup default stable
-
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+          fallback: none
 
       - name: Audit Rust dependencies
         run: cargo audit --file src-tauri/Cargo.lock
