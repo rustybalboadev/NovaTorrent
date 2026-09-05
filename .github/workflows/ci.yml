@@ -54,6 +54,12 @@ jobs:
       - name: Select stable Rust
         run: rustup default stable
 
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+          shared-key: "ci"
+
       - name: Check formatting
         run: cargo fmt --all --check
 
@@ -79,6 +85,12 @@ jobs:
 
       - name: Select stable Rust
         run: rustup default stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+          shared-key: "ci"
 
       - name: Install dependencies
         run: npm ci
