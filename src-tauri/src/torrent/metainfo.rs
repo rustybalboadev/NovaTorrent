@@ -3,6 +3,15 @@ use crate::torrent::{
     sha1,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+
+const MAX_TRACKER_URLS: usize = 64;
+const MAX_WEB_SEED_URLS: usize = 32;
+const MAX_SOURCE_URL_LENGTH: usize = 4096;
+const MAX_TORRENT_FILES: usize = 10_000;
+const MAX_PATH_COMPONENTS: usize = 64;
+const MAX_COMMENT_LENGTH: usize = 4096;
+const MAX_CREATED_BY_LENGTH: usize = 512;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TorrentFile {
@@ -36,16 +45,10 @@ impl Metainfo {
             .dict_get(b"info")
             .ok_or_else(|| "metainfo is missing info dictionary".to_string())?;
         let info_hash = sha1::digest(&input[info.span.clone()]);
-        let announce = root
-            .dict_get(b"announce")
-            .and_then(|node| node.as_str_lossy());
+        let announce = bounded_string(root.dict_get(b"announce"), MAX_SOURCE_URL_LENGTH);
         let announce_list = parse_announce_list(root.dict_get(b"announce-list"));
-        let comment = root
-            .dict_get(b"comment")
-            .and_then(|node| node.as_str_lossy());
-        let created_by = root
-            .dict_get(b"created by")
-            .and_then(|node| node.as_str_lossy());
+        let comment = bounded_string(root.dict_get(b"comment"), MAX_COMMENT_LENGTH);
+        let created_by = bounded_string(root.dict_get(b"created by"), MAX_CREATED_BY_LENGTH);
         let creation_date = root
             .dict_get(b"creation date")
             .and_then(|node| node.as_i64());
@@ -103,6 +106,9 @@ impl Metainfo {
             .ok_or_else(|| "info dictionary is missing piece length".to_string())?
             .try_into()
             .map_err(|_| "piece length cannot be negative".to_string())?;
+        if piece_length == 0 {
+            return Err("piece length must be greater than zero".to_string());
+        }
         let pieces_raw = info
             .dict_get(b"pieces")
             .and_then(|node| node.as_bytes())
@@ -119,7 +125,23 @@ impl Metainfo {
             .and_then(|node| node.as_i64())
             .is_some_and(|value| value == 1);
         let files = parse_files(info, &name)?;
-        let total_length = files.iter().map(|file| file.length).sum();
+        let total_length = files.iter().try_fold(0u64, |total, file| {
+            total
+                .checked_add(file.length)
+                .ok_or_else(|| "torrent total length is too large".to_string())
+        })?;
+        let expected_piece_count = if total_length == 0 {
+            0
+        } else {
+            ((total_length - 1) / piece_length) + 1
+        };
+        let actual_piece_count = u64::try_from(pieces.len())
+            .map_err(|_| "torrent contains too many piece hashes".to_string())?;
+        if actual_piece_count != expected_piece_count {
+            return Err(format!(
+                "piece hash count does not match torrent size: expected {expected_piece_count}, found {actual_piece_count}"
+            ));
+        }
 
         Ok(Self {
             announce,
@@ -141,10 +163,18 @@ impl Metainfo {
     pub fn tracker_urls(&self) -> Vec<String> {
         let mut urls = Vec::new();
         if let Some(announce) = self.announce.as_ref() {
-            urls.push(announce.clone());
+            if announce.len() <= MAX_SOURCE_URL_LENGTH {
+                urls.push(announce.clone());
+            }
         }
         for tier in &self.announce_list {
             for tracker in tier {
+                if urls.len() >= MAX_TRACKER_URLS {
+                    return urls;
+                }
+                if tracker.len() > MAX_SOURCE_URL_LENGTH {
+                    continue;
+                }
                 if !urls.iter().any(|existing| existing == tracker) {
                     urls.push(tracker.clone());
                 }
@@ -171,8 +201,13 @@ fn parse_files(info: &bencode::BencodeNode, name: &str) -> Result<Vec<TorrentFil
         .dict_get(b"files")
         .and_then(|node| node.as_list())
         .ok_or_else(|| "multi-file torrent is missing files list".to_string())?;
+    if files.len() > MAX_TORRENT_FILES {
+        return Err(format!(
+            "torrent contains too many files: maximum is {MAX_TORRENT_FILES}"
+        ));
+    }
 
-    files
+    let files = files
         .iter()
         .map(|file| {
             let length = file
@@ -185,6 +220,11 @@ fn parse_files(info: &bencode::BencodeNode, name: &str) -> Result<Vec<TorrentFil
                 .dict_get(b"path")
                 .and_then(|node| node.as_list())
                 .ok_or_else(|| "file entry is missing path".to_string())?;
+            if path.len() > MAX_PATH_COMPONENTS {
+                return Err(format!(
+                    "torrent file path contains too many components: maximum is {MAX_PATH_COMPONENTS}"
+                ));
+            }
             let components = path
                 .iter()
                 .map(|node| {
@@ -205,18 +245,66 @@ fn parse_files(info: &bencode::BencodeNode, name: &str) -> Result<Vec<TorrentFil
                 included: true,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>, String>>()?;
+
+    let mut normalized_paths = HashSet::with_capacity(files.len());
+    for file in &files {
+        let normalized = file
+            .components
+            .iter()
+            .map(|component| component.to_lowercase())
+            .collect::<Vec<_>>()
+            .join("\\");
+        if !normalized_paths.insert(normalized) {
+            return Err("torrent contains duplicate Windows file paths".to_string());
+        }
+    }
+    Ok(files)
 }
 
 fn validate_path_component(component: &str) -> Result<(), String> {
     if component.is_empty() || component == "." || component == ".." {
         return Err("torrent path component is not safe".to_string());
     }
-    if component
-        .chars()
-        .any(|ch| matches!(ch, '/' | '\\' | ':' | '\0'))
+    if component.ends_with([' ', '.'])
+        || component.encode_utf16().count() > 255
+        || component.chars().any(|ch| {
+            ch.is_control()
+                || matches!(
+                    ch,
+                    '/' | '\\' | ':' | '\0' | '<' | '>' | '"' | '|' | '?' | '*'
+                )
+        })
     {
         return Err("torrent path component contains an unsafe character".to_string());
+    }
+    let stem = component.split('.').next().unwrap_or(component);
+    if matches!(
+        stem.to_ascii_uppercase().as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    ) {
+        return Err("torrent path component uses a reserved Windows name".to_string());
     }
     Ok(())
 }
@@ -228,17 +316,26 @@ fn parse_announce_list(node: Option<&bencode::BencodeNode>) -> Vec<Vec<String>> 
     let Some(tiers) = node.as_list() else {
         return Vec::new();
     };
-    tiers
-        .iter()
-        .filter_map(|tier| {
-            let trackers = tier
-                .as_list()?
-                .iter()
-                .filter_map(|node| node.as_str_lossy())
-                .collect::<Vec<_>>();
-            (!trackers.is_empty()).then_some(trackers)
-        })
-        .collect()
+    let mut output = Vec::new();
+    let mut remaining = MAX_TRACKER_URLS;
+    for tier in tiers {
+        if remaining == 0 {
+            break;
+        }
+        let Some(items) = tier.as_list() else {
+            continue;
+        };
+        let trackers = items
+            .iter()
+            .filter_map(|item| bounded_string(Some(item), MAX_SOURCE_URL_LENGTH))
+            .take(remaining)
+            .collect::<Vec<_>>();
+        remaining = remaining.saturating_sub(trackers.len());
+        if !trackers.is_empty() {
+            output.push(trackers);
+        }
+    }
+    output
 }
 
 fn parse_url_list(node: Option<&bencode::BencodeNode>) -> Vec<String> {
@@ -246,26 +343,38 @@ fn parse_url_list(node: Option<&bencode::BencodeNode>) -> Vec<String> {
         return Vec::new();
     };
     match &node.value {
-        BencodeValue::Bytes(_) => node
-            .as_str_lossy()
-            .map(|value| split_url_list_string(&value))
+        BencodeValue::Bytes(_) => bounded_string(Some(node), MAX_TORRENT_FILE_BYTES_FOR_URL_LIST)
+            .map(|value| collect_split_urls(std::iter::once(value)))
             .unwrap_or_default(),
-        BencodeValue::List(items) => items
-            .iter()
-            .filter_map(|item| item.as_str_lossy())
-            .flat_map(|value| split_url_list_string(&value))
-            .collect(),
+        BencodeValue::List(items) => collect_split_urls(
+            items
+                .iter()
+                .filter_map(|item| bounded_string(Some(item), MAX_TORRENT_FILE_BYTES_FOR_URL_LIST)),
+        ),
         _ => Vec::new(),
     }
 }
 
-fn split_url_list_string(value: &str) -> Vec<String> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|url| !url.is_empty())
-        .map(str::to_string)
-        .collect()
+const MAX_TORRENT_FILE_BYTES_FOR_URL_LIST: usize = 32 * MAX_SOURCE_URL_LENGTH;
+
+fn collect_split_urls(values: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut output = Vec::new();
+    for value in values {
+        for url in value.split(',').map(str::trim) {
+            if output.len() >= MAX_WEB_SEED_URLS {
+                return output;
+            }
+            if !url.is_empty() && url.len() <= MAX_SOURCE_URL_LENGTH {
+                output.push(url.to_string());
+            }
+        }
+    }
+    output
+}
+
+fn bounded_string(node: Option<&bencode::BencodeNode>, max_length: usize) -> Option<String> {
+    let bytes = node?.as_bytes()?;
+    (bytes.len() <= max_length).then(|| String::from_utf8_lossy(bytes).into_owned())
 }
 
 #[cfg(test)]
@@ -383,5 +492,33 @@ mod tests {
     fn rejects_unsafe_file_paths() {
         let input = b"d4:infod5:filesld6:lengthi1e4:pathl2:..8:evil.txteee4:name4:root12:piece lengthi1e6:pieces20:aaaaaaaaaaaaaaaaaaaaee";
         assert!(Metainfo::from_bytes(input).is_err());
+    }
+
+    #[test]
+    fn rejects_zero_piece_length() {
+        let input =
+            b"d4:infod6:lengthi1e4:name1:a12:piece lengthi0e6:pieces20:aaaaaaaaaaaaaaaaaaaaee";
+        assert!(Metainfo::from_bytes(input).is_err());
+    }
+
+    #[test]
+    fn rejects_inconsistent_piece_hash_count() {
+        let input = b"d4:infod6:lengthi10e4:name1:a12:piece lengthi4e6:pieces40:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaee";
+        let error = Metainfo::from_bytes(input).expect_err("piece count must be validated");
+        assert!(error.contains("piece hash count"));
+    }
+
+    #[test]
+    fn rejects_duplicate_windows_paths() {
+        let input = b"d4:infod5:filesld6:lengthi1e4:pathl5:A.txteed6:lengthi1e4:pathl5:a.txteee4:name4:root12:piece lengthi2e6:pieces20:aaaaaaaaaaaaaaaaaaaaee";
+        let error = Metainfo::from_bytes(input).expect_err("duplicate paths must be rejected");
+        assert!(error.contains("duplicate Windows file paths"));
+    }
+
+    #[test]
+    fn rejects_reserved_windows_names() {
+        let input = b"d4:infod6:lengthi1e4:name7:CON.txt12:piece lengthi1e6:pieces20:aaaaaaaaaaaaaaaaaaaaee";
+        let error = Metainfo::from_bytes(input).expect_err("reserved names must be rejected");
+        assert!(error.contains("reserved Windows name"));
     }
 }

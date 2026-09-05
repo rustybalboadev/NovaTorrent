@@ -1,5 +1,12 @@
 use crate::torrent::{peer::PeerInfo, sha1};
 
+const MAX_MAGNET_TRACKERS: usize = 64;
+const MAX_MAGNET_WEB_SEEDS: usize = 32;
+const MAX_MAGNET_PEERS: usize = 200;
+const MAX_MAGNET_URI_LENGTH: usize = 32 * 1024;
+const MAX_MAGNET_SOURCE_LENGTH: usize = 4096;
+const MAX_MAGNET_DISPLAY_NAME_LENGTH: usize = 1024;
+
 #[derive(Debug, Clone)]
 pub struct MagnetLink {
     pub display_name: Option<String>,
@@ -11,6 +18,11 @@ pub struct MagnetLink {
 
 impl MagnetLink {
     pub fn parse(input: &str) -> Result<Self, String> {
+        if input.len() > MAX_MAGNET_URI_LENGTH {
+            return Err(format!(
+                "magnet link exceeds the {MAX_MAGNET_URI_LENGTH}-byte limit"
+            ));
+        }
         if !input
             .get(.."magnet:?".len())
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("magnet:?"))
@@ -30,10 +42,22 @@ impl MagnetLink {
             };
             let decoded = percent_decode(value)?;
             match key.to_ascii_lowercase().as_str() {
-                "dn" => display_name = Some(decoded),
-                "tr" => push_unique_string(&mut trackers, decoded),
-                "ws" => push_unique_string(&mut web_seeds, decoded),
-                "x.pe" => push_unique_peer(&mut peers, parse_exact_peer(&decoded)?),
+                "dn" if decoded.len() <= MAX_MAGNET_DISPLAY_NAME_LENGTH => {
+                    display_name = Some(decoded)
+                }
+                "tr" if trackers.len() < MAX_MAGNET_TRACKERS => {
+                    if decoded.len() <= MAX_MAGNET_SOURCE_LENGTH {
+                        push_unique_string(&mut trackers, decoded)
+                    }
+                }
+                "ws" if web_seeds.len() < MAX_MAGNET_WEB_SEEDS => {
+                    if decoded.len() <= MAX_MAGNET_SOURCE_LENGTH {
+                        push_unique_string(&mut web_seeds, decoded)
+                    }
+                }
+                "x.pe" if peers.len() < MAX_MAGNET_PEERS => {
+                    push_unique_peer(&mut peers, parse_exact_peer(&decoded)?)
+                }
                 "xt" => {
                     if let Some(hash) = strip_ascii_prefix(&decoded, "urn:btih:") {
                         info_hash = Some(parse_btih(hash)?);
@@ -223,5 +247,25 @@ mod tests {
         )
         .expect("magnet parses");
         assert_eq!(magnet.trackers, vec!["http://t.test/announce"]);
+    }
+
+    #[test]
+    fn rejects_oversized_magnet_links() {
+        let input = format!(
+            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn={}",
+            "a".repeat(MAX_MAGNET_URI_LENGTH)
+        );
+        assert!(MagnetLink::parse(&input).is_err());
+    }
+
+    #[test]
+    fn caps_unique_magnet_sources() {
+        let trackers = (0..MAX_MAGNET_TRACKERS + 20)
+            .map(|index| format!("&tr=http://tracker{index}.test/announce"))
+            .collect::<String>();
+        let input =
+            format!("magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567{trackers}");
+        let magnet = MagnetLink::parse(&input).expect("bounded magnet parses");
+        assert_eq!(magnet.trackers.len(), MAX_MAGNET_TRACKERS);
     }
 }

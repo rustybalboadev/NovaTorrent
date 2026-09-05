@@ -393,15 +393,18 @@ fn announce_udp_address(
     socket
         .set_write_timeout(Some(UDP_TRACKER_WRITE_TIMEOUT))
         .map_err(|err| format!("could not set UDP tracker write timeout: {err}"))?;
+    socket
+        .connect(address)
+        .map_err(|err| format!("could not connect UDP tracker socket: {err}"))?;
 
     let connect_transaction_id = request.transaction_id;
     let connect_packet = build_udp_connect_request(connect_transaction_id);
     socket
-        .send_to(&connect_packet, address)
+        .send(&connect_packet)
         .map_err(|err| format!("could not send UDP tracker connect request: {err}"))?;
     let mut buffer = [0u8; 2048];
-    let (length, _) = socket
-        .recv_from(&mut buffer)
+    let length = socket
+        .recv(&mut buffer)
         .map_err(|err| format!("could not read UDP tracker connect response: {err}"))?;
     let connect = parse_udp_connect_response(&buffer[..length], connect_transaction_id)?;
 
@@ -409,15 +412,23 @@ fn announce_udp_address(
     request.transaction_id = connect_transaction_id.wrapping_add(1);
     let announce_packet = build_udp_announce_request(request.clone());
     socket
-        .send_to(&announce_packet, address)
+        .send(&announce_packet)
         .map_err(|err| format!("could not send UDP tracker announce request: {err}"))?;
-    let (length, _) = socket
-        .recv_from(&mut buffer)
+    let length = socket
+        .recv(&mut buffer)
         .map_err(|err| format!("could not read UDP tracker announce response: {err}"))?;
     parse_udp_announce_response(&buffer[..length], request.transaction_id)
 }
 
 pub fn parse_http_tracker_url(url: &str) -> Result<HttpTrackerEndpoint, String> {
+    if url
+        .bytes()
+        .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        return Err(
+            "HTTP tracker URL contains unsafe whitespace or control characters".to_string(),
+        );
+    }
     let (rest, use_tls, default_port) = if let Some(rest) = url.strip_prefix("http://") {
         (rest, false, 80)
     } else if let Some(rest) = url.strip_prefix("https://") {
@@ -864,6 +875,13 @@ mod tests {
                 path_and_query: "/announce?x=1".to_string(),
                 use_tls: false,
             }
+        );
+    }
+
+    #[test]
+    fn rejects_http_tracker_request_injection() {
+        assert!(
+            parse_http_tracker_url("http://tracker.example/announce\r\nX-Test: injected").is_err()
         );
     }
 

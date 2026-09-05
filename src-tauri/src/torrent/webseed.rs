@@ -232,6 +232,12 @@ pub fn download_torrent_cancellable_with_limiter(
 }
 
 pub fn parse_http_url(url: &str) -> Result<HttpEndpoint, String> {
+    if url
+        .bytes()
+        .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        return Err("webseed URL contains unsafe whitespace or control characters".to_string());
+    }
     let (rest, use_tls, default_port) = if let Some(rest) = url.strip_prefix("http://") {
         (rest, false, 80)
     } else if let Some(rest) = url.strip_prefix("https://") {
@@ -651,6 +657,11 @@ mod tests {
                 use_tls: false,
             }
         );
+    }
+
+    #[test]
+    fn rejects_webseed_request_injection() {
+        assert!(parse_http_url("http://mirror.test/file\r\nX-Test: injected").is_err());
     }
 
     #[test]
