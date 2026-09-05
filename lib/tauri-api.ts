@@ -1,18 +1,19 @@
 "use client";
 
 import { invoke } from "@tauri-apps/api/core";
+import { isPlayableMediaName } from "@/lib/media";
 import type {
   AddTorrentRequest,
   AddTorrentResponse,
   LogEntry,
   MediaPlayerLogRequest,
-  SafeTestTorrent,
   StreamPriorityRequest,
   StreamPriorityStatus,
+  SubtitleFileText,
   TorrentDetails,
   TorrentFileAvailability,
-  TorrentFileHash,
   TorrentListResponse,
+  TorrentSummaryListResponse,
   UpdateTorrentOptionsRequest
 } from "@/lib/torrent-types";
 import { mockPreview, mockTorrents } from "@/lib/mock-data";
@@ -27,31 +28,54 @@ export function isTauriRuntime() {
   return typeof window !== "undefined" && Boolean(window.__TAURI_INTERNALS__);
 }
 
+function mockTorrentById(id: string) {
+  return mockTorrents.find((torrent) => String(torrent.id) === id || torrent.info_hash === id) ?? mockTorrents[0];
+}
+
 export async function listTorrents(): Promise<TorrentListResponse> {
   if (!isTauriRuntime()) return { torrents: mockTorrents };
   return invoke<TorrentListResponse>("list_torrents");
 }
 
+export async function listTorrentSummaries(): Promise<TorrentSummaryListResponse> {
+  if (!isTauriRuntime()) {
+    return {
+      torrents: mockTorrents.map((torrent) => ({
+        id: torrent.id,
+        info_hash: torrent.info_hash,
+        name: torrent.name,
+        output_folder: torrent.output_folder,
+        stats: torrent.stats ?? {},
+        peer_count: torrent.peers?.length ?? 0,
+        file_count: torrent.files?.length ?? 0,
+        playable_file_count: (torrent.files ?? []).filter((file) => file.included && isPlayableMediaName(file.name)).length,
+        first_playable_file_index: firstPlayableMediaIndex(torrent.files ?? [])
+      }))
+    };
+  }
+  return invoke<TorrentSummaryListResponse>("list_torrent_summaries");
+}
+
+function firstPlayableMediaIndex(files: NonNullable<TorrentDetails["files"]>) {
+  const index = files.findIndex((file) => file.included && isPlayableMediaName(file.name));
+  return index >= 0 ? index : null;
+}
+
 export async function torrentDetails(id: string): Promise<TorrentDetails> {
   if (!isTauriRuntime()) {
-    return mockTorrents.find((torrent) => String(torrent.id) === id || torrent.info_hash === id) ?? mockTorrents[0];
+    return mockTorrentById(id);
   }
   return invoke<TorrentDetails>("torrent_details", { id });
 }
 
 export async function defaultDownloadDir(): Promise<string> {
-  if (!isTauriRuntime()) return "C:\\Users\\rusty\\Downloads\\NovaTorrent";
+  if (!isTauriRuntime()) return "C:\\Users\\Example\\Downloads";
   return invoke<string>("default_download_dir");
 }
 
 export async function backendLogFilePath(): Promise<string | null> {
-  if (!isTauriRuntime()) return "C:\\Users\\rusty\\Downloads\\NovaTorrent\\novatorrent.log";
+  if (!isTauriRuntime()) return "C:\\Users\\Example\\AppData\\Local\\com.novatorrent.desktop\\logs\\novatorrent.log";
   return invoke<string>("backend_log_file_path");
-}
-
-export async function safeTestTorrents(): Promise<SafeTestTorrent[]> {
-  if (!isTauriRuntime()) return [];
-  return invoke<SafeTestTorrent[]>("safe_test_torrents");
 }
 
 export async function openAddTorrentWindow(source?: string) {
@@ -72,13 +96,16 @@ export async function takePendingOpenSources(): Promise<string[]> {
 
 export async function previewTorrent(request: AddTorrentRequest): Promise<AddTorrentResponse> {
   if (!isTauriRuntime()) {
+    const outputFolder = [request.destination || mockPreview.output_folder, request.subFolder]
+      .filter(Boolean)
+      .join("\\");
     return {
       id: null,
       details: {
         ...mockPreview,
-        output_folder: request.destination || mockPreview.output_folder
+        output_folder: outputFolder
       },
-      output_folder: request.destination || mockPreview.output_folder,
+      output_folder: outputFolder,
       seen_peers: []
     };
   }
@@ -87,14 +114,17 @@ export async function previewTorrent(request: AddTorrentRequest): Promise<AddTor
 
 export async function addTorrent(request: AddTorrentRequest): Promise<AddTorrentResponse> {
   if (!isTauriRuntime()) {
+    const outputFolder = [request.destination || mockPreview.output_folder, request.subFolder]
+      .filter(Boolean)
+      .join("\\");
     return {
       id: Date.now(),
       details: {
         ...mockPreview,
         id: Date.now(),
-        output_folder: request.destination || mockPreview.output_folder
+        output_folder: outputFolder
       },
-      output_folder: request.destination || mockPreview.output_folder,
+      output_folder: outputFolder,
       seen_peers: []
     };
   }
@@ -156,29 +186,19 @@ export async function updateTorrentFiles(id: string, onlyFiles: number[]) {
   await invoke("update_torrent_files", { id, onlyFiles });
 }
 
+export async function updateTorrentFilePriority(id: string, fileIndex: number, priority: number) {
+  if (!isTauriRuntime()) return;
+  await invoke("update_torrent_file_priority", { id, fileIndex, priority });
+}
+
 export async function updateTorrentOptions(id: string, request: UpdateTorrentOptionsRequest) {
   if (!isTauriRuntime()) return;
   await invoke("update_torrent_options", { id, request });
 }
 
-export async function hashTorrentFile(id: string, fileIndex: number): Promise<TorrentFileHash> {
-  if (!isTauriRuntime()) {
-    const sha256 = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
-    return {
-      file_index: fileIndex,
-      name: mockTorrents[0]?.files?.[fileIndex]?.name ?? "preview-file.bin",
-      path: "C:\\Users\\rusty\\Downloads\\NovaTorrent\\preview-file.bin",
-      size: mockTorrents[0]?.files?.[fileIndex]?.length ?? 0,
-      sha256,
-      virustotal_url: `https://www.virustotal.com/gui/file/${sha256}`
-    };
-  }
-  return invoke<TorrentFileHash>("hash_torrent_file", { id, fileIndex });
-}
-
 export async function streamFileAvailability(id: string, fileIndex: number): Promise<TorrentFileAvailability> {
   if (!isTauriRuntime()) {
-    const file = mockTorrents[0]?.files?.[fileIndex];
+    const file = mockTorrentById(id)?.files?.[fileIndex];
     const length = file?.length ?? 0;
     const verified = Math.floor(length * 0.35);
     return {
@@ -197,6 +217,18 @@ export async function streamFileAvailability(id: string, fileIndex: number): Pro
 export async function streamFileUrl(id: string, fileIndex: number): Promise<string> {
   if (!isTauriRuntime()) return "";
   return invoke<string>("stream_file_url", { id, fileIndex });
+}
+
+export async function subtitleFileText(id: string, fileIndex: number): Promise<SubtitleFileText> {
+  if (!isTauriRuntime()) {
+    const file = mockTorrentById(id)?.files?.[fileIndex];
+    return {
+      file_index: fileIndex,
+      name: file?.name ?? "captions.en.srt",
+      text: "1\n00:00:01,000 --> 00:00:04,000\nNovaTorrent captions are ready.\n"
+    };
+  }
+  return invoke<SubtitleFileText>("subtitle_file_text", { id, fileIndex });
 }
 
 export async function openMediaWindow(id: string, fileIndex: number) {
@@ -222,7 +254,7 @@ export async function mediaPlayerLog(request: MediaPlayerLogRequest) {
 
 export async function setStreamPriority(id: string, request: StreamPriorityRequest): Promise<StreamPriorityStatus> {
   if (!isTauriRuntime()) {
-    const file = mockTorrents[0]?.files?.[request.fileIndex];
+    const file = mockTorrentById(id)?.files?.[request.fileIndex];
     return {
       file_index: request.fileIndex,
       name: file?.name ?? "preview-video.mp4",
@@ -238,14 +270,6 @@ export async function setStreamPriority(id: string, request: StreamPriorityReque
 export async function clearStreamPriority(id: string) {
   if (!isTauriRuntime()) return;
   await invoke("clear_stream_priority", { id });
-}
-
-export async function openVirusTotalReport(sha256: string) {
-  if (!isTauriRuntime()) {
-    window.open(`https://www.virustotal.com/gui/file/${sha256}`, "_blank", "noopener,noreferrer");
-    return;
-  }
-  await invoke("open_virustotal_report", { sha256 });
 }
 
 export async function backendLogs(torrentId?: number | null): Promise<LogEntry[]> {
@@ -270,4 +294,12 @@ export async function backendLogs(torrentId?: number | null): Promise<LogEntry[]
     ];
   }
   return invoke<LogEntry[]>("backend_logs", { torrentId: torrentId ?? null });
+}
+
+export async function backendLogsAfter(torrentId?: number | null, afterId?: number | null): Promise<LogEntry[]> {
+  if (!isTauriRuntime()) {
+    const entries = await backendLogs(torrentId);
+    return afterId == null ? entries : entries.filter((entry) => entry.id > afterId);
+  }
+  return invoke<LogEntry[]>("backend_logs_after", { torrentId: torrentId ?? null, afterId: afterId ?? null });
 }

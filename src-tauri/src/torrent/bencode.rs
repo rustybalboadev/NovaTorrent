@@ -200,8 +200,14 @@ mod tests {
         let input = b"d3:cow3:moo4:spam4:eggse";
         let node = parse(input).expect("bencode parses");
         assert_eq!(node.span, 0..input.len());
-        assert_eq!(node.dict_get(b"cow").and_then(BencodeNode::as_str_lossy), Some("moo".to_string()));
-        assert_eq!(node.dict_get(b"spam").and_then(BencodeNode::as_str_lossy), Some("eggs".to_string()));
+        assert_eq!(
+            node.dict_get(b"cow").and_then(BencodeNode::as_str_lossy),
+            Some("moo".to_string())
+        );
+        assert_eq!(
+            node.dict_get(b"spam").and_then(BencodeNode::as_str_lossy),
+            Some("eggs".to_string())
+        );
     }
 
     #[test]

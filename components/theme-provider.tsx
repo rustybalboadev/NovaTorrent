@@ -30,8 +30,12 @@ function systemTheme() {
 }
 
 function storedTheme(storageKey: string, fallback: Theme) {
-  const value = window.localStorage.getItem(storageKey);
-  return value === "light" || value === "dark" || value === "system" ? value : fallback;
+  try {
+    const value = window.localStorage.getItem(storageKey);
+    return value === "light" || value === "dark" || value === "system" ? value : fallback;
+  } catch {
+    return fallback;
+  }
 }
 
 function suppressThemeTransition() {
@@ -54,23 +58,21 @@ export function ThemeProvider({
   enableSystem = true,
   storageKey = "theme"
 }: ThemeProviderProps) {
-  const loadedStoredThemeRef = React.useRef(false);
-  const [theme, setThemeState] = React.useState<Theme>(defaultTheme);
-  const [resolvedTheme, setResolvedTheme] = React.useState<"light" | "dark">("light");
+  const loadedStoredThemeRef = React.useRef(typeof window !== "undefined");
+  const [theme, setThemeState] = React.useState<Theme>(() =>
+    typeof window === "undefined" ? defaultTheme : storedTheme(storageKey, defaultTheme)
+  );
+  const [resolvedTheme, setResolvedTheme] = React.useState<"light" | "dark">(() =>
+    typeof window === "undefined" ? "light" : systemTheme()
+  );
 
   React.useEffect(() => {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
     const updateFromSystem = () => setResolvedTheme(systemTheme());
-    const initialize = () => {
-      loadedStoredThemeRef.current = true;
-      setThemeState(storedTheme(storageKey, defaultTheme));
-      updateFromSystem();
-    };
 
-    window.queueMicrotask(initialize);
     media.addEventListener("change", updateFromSystem);
     return () => media.removeEventListener("change", updateFromSystem);
-  }, [defaultTheme, storageKey]);
+  }, []);
 
   React.useEffect(() => {
     const root = document.documentElement;
@@ -85,7 +87,11 @@ export function ThemeProvider({
     }
     root.style.colorScheme = nextTheme;
     if (loadedStoredThemeRef.current) {
-      window.localStorage.setItem(storageKey, theme);
+      try {
+        window.localStorage.setItem(storageKey, theme);
+      } catch {
+        // The visual theme still works when storage is unavailable.
+      }
     }
     restoreTransitions?.();
   }, [attribute, disableTransitionOnChange, enableSystem, resolvedTheme, storageKey, theme]);

@@ -49,7 +49,8 @@ pub fn build_piece_plan(
             let absolute_offset = index as u64 * piece_length;
             let remaining = total_length.saturating_sub(absolute_offset);
             let length = remaining.min(piece_length);
-            let length = u32::try_from(length).map_err(|_| "piece length exceeds u32".to_string())?;
+            let length =
+                u32::try_from(length).map_err(|_| "piece length exceeds u32".to_string())?;
             Ok(PiecePlan {
                 index: u32::try_from(index).map_err(|_| "piece index exceeds u32".to_string())?,
                 absolute_offset,
@@ -61,7 +62,11 @@ pub fn build_piece_plan(
         .collect()
 }
 
-pub fn build_block_requests(piece_index: u32, piece_length: u32, block_size: u32) -> Vec<BlockRequest> {
+pub fn build_block_requests(
+    piece_index: u32,
+    piece_length: u32,
+    block_size: u32,
+) -> Vec<BlockRequest> {
     if piece_length == 0 || block_size == 0 {
         return Vec::new();
     }

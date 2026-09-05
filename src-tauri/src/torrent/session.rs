@@ -23,31 +23,38 @@ use crate::torrent::{
     metainfo::{Metainfo, TorrentFile},
     peer::PeerInfo,
     peerwire::{self, MetadataFetchPlan, PeerDownloadPlan},
-    sha1, sha256,
-    storage,
+    sha1, storage,
     tracker::{self, TrackerAnnounceResponse, TrackerStatus, UdpAnnounceEvent, UdpAnnounceRequest},
     webseed::{self, WebSeedStatus},
 };
 
 const RUN_PAUSED: &str = "torrent was paused";
-const MAX_PARALLEL_PEERS: usize = 16;
+// Match libtorrent's default torrent_connect_boost so a newly added torrent can
+// find a useful peer quickly without bypassing NovaTorrent's per-torrent limit.
+const MAX_PARALLEL_PEERS: usize = 50;
 const DEFAULT_CONNECTION_LIMIT: usize = 50;
 const MAX_CONNECTION_LIMIT: usize = 500;
 const MAX_UPLOAD_SLOTS: usize = 4;
 const MAX_INBOUND_PEER_CONNECTIONS: usize = 64;
+const MAX_OUTBOUND_CONNECT_ATTEMPTS: usize = 60;
 const MAX_ENDGAME_PIECES: usize = 8;
 const MAX_PIECES_PER_PEER_ROUND: usize = 16;
 const MIN_RATE_LIMIT: u64 = 1024;
 const MAX_RATE_LIMIT: u64 = 10 * 1024 * 1024 * 1024;
 const TRACKER_ANNOUNCE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(16);
 const TRACKER_EARLY_PEER_GRACE: Duration = Duration::from_millis(100);
+const PEER_STARTUP_CONNECTION_GRACE: Duration = Duration::from_millis(150);
+const PEER_STARTUP_STRAGGLER_GRACE: Duration = Duration::from_millis(750);
+const PEER_STEADY_ROUND_STRAGGLER_GRACE: Duration = Duration::from_secs(2);
 const MAX_SWARM_REFRESH_ROUNDS: usize = 8;
 const MAX_RUNTIME_RETRY_DELAY: Duration = Duration::from_secs(60);
 const MAX_PARALLEL_METADATA_PEERS: usize = 8;
 const DEFAULT_STREAM_URGENT_BYTES: u64 = 16 * 1024 * 1024;
 const DEFAULT_STREAM_LOOKAHEAD_BYTES: u64 = 192 * 1024 * 1024;
 const MAX_STREAM_LOOKAHEAD_BYTES: u64 = 1024 * 1024 * 1024;
-const MAX_MEDIA_STREAM_READ_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_MEDIA_STREAM_READ_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_SUPPLEMENTAL_STREAM_FILES: usize = 32;
+const MAX_SUPPLEMENTAL_STREAM_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -74,6 +81,35 @@ pub struct TorrentListResponse {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct TorrentSummaryListResponse {
+    pub torrents: Vec<TorrentSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TorrentSummary {
+    pub id: Option<u64>,
+    pub info_hash: String,
+    pub name: Option<String>,
+    pub output_folder: String,
+    pub stats: TorrentSummaryStats,
+    pub peer_count: usize,
+    pub file_count: usize,
+    pub playable_file_count: usize,
+    pub first_playable_file_index: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TorrentSummaryStats {
+    pub state: TorrentState,
+    pub error: Option<String>,
+    pub progress_bytes: u64,
+    pub uploaded_bytes: u64,
+    pub total_bytes: u64,
+    pub finished: bool,
+    pub live: LiveStats,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct AddTorrentResponse {
     pub id: Option<u64>,
     pub details: TorrentDetails,
@@ -83,16 +119,6 @@ pub struct AddTorrentResponse {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct EmptyJsonResponse {}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct TorrentFileHash {
-    pub file_index: usize,
-    pub name: String,
-    pub path: String,
-    pub size: u64,
-    pub sha256: String,
-    pub virustotal_url: String,
-}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TorrentFileAvailability {
@@ -133,6 +159,8 @@ pub struct TorrentDetails {
     pub web_seeds: Vec<WebSeedStatus>,
     pub peers: Vec<PeerInfo>,
     pub options: TorrentOptions,
+    pub file_priorities: Vec<u8>,
+    pub piece_states: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -266,6 +294,8 @@ pub struct StreamPriorityRequest {
     pub playhead_offset: u64,
     pub urgent_bytes: Option<u64>,
     pub lookahead_bytes: Option<u64>,
+    #[serde(default)]
+    pub supplemental_file_indices: Option<Vec<usize>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -324,6 +354,7 @@ struct TorrentTask {
     source: TorrentSource,
     info_hash: [u8; 20],
     name: String,
+    destination_root: PathBuf,
     output_folder: PathBuf,
     files: Vec<TorrentFile>,
     trackers: Vec<TrackerStatus>,
@@ -345,6 +376,11 @@ struct TorrentTask {
     upload_limiter: peerwire::BandwidthLimiter,
     peer_health: HashMap<String, PeerHealth>,
     stream_priority: Option<StreamPriorityState>,
+    // The partial-store checkpoint intentionally lags writes for throughput. Keep the
+    // current verified map here so streaming never waits for that checkpoint interval.
+    live_verified_pieces: Option<Vec<bool>>,
+    file_priorities: Vec<u8>,
+    downloading_pieces: HashSet<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -380,6 +416,7 @@ struct PeerDownloadSnapshot {
     info_hash: [u8; 20],
     output_folder: PathBuf,
     files: Vec<TorrentFile>,
+    file_priorities: Vec<u8>,
     total_length: u64,
     piece_length: u64,
     piece_hashes: Vec<[u8; 20]>,
@@ -402,6 +439,7 @@ struct StreamPriorityState {
     playhead_offset: u64,
     urgent_bytes: u64,
     lookahead_bytes: u64,
+    supplemental_file_indices: Vec<usize>,
     updated_at_ms: u128,
 }
 
@@ -556,6 +594,8 @@ struct PersistedTorrent {
     seed_ratio_limit: Option<f64>,
     #[serde(default)]
     completed_at_ms: Option<u128>,
+    #[serde(default)]
+    file_priorities: Vec<u8>,
 }
 
 pub struct TorrentSession {
@@ -569,18 +609,21 @@ pub struct TorrentSession {
     dht_routing: Mutex<DhtRoutingTable>,
     dht_peers: Mutex<HashMap<[u8; 20], Vec<StoredDhtPeer>>>,
     dht_state_write: Mutex<()>,
+    session_state_write: Mutex<()>,
     listen_port: AtomicU16,
-    torrents: Mutex<Vec<TorrentTask>>,
+    torrents: Arc<Mutex<Vec<TorrentTask>>>,
     logs: Mutex<Vec<LogEntry>>,
     active_runs: Mutex<HashSet<u64>>,
-    active_announces: Mutex<HashSet<u64>>,
+    active_announces: Arc<Mutex<HashSet<u64>>>,
     active_incoming_peers: Arc<AtomicUsize>,
+    active_outbound_connects: Arc<AtomicUsize>,
     next_id: AtomicU64,
     next_log_id: AtomicU64,
+    shutting_down: AtomicBool,
 }
 
-struct ActiveAnnounceGuard<'a> {
-    active_announces: &'a Mutex<HashSet<u64>>,
+struct ActiveAnnounceGuard {
+    active_announces: Arc<Mutex<HashSet<u64>>>,
     torrent_id: u64,
 }
 
@@ -588,7 +631,17 @@ pub(crate) struct IncomingPeerPermit {
     active: Arc<AtomicUsize>,
 }
 
-impl Drop for ActiveAnnounceGuard<'_> {
+struct OutboundConnectPermit {
+    active: Arc<AtomicUsize>,
+}
+
+impl Drop for OutboundConnectPermit {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::Release);
+    }
+}
+
+impl Drop for ActiveAnnounceGuard {
     fn drop(&mut self) {
         if let Ok(mut active) = self.active_announces.lock() {
             active.remove(&self.torrent_id);
@@ -604,16 +657,28 @@ impl Drop for IncomingPeerPermit {
 
 impl TorrentSession {
     pub fn new(default_output_dir: PathBuf) -> Self {
-        let log_file_path = default_output_dir.join("novatorrent.log");
-        let session_file_path = default_output_dir.join("novatorrent-session.json");
-        let dht_state_file_path = default_output_dir.join("novatorrent-dht.json");
+        Self::new_with_state_dir(default_output_dir.clone(), default_output_dir)
+    }
+
+    pub fn new_with_state_dir(default_output_dir: PathBuf, state_dir: PathBuf) -> Self {
+        let log_file_path = state_dir.join("novatorrent.log");
+        Self::new_with_state_and_log_file(default_output_dir, state_dir, log_file_path)
+    }
+
+    pub fn new_with_state_and_log_file(
+        default_output_dir: PathBuf,
+        state_dir: PathBuf,
+        log_file_path: PathBuf,
+    ) -> Self {
+        let session_file_path = state_dir.join("novatorrent-session.json");
+        let dht_state_file_path = state_dir.join("novatorrent-dht.json");
         let (dht_node_id, persisted_nodes, dht_state_error, write_new_dht_state) =
             match load_dht_state(&dht_state_file_path) {
                 Ok(Some(state)) if state.version == 1 && state.node_id != [0u8; 20] => {
                     (state.node_id, state.nodes, None, false)
                 }
                 Ok(Some(state)) => (
-                    session_node_id(&default_output_dir),
+                    session_node_id(&state_dir),
                     Vec::new(),
                     Some(format!(
                         "persisted DHT state version {} or node ID is invalid; generated a new identity",
@@ -621,15 +686,15 @@ impl TorrentSession {
                     )),
                     true,
                 ),
-                Ok(None) => (session_node_id(&default_output_dir), Vec::new(), None, true),
+                Ok(None) => (session_node_id(&state_dir), Vec::new(), None, true),
                 Err(err) => (
-                    session_node_id(&default_output_dir),
+                    session_node_id(&state_dir),
                     Vec::new(),
                     Some(format!("could not restore DHT state: {err}")),
                     true,
                 ),
             };
-        let dht_token_secret = session_token_secret(&default_output_dir);
+        let dht_token_secret = session_token_secret(&state_dir);
         let mut dht_routing = DhtRoutingTable::new(dht_node_id);
         let mut restored_nodes = 0usize;
         for node in persisted_nodes.into_iter().take(256) {
@@ -651,14 +716,17 @@ impl TorrentSession {
             dht_routing: Mutex::new(dht_routing),
             dht_peers: Mutex::new(HashMap::new()),
             dht_state_write: Mutex::new(()),
+            session_state_write: Mutex::new(()),
             listen_port: AtomicU16::new(0),
-            torrents: Mutex::new(Vec::new()),
+            torrents: Arc::new(Mutex::new(Vec::new())),
             logs: Mutex::new(Vec::new()),
             active_runs: Mutex::new(HashSet::new()),
-            active_announces: Mutex::new(HashSet::new()),
+            active_announces: Arc::new(Mutex::new(HashSet::new())),
             active_incoming_peers: Arc::new(AtomicUsize::new(0)),
+            active_outbound_connects: Arc::new(AtomicUsize::new(0)),
             next_id: AtomicU64::new(1),
             next_log_id: AtomicU64::new(1),
+            shutting_down: AtomicBool::new(false),
         };
         if let Some(error) = dht_state_error {
             session.log(LogLevel::Warn, "dht", error, None);
@@ -718,16 +786,7 @@ impl TorrentSession {
         }
         let bytes = serde_json::to_vec_pretty(&state)
             .map_err(|err| format!("could not encode DHT state: {err}"))?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&self.dht_state_file_path)
-            .map_err(|err| format!("could not open DHT state: {err}"))?;
-        file.write_all(&bytes)
-            .map_err(|err| format!("could not write DHT state: {err}"))?;
-        file.sync_all()
-            .map_err(|err| format!("could not flush DHT state: {err}"))
+        write_state_file_atomic(&self.dht_state_file_path, &bytes, "DHT state")
     }
 
     fn persist_dht_state_or_log(&self) {
@@ -750,6 +809,26 @@ impl TorrentSession {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    pub fn prepare_shutdown(&self) {
+        if self.shutting_down.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Ok(mut torrents) = self.torrents.lock() {
+            for torrent in torrents.iter_mut() {
+                torrent.cancelled.store(true, Ordering::Release);
+                torrent.downloading_pieces.clear();
+            }
+        }
+        self.persist_session_or_log(None);
+        self.persist_dht_state_or_log();
+        self.log(
+            LogLevel::Info,
+            "session",
+            "shutdown checkpoint saved; active transfers are stopping cleanly",
+            None,
+        );
     }
 
     pub fn set_listen_port(&self, port: u16) {
@@ -848,7 +927,11 @@ impl TorrentSession {
             Ok(query) => query,
             Err(err) => {
                 let transaction_id = dht::transaction_id_from_message(packet).unwrap_or_default();
-                let code = if err.starts_with("unknown DHT method") { 204 } else { 203 };
+                let code = if err.starts_with("unknown DHT method") {
+                    204
+                } else {
+                    203
+                };
                 return dht::build_krpc_error(&transaction_id, code, &single_line(&err));
             }
         };
@@ -933,12 +1016,7 @@ impl TorrentSession {
         }
     }
 
-    fn learn_peer_dht_node(
-        &self,
-        address: &str,
-        port: u16,
-        torrent_id: u64,
-    ) -> Result<(), String> {
+    fn learn_peer_dht_node(&self, address: &str, port: u16, torrent_id: u64) -> Result<(), String> {
         if port == 0 {
             return Err("peer advertised DHT port zero".to_string());
         }
@@ -976,7 +1054,11 @@ impl TorrentSession {
             "dht",
             format!(
                 "verified peer-advertised DHT node {endpoint}{}",
-                if inserted { " and added it to routing" } else { "" }
+                if inserted {
+                    " and added it to routing"
+                } else {
+                    ""
+                }
             ),
             Some(torrent_id),
         );
@@ -1165,7 +1247,11 @@ impl TorrentSession {
                         let evicted = routing.record_failure(&contact);
                         summary.evicted += usize::from(evicted);
                         self.log(
-                            if evicted { LogLevel::Warn } else { LogLevel::Debug },
+                            if evicted {
+                                LogLevel::Warn
+                            } else {
+                                LogLevel::Debug
+                            },
                             "dht",
                             format!(
                                 "DHT node {}:{} failed a liveness check{}: {err}",
@@ -1232,13 +1318,21 @@ impl TorrentSession {
                         let evicted = routing.record_failure(&contact);
                         summary.evicted += usize::from(evicted);
                         self.log(
-                            if evicted { LogLevel::Warn } else { LogLevel::Debug },
+                            if evicted {
+                                LogLevel::Warn
+                            } else {
+                                LogLevel::Debug
+                            },
                             "dht",
                             format!(
                                 "DHT refresh through {}:{} failed{}: {err}",
                                 contact.address,
                                 contact.port,
-                                if evicted { " and the node was evicted" } else { "" }
+                                if evicted {
+                                    " and the node was evicted"
+                                } else {
+                                    ""
+                                }
                             ),
                             None,
                         );
@@ -1315,15 +1409,17 @@ impl TorrentSession {
     }
 
     fn store_dht_peer(&self, info_hash: [u8; 20], peer: PeerInfo) -> Result<(), String> {
-        let mut store = self.dht_peers.lock().map_err(|_| "DHT peer store lock poisoned")?;
+        let mut store = self
+            .dht_peers
+            .lock()
+            .map_err(|_| "DHT peer store lock poisoned")?;
         if !store.contains_key(&info_hash) && store.len() >= 1_024 {
             return Err("DHT peer store is full".to_string());
         }
         let peers = store.entry(info_hash).or_default();
-        if let Some(existing) = peers
-            .iter_mut()
-            .find(|existing| existing.peer.address == peer.address && existing.peer.port == peer.port)
-        {
+        if let Some(existing) = peers.iter_mut().find(|existing| {
+            existing.peer.address == peer.address && existing.peer.port == peer.port
+        }) {
             existing.last_seen_ms = timestamp_ms();
         } else {
             if peers.len() >= 200 {
@@ -1379,6 +1475,15 @@ impl TorrentSession {
         TorrentListResponse { torrents }
     }
 
+    pub fn list_summaries(&self) -> TorrentSummaryListResponse {
+        let torrents = self
+            .torrents
+            .lock()
+            .map(|torrents| torrents.iter().map(TorrentTask::summary).collect())
+            .unwrap_or_default();
+        TorrentSummaryListResponse { torrents }
+    }
+
     pub fn details(&self, id: &str) -> Result<TorrentDetails, String> {
         let torrents = self.torrents.lock().map_err(|_| "torrent lock poisoned")?;
         torrents
@@ -1391,7 +1496,12 @@ impl TorrentSession {
     pub fn preview(&self, request: AddTorrentRequest) -> Result<AddTorrentResponse, String> {
         let mut task = self.build_task(request, None)?;
         task.stats.state = TorrentState::Preview;
-        self.log(LogLevel::Info, "metainfo", "previewed torrent metadata", None);
+        self.log(
+            LogLevel::Info,
+            "metainfo",
+            "previewed torrent metadata",
+            None,
+        );
         Ok(AddTorrentResponse {
             id: None,
             output_folder: task.output_folder.to_string_lossy().into_owned(),
@@ -1402,7 +1512,26 @@ impl TorrentSession {
 
     pub fn add(&self, request: AddTorrentRequest) -> Result<AddTorrentResponse, String> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let task = self.build_task(request, Some(id))?;
+        let mut task = self.build_task(request, Some(id))?;
+        if let Err(err) = self.cache_metainfo_source(&mut task) {
+            self.log(LogLevel::Warn, "session", err, Some(id));
+        }
+        if !task.options.overwrite && !task.files.is_empty() {
+            let conflicts =
+                storage::existing_output_paths(&task.output_folder, &task.name, &task.files)?;
+            if let Some(first) = conflicts.first() {
+                let additional = conflicts.len().saturating_sub(1);
+                let suffix = if additional == 0 {
+                    String::new()
+                } else {
+                    format!(" and {additional} more")
+                };
+                return Err(format!(
+                    "A file already exists at {}{suffix}. Choose a different destination, change the subfolder, or enable Replace existing files.",
+                    first.to_string_lossy()
+                ));
+            }
+        }
         let output_folder = task.output_folder.to_string_lossy().into_owned();
         let details = task.details();
         let name = task.name.clone();
@@ -1426,13 +1555,40 @@ impl TorrentSession {
         })
     }
 
+    fn cache_metainfo_source(&self, task: &mut TorrentTask) -> Result<(), String> {
+        let TorrentSource::File(source) = &task.source else {
+            return Ok(());
+        };
+        let source = PathBuf::from(source);
+        let Some(state_dir) = self.session_file_path.parent() else {
+            return Ok(());
+        };
+        let cache_dir = state_dir.join("metainfo");
+        fs::create_dir_all(&cache_dir)
+            .map_err(|err| format!("could not create metainfo cache: {err}"))?;
+        let cached = cache_dir.join(format!("{}.torrent", sha1::hex(&task.info_hash)));
+        if source != cached {
+            let bytes = fs::read(&source)
+                .map_err(|err| format!("could not read metainfo for restart cache: {err}"))?;
+            write_state_file_atomic(&cached, &bytes, "cached metainfo")?;
+        }
+        task.source = TorrentSource::File(cached.to_string_lossy().into_owned());
+        Ok(())
+    }
+
     pub fn pause(&self, id: &str) -> Result<EmptyJsonResponse, String> {
         self.update_task(id, |torrent| {
             torrent.cancelled.store(true, Ordering::Relaxed);
             torrent.options.paused = true;
             torrent.stats.state = TorrentState::Paused;
+            torrent.downloading_pieces.clear();
         })?;
-        self.log(LogLevel::Info, "runtime", "pause requested", id.parse().ok());
+        self.log(
+            LogLevel::Info,
+            "runtime",
+            "pause requested",
+            id.parse().ok(),
+        );
         self.persist_session_or_log(id.parse().ok());
         Ok(EmptyJsonResponse {})
     }
@@ -1448,7 +1604,12 @@ impl TorrentSession {
             };
             torrent.stats.error = None;
         })?;
-        self.log(LogLevel::Info, "runtime", "continue requested", id.parse().ok());
+        self.log(
+            LogLevel::Info,
+            "runtime",
+            "continue requested",
+            id.parse().ok(),
+        );
         self.persist_session_or_log(id.parse().ok());
         Ok(EmptyJsonResponse {})
     }
@@ -1468,7 +1629,33 @@ impl TorrentSession {
             })
     }
 
-    pub fn serve_incoming_peer(&self, stream: TcpStream) -> Result<peerwire::PeerSeedResult, String> {
+    fn acquire_outbound_connect(
+        &self,
+        cancelled: &AtomicBool,
+    ) -> Result<OutboundConnectPermit, String> {
+        loop {
+            if cancelled.load(Ordering::Acquire) {
+                return Err("peer download cancelled".to_string());
+            }
+            if self
+                .active_outbound_connects
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                    (active < MAX_OUTBOUND_CONNECT_ATTEMPTS).then_some(active + 1)
+                })
+                .is_ok()
+            {
+                return Ok(OutboundConnectPermit {
+                    active: Arc::clone(&self.active_outbound_connects),
+                });
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    pub fn serve_incoming_peer(
+        &self,
+        stream: TcpStream,
+    ) -> Result<peerwire::PeerSeedResult, String> {
         let permit = self.try_acquire_incoming_peer()?;
         self.serve_incoming_peer_with_permit(stream, permit)
     }
@@ -1480,7 +1667,12 @@ impl TorrentSession {
     ) -> Result<peerwire::PeerSeedResult, String> {
         let remote = stream.peer_addr().ok();
         let handshake = peerwire::read_incoming_handshake(&mut stream).map_err(|err| {
-            self.log(LogLevel::Warn, "seed", format!("incoming handshake failed: {err}"), None);
+            self.log(
+                LogLevel::Warn,
+                "seed",
+                format!("incoming handshake failed: {err}"),
+                None,
+            );
             err
         })?;
         let snapshot = {
@@ -1659,7 +1851,9 @@ impl TorrentSession {
         };
         torrent.general.seeding_time_seconds = torrent
             .completed_at_ms
-            .map(|completed_at_ms| ((timestamp_ms().saturating_sub(completed_at_ms)) / 1_000) as u64)
+            .map(|completed_at_ms| {
+                ((timestamp_ms().saturating_sub(completed_at_ms)) / 1_000) as u64
+            })
             .unwrap_or_default();
         if let Some(live) = torrent.stats.live.as_mut() {
             live.upload_speed = bytes_uploaded;
@@ -1707,7 +1901,9 @@ impl TorrentSession {
                 self.log(
                     LogLevel::Warn,
                     "tracker",
-                    format!("could not send stopped announce after seed ratio limit was reached: {err}"),
+                    format!(
+                        "could not send stopped announce after seed ratio limit was reached: {err}"
+                    ),
                     Some(id),
                 );
             }
@@ -1722,7 +1918,10 @@ impl TorrentSession {
         }
 
         {
-            let mut active = self.active_runs.lock().map_err(|_| "runtime lock poisoned")?;
+            let mut active = self
+                .active_runs
+                .lock()
+                .map_err(|_| "runtime lock poisoned")?;
             if !active.insert(snapshot.id) {
                 self.log(
                     LogLevel::Debug,
@@ -1807,7 +2006,10 @@ impl TorrentSession {
         error: &str,
         failure_count: u32,
     ) -> Option<Duration> {
-        if error == RUN_PAUSED || !recoverable_runtime_error(error) {
+        if self.shutting_down.load(Ordering::Acquire)
+            || error == RUN_PAUSED
+            || !recoverable_runtime_error(error)
+        {
             return None;
         }
         let snapshot = self.runtime_snapshot(id).ok()?;
@@ -1895,8 +2097,119 @@ impl TorrentSession {
             }
         }
 
-        let mut discovery = self.discover_sources_for_runtime(id, &snapshot);
-        snapshot = self.runtime_snapshot(id)?;
+        if !snapshot.trackers_disabled
+            && snapshot.tracker_count > 0
+            && !snapshot.private
+            && snapshot.webseed_count == 0
+        {
+            return self.run_with_parallel_discovery(id, &snapshot, runtime_started);
+        }
+
+        let discovery = self.discover_sources_for_runtime(id, &snapshot);
+        self.run_after_discovery(id, runtime_started, discovery)
+    }
+
+    fn run_with_parallel_discovery(
+        &self,
+        id: &str,
+        initial: &RuntimeSnapshot,
+        runtime_started: Instant,
+    ) -> Result<(), String> {
+        let initial_peer_count = initial.peer_count;
+        let (first_result, discovery) = std::thread::scope(|scope| {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let tracker_sender = sender.clone();
+            scope.spawn(move || {
+                let started = Instant::now();
+                let error = self.announce(id).err();
+                let _ = tracker_sender.send(("tracker", error, started.elapsed()));
+            });
+            let dht_sender = sender.clone();
+            scope.spawn(move || {
+                let started = Instant::now();
+                let error = self.query_dht(id).err();
+                let _ = dht_sender.send(("dht", error, started.elapsed()));
+            });
+            drop(sender);
+
+            let mut discovery = DiscoveryOutcome {
+                dht_ran: true,
+                ..DiscoveryOutcome::default()
+            };
+            let mut completed = 0usize;
+            let mut pipeline_result = None;
+            while completed < 2 {
+                if pipeline_result.is_none() {
+                    let current = self.runtime_snapshot(id)?;
+                    self.ensure_running(&current)?;
+                    let can_start = current.peer_count > 0
+                        || (current.metadata_available && current.webseed_count > 0);
+                    if can_start {
+                        self.log(
+                            LogLevel::Info,
+                            "runtime",
+                            format!(
+                                "starting download path while discovery continues after {} ms",
+                                runtime_started.elapsed().as_millis()
+                            ),
+                            Some(current.id),
+                        );
+                        pipeline_result =
+                            Some(self.run_after_discovery(id, runtime_started, discovery.clone()));
+                        continue;
+                    }
+                }
+
+                let (source, error, elapsed) = receiver.recv().map_err(|_| {
+                    "discovery workers stopped before reporting results".to_string()
+                })?;
+                completed += 1;
+                match source {
+                    "tracker" => discovery.tracker_error = error,
+                    "dht" => discovery.dht_error = error,
+                    _ => {}
+                }
+                self.log_discovery_finished(
+                    id,
+                    initial.id,
+                    source,
+                    if source == "tracker" {
+                        "tracker discovery"
+                    } else {
+                        "DHT discovery"
+                    },
+                    elapsed,
+                );
+            }
+
+            let result = pipeline_result.unwrap_or_else(|| {
+                self.run_after_discovery(id, runtime_started, discovery.clone())
+            });
+            Ok::<_, String>((result, discovery))
+        })?;
+
+        if first_result.is_err() {
+            let current = self.runtime_snapshot(id)?;
+            if !current.finished && current.peer_count > initial_peer_count {
+                self.log(
+                    LogLevel::Info,
+                    "runtime",
+                    "retrying download path with peers learned by late discovery",
+                    Some(current.id),
+                );
+                return self.run_after_discovery(id, runtime_started, discovery);
+            }
+        }
+        first_result
+    }
+
+    fn run_after_discovery(
+        &self,
+        id: &str,
+        runtime_started: Instant,
+        mut discovery: DiscoveryOutcome,
+    ) -> Result<(), String> {
+        let mut snapshot = self.runtime_snapshot(id)?;
         self.ensure_running(&snapshot)?;
 
         if !snapshot.metadata_available {
@@ -1983,7 +2296,10 @@ impl TorrentSession {
             self.log(
                 LogLevel::Info,
                 "runtime",
-                format!("starting peer download after {} ms", runtime_started.elapsed().as_millis()),
+                format!(
+                    "starting peer download after {} ms",
+                    runtime_started.elapsed().as_millis()
+                ),
                 Some(snapshot.id),
             );
             match self.download_from_peers(id) {
@@ -2039,7 +2355,7 @@ impl TorrentSession {
                 .runtime_snapshot(id)
                 .map(|snapshot| snapshot.peer_count)
                 .unwrap_or_default();
-            if peer_count == 0 {
+            if peer_count == 0 && snapshot.webseed_count == 0 {
                 let started = Instant::now();
                 outcome.dht_error = self.query_dht(id).err();
                 outcome.dht_ran = true;
@@ -2050,11 +2366,18 @@ impl TorrentSession {
                     "DHT discovery",
                     started.elapsed(),
                 );
-            } else {
+            } else if peer_count > 0 {
                 self.log(
                     LogLevel::Debug,
                     "dht",
                     format!("deferred startup DHT lookup because trackers produced {peer_count} peer(s)"),
+                    Some(snapshot.id),
+                );
+            } else {
+                self.log(
+                    LogLevel::Debug,
+                    "dht",
+                    "deferred startup DHT lookup so an available webseed can start immediately",
                     Some(snapshot.id),
                 );
             }
@@ -2072,13 +2395,7 @@ impl TorrentSession {
             let started = Instant::now();
             outcome.dht_error = self.query_dht(id).err();
             outcome.dht_ran = true;
-            self.log_discovery_finished(
-                id,
-                snapshot.id,
-                "dht",
-                "DHT discovery",
-                started.elapsed(),
-            );
+            self.log_discovery_finished(id, snapshot.id, "dht", "DHT discovery", started.elapsed());
         }
 
         outcome
@@ -2196,7 +2513,10 @@ impl TorrentSession {
                 info_hash: torrent.info_hash,
                 uploaded: torrent.stats.uploaded_bytes,
                 downloaded: torrent.stats.progress_bytes,
-                left: torrent.stats.total_bytes.saturating_sub(torrent.stats.progress_bytes),
+                left: torrent
+                    .stats
+                    .total_bytes
+                    .saturating_sub(torrent.stats.progress_bytes),
                 port: self.listen_port(),
                 event,
                 trackers: tracker_urls,
@@ -2204,7 +2524,12 @@ impl TorrentSession {
         };
 
         if snapshot.trackers.is_empty() {
-            self.log(LogLevel::Warn, "tracker", "announce skipped: no trackers configured", Some(snapshot.id));
+            self.log(
+                LogLevel::Warn,
+                "tracker",
+                "announce skipped: no trackers configured",
+                Some(snapshot.id),
+            );
             return Ok(EmptyJsonResponse {});
         }
         if snapshot.port == 0 {
@@ -2240,10 +2565,10 @@ impl TorrentSession {
             }
             std::thread::sleep(Duration::from_millis(25));
         }
-        let _active_announce = ActiveAnnounceGuard {
-            active_announces: &self.active_announces,
+        let mut active_announce = Some(ActiveAnnounceGuard {
+            active_announces: Arc::clone(&self.active_announces),
             torrent_id: snapshot.id,
-        };
+        });
 
         self.log(
             LogLevel::Info,
@@ -2326,7 +2651,8 @@ impl TorrentSession {
                 );
                 break;
             };
-            let usable_peer_response = matches!(&result, Ok(response) if !response.peers.is_empty());
+            let usable_peer_response =
+                matches!(&result, Ok(response) if !response.peers.is_empty());
             self.log(
                 match &result {
                     Ok(_) => LogLevel::Debug,
@@ -2340,12 +2666,7 @@ impl TorrentSession {
                         elapsed.as_millis(),
                         response.peers.len()
                     ),
-                    Err(err) => format!(
-                        "{} failed in {} ms: {}",
-                        url,
-                        elapsed.as_millis(),
-                        err
-                    ),
+                    Err(err) => format!("{} failed in {} ms: {}", url, elapsed.as_millis(), err),
                 },
                 Some(snapshot.id),
             );
@@ -2368,19 +2689,15 @@ impl TorrentSession {
                         elapsed.as_millis(),
                         response.peers.len()
                     ),
-                    Err(err) => format!(
-                        "{} failed in {} ms: {}",
-                        url,
-                        elapsed.as_millis(),
-                        err
-                    ),
+                    Err(err) => format!("{} failed in {} ms: {}", url, elapsed.as_millis(), err),
                 },
                 Some(snapshot.id),
             );
             results.push((url, result));
         }
         let pending_workers = snapshot.trackers.len().saturating_sub(results.len());
-        let using_early_peers = can_use_early_peers && first_peer_result_at.is_some() && pending_workers > 0;
+        let using_early_peers =
+            can_use_early_peers && first_peer_result_at.is_some() && pending_workers > 0;
         if using_early_peers {
             self.log(
                 LogLevel::Info,
@@ -2390,6 +2707,19 @@ impl TorrentSession {
                 ),
                 Some(snapshot.id),
             );
+            let torrents = Arc::clone(&self.torrents);
+            let torrent_id = snapshot.id;
+            let event = snapshot.event;
+            let announce_guard = active_announce.take();
+            std::thread::spawn(move || {
+                for (url, result, _) in tracker_receiver {
+                    apply_late_tracker_result(&torrents, torrent_id, event, &url, result);
+                }
+                for worker in tracker_workers {
+                    let _ = worker.join();
+                }
+                drop(announce_guard);
+            });
         } else {
             for worker in tracker_workers {
                 if worker.join().is_err() {
@@ -2400,6 +2730,9 @@ impl TorrentSession {
                         Some(snapshot.id),
                     );
                 }
+            }
+            while let Ok((url, result, _)) = tracker_receiver.try_recv() {
+                results.push((url, result));
             }
         }
 
@@ -2413,7 +2746,11 @@ impl TorrentSession {
             .find(|torrent| torrent.matches_id(id))
             .ok_or_else(|| format!("torrent not found: {id}"))?;
         for (url, result) in results {
-            let Some(status_index) = torrent.trackers.iter().position(|tracker| tracker.url == url) else {
+            let Some(status_index) = torrent
+                .trackers
+                .iter()
+                .position(|tracker| tracker.url == url)
+            else {
                 continue;
             };
             match result {
@@ -2433,11 +2770,25 @@ impl TorrentSession {
                     status.state = "Error".to_string();
                     status.message = Some(err.clone());
                     failures.push(format!("{url}: {err}"));
-                    self.log(LogLevel::Warn, "tracker", format!("{url}: {err}"), Some(snapshot.id));
+                    self.log(
+                        LogLevel::Warn,
+                        "tracker",
+                        format!("{url}: {err}"),
+                        Some(snapshot.id),
+                    );
                 }
             }
         }
-        if discovered > 0 && torrent.stats.state != TorrentState::Paused && !torrent.stats.finished {
+        if discovered > 0
+            && matches!(
+                torrent.stats.state,
+                TorrentState::Discovering
+                    | TorrentState::Dht
+                    | TorrentState::Queued
+                    | TorrentState::Metadata
+            )
+            && !torrent.stats.finished
+        {
             torrent.stats.state = TorrentState::Queued;
         }
         if successful {
@@ -2467,7 +2818,10 @@ impl TorrentSession {
             Some(snapshot.id),
         );
         if !successful {
-            return Err(format!("all tracker announces failed: {}", failures.join("; ")));
+            return Err(format!(
+                "all tracker announces failed: {}",
+                failures.join("; ")
+            ));
         }
         Ok(EmptyJsonResponse {})
     }
@@ -2486,7 +2840,11 @@ impl TorrentSession {
                 files: torrent.files.clone(),
                 piece_length: torrent.general.piece_size,
                 piece_hashes: torrent.piece_hashes.clone(),
-                web_seeds: torrent.web_seeds.iter().map(|seed| seed.url.clone()).collect(),
+                web_seeds: torrent
+                    .web_seeds
+                    .iter()
+                    .map(|seed| seed.url.clone())
+                    .collect(),
                 overwrite: torrent.options.overwrite,
                 cancelled: Arc::clone(&torrent.cancelled),
                 download_limiter: torrent.download_limiter.clone(),
@@ -2497,7 +2855,12 @@ impl TorrentSession {
             return Err("torrent metadata has no files".to_string());
         }
         if snapshot.web_seeds.is_empty() {
-            self.log(LogLevel::Warn, "webseed", "webseed download skipped: no web seeds configured", Some(snapshot.id));
+            self.log(
+                LogLevel::Warn,
+                "webseed",
+                "webseed download skipped: no web seeds configured",
+                Some(snapshot.id),
+            );
             return Err("torrent has no web seeds".to_string());
         }
 
@@ -2532,7 +2895,12 @@ impl TorrentSession {
                 Some(&snapshot.download_limiter),
             ) {
                 Ok(result) => {
-                    self.mark_webseed_complete(id, seed_url, result.bytes_written, result.pieces_verified)?;
+                    self.mark_webseed_complete(
+                        id,
+                        seed_url,
+                        result.bytes_written,
+                        result.pieces_verified,
+                    )?;
                     self.log(
                         LogLevel::Info,
                         "webseed",
@@ -2549,7 +2917,12 @@ impl TorrentSession {
                 }
                 Err(err) => {
                     self.set_webseed_state(id, seed_url, "Error", Some(err.clone()), 0)?;
-                    self.log(LogLevel::Warn, "webseed", format!("{seed_url}: {err}"), Some(snapshot.id));
+                    self.log(
+                        LogLevel::Warn,
+                        "webseed",
+                        format!("{seed_url}: {err}"),
+                        Some(snapshot.id),
+                    );
                     last_error = Some(err);
                 }
             }
@@ -2588,7 +2961,11 @@ impl TorrentSession {
                         Some(torrent_id),
                     );
                 }
-                let available = connection.availability().iter().filter(|piece| **piece).count();
+                let available = connection
+                    .availability()
+                    .iter()
+                    .filter(|piece| **piece)
+                    .count();
                 self.set_peer_connection(
                     id,
                     &peer.address,
@@ -2756,6 +3133,7 @@ impl TorrentSession {
                 deferred_for_backoff,
                 deferred_for_duplicate_ip,
                 stream_priority: torrent.stream_priority.clone(),
+                file_priorities: torrent.file_priorities.clone(),
             }
         };
 
@@ -2888,7 +3266,9 @@ impl TorrentSession {
                 };
                 let download_limiter = snapshot.download_limiter.clone();
                 let sender = connect_sender.clone();
+                let connect_permit = self.acquire_outbound_connect(snapshot.cancelled.as_ref())?;
                 std::thread::spawn(move || {
+                    let _connect_permit = connect_permit;
                     let started = Instant::now();
                     let result = peerwire::connect_peer_for_download_with_limiter(
                         &address,
@@ -2905,29 +3285,20 @@ impl TorrentSession {
             let mut advertised_dht_nodes = Vec::new();
             let mut settled_peers = HashSet::new();
             let mut received = 0usize;
-            let mut first_connected_at = None::<Instant>;
             let batch_deadline = Instant::now() + Duration::from_secs(6);
             while received < peer_batch.len() {
                 if snapshot.cancelled.load(Ordering::Relaxed) {
                     return Err("peer download cancelled".to_string());
                 }
-                let timeout = if let Some(first_connected_at) = first_connected_at {
-                    let grace = Duration::from_millis(900);
-                    if first_connected_at.elapsed() >= grace {
-                        break;
-                    }
-                    grace.saturating_sub(first_connected_at.elapsed())
-                } else {
-                    let remaining = batch_deadline.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        break;
-                    }
-                    remaining.min(Duration::from_millis(500))
-                };
+                let remaining = batch_deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let timeout = remaining.min(Duration::from_millis(500));
                 let (peer, result, elapsed) = match connect_receiver.recv_timeout(timeout) {
                     Ok(result) => result,
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                        if first_connected_at.is_some() || Instant::now() >= batch_deadline {
+                        if Instant::now() >= batch_deadline {
                             break;
                         }
                         continue;
@@ -2947,8 +3318,35 @@ impl TorrentSession {
                     &mut advertised_dht_nodes,
                     &mut errors,
                 )?;
-                if connected.len() > connected_before && first_connected_at.is_none() {
-                    first_connected_at = Some(Instant::now());
+                if connected.len() > connected_before {
+                    break;
+                }
+            }
+            if !connected.is_empty() && received < peer_batch.len() {
+                let grace_deadline = Instant::now() + PEER_STARTUP_CONNECTION_GRACE;
+                while received < peer_batch.len() {
+                    let remaining = grace_deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    match connect_receiver.recv_timeout(remaining) {
+                        Ok((peer, result, elapsed)) => {
+                            received += 1;
+                            settled_peers.insert((peer.address.clone(), peer.port));
+                            pex_candidates_added += self.accept_peer_connection_result(
+                                id,
+                                snapshot.id,
+                                peer,
+                                result,
+                                elapsed,
+                                &mut connected,
+                                &mut advertised_dht_nodes,
+                                &mut errors,
+                            )?;
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
                 }
             }
             for peer in peer_batch {
@@ -3046,9 +3444,7 @@ impl TorrentSession {
                     .enumerate()
                     .filter_map(|(index, complete)| (!*complete).then_some(index as u32))
                     .collect::<Vec<_>>();
-                let endgame_threshold = connected
-                    .len()
-                    .clamp(2, MAX_ENDGAME_PIECES);
+                let endgame_threshold = connected.len().clamp(2, MAX_ENDGAME_PIECES);
                 let endgame_candidate = (missing.len() <= endgame_threshold)
                     .then(|| {
                         missing
@@ -3070,7 +3466,7 @@ impl TorrentSession {
                     })
                     .flatten();
                 if let Some((piece_index, endgame_peer_count)) = endgame_candidate {
-                        self.log(
+                    self.log(
                             LogLevel::Info,
                             "peer",
                             format!(
@@ -3079,86 +3475,85 @@ impl TorrentSession {
                             ),
                             Some(snapshot.id),
                         );
-                        let mut endgame_peers = Vec::with_capacity(endgame_peer_count);
-                        let mut remaining_connections = Vec::new();
-                        for peer in connected {
-                            if peer
-                                .connection
-                                .availability()
-                                .get(piece_index as usize)
-                                .copied()
-                                .unwrap_or(false)
-                            {
-                                endgame_peers.push(peer);
-                            } else {
-                                remaining_connections.push(peer);
-                            }
+                    let mut endgame_peers = Vec::with_capacity(endgame_peer_count);
+                    let mut remaining_connections = Vec::new();
+                    for peer in connected {
+                        if peer
+                            .connection
+                            .availability()
+                            .get(piece_index as usize)
+                            .copied()
+                            .unwrap_or(false)
+                        {
+                            endgame_peers.push(peer);
+                        } else {
+                            remaining_connections.push(peer);
                         }
-                        let EndgameRaceResult {
-                            winner,
-                            cancelled,
-                            duplicates,
-                            errors: race_errors,
-                            worker_panics,
-                            reusable,
-                        } = race_endgame_piece(
-                            endgame_peers,
-                            piece_index,
-                            snapshot.cancelled.as_ref(),
-                        );
-                        remaining_connections.extend(reusable);
-                        connected = remaining_connections;
-                        for peer in cancelled {
-                            self.set_peer_connection(
-                                id,
-                                &peer.address,
-                                peer.port,
-                                "Endgame duplicate cancelled",
-                                None,
-                            )?;
-                        }
-                        for peer in duplicates {
-                            self.set_peer_connection(
-                                id,
-                                &peer.address,
-                                peer.port,
-                                "Endgame duplicate discarded",
-                                None,
-                            )?;
-                        }
-                        for (peer, error) in race_errors {
-                            self.record_peer_failure(id, &peer.address, peer.port)?;
-                            self.set_peer_connection(
-                                id,
-                                &peer.address,
-                                peer.port,
-                                "Error",
-                                Some(error.clone()),
-                            )?;
-                            errors.push(format!("{}:{}: {error}", peer.address, peer.port));
-                        }
-                        errors.extend(worker_panics);
-                        if snapshot.cancelled.load(Ordering::Acquire) {
-                            return Err("peer download cancelled".to_string());
-                        }
-                        if let Some((peer, downloaded)) = winner {
-                            let downloaded_bytes = downloaded.bytes.len() as u64;
-                            partial_store.write_piece(downloaded.index, &downloaded.bytes)?;
-                            verified[downloaded.index as usize] = true;
-                            self.mark_peer_piece_progress(
-                                id,
-                                &peer.address,
-                                peer.port,
-                                downloaded_bytes,
-                                1,
-                                &verified,
-                                snapshot.total_length,
-                                snapshot.piece_length,
-                                0,
-                                None,
-                                None,
-                            )?;
-                            self.log(
+                    }
+                    self.set_downloading_pieces(id, HashSet::from([piece_index]))?;
+                    let EndgameRaceResult {
+                        winner,
+                        cancelled,
+                        duplicates,
+                        errors: race_errors,
+                        worker_panics,
+                        reusable,
+                    } = race_endgame_piece(endgame_peers, piece_index, snapshot.cancelled.as_ref());
+                    self.set_downloading_pieces(id, HashSet::new())?;
+                    remaining_connections.extend(reusable);
+                    connected = remaining_connections;
+                    for peer in cancelled {
+                        self.set_peer_connection(
+                            id,
+                            &peer.address,
+                            peer.port,
+                            "Endgame duplicate cancelled",
+                            None,
+                        )?;
+                    }
+                    for peer in duplicates {
+                        self.set_peer_connection(
+                            id,
+                            &peer.address,
+                            peer.port,
+                            "Endgame duplicate discarded",
+                            None,
+                        )?;
+                    }
+                    for (peer, error) in race_errors {
+                        self.record_peer_failure(id, &peer.address, peer.port)?;
+                        self.set_peer_connection(
+                            id,
+                            &peer.address,
+                            peer.port,
+                            "Error",
+                            Some(error.clone()),
+                        )?;
+                        errors.push(format!("{}:{}: {error}", peer.address, peer.port));
+                    }
+                    errors.extend(worker_panics);
+                    if snapshot.cancelled.load(Ordering::Acquire) {
+                        return Err("peer download cancelled".to_string());
+                    }
+                    if let Some((peer, downloaded)) = winner {
+                        let downloaded_bytes = downloaded.bytes.len() as u64;
+                        partial_store.write_piece(downloaded.index, &downloaded.bytes)?;
+                        verified[downloaded.index as usize] = true;
+                        self.mark_peer_piece_progress(
+                            id,
+                            &peer.address,
+                            peer.port,
+                            downloaded_bytes,
+                            1,
+                            &[downloaded.index],
+                            &verified,
+                            snapshot.total_length,
+                            snapshot.piece_length,
+                            0,
+                            None,
+                            None,
+                        )?;
+                        self.log(
                                 LogLevel::Info,
                                 "peer",
                                 format!(
@@ -3167,11 +3562,11 @@ impl TorrentSession {
                                 ),
                                 Some(snapshot.id),
                             );
-                            continue;
-                        }
-                        if connected.is_empty() {
-                            break;
-                        }
+                        continue;
+                    }
+                    if connected.is_empty() {
+                        break;
+                    }
                 }
                 let availability = connected
                     .iter()
@@ -3182,9 +3577,15 @@ impl TorrentSession {
                 let stream_priority = self
                     .current_stream_priority(id)?
                     .or_else(|| snapshot.stream_priority.clone());
+                let piece_priorities = piece_priority_levels(
+                    &snapshot.files,
+                    &snapshot.file_priorities,
+                    snapshot.piece_length,
+                    verified.len(),
+                );
                 let mut assignments = if let Some(stream_priority) = stream_priority.as_ref() {
                     let peer_hints = self.peer_scheduling_hints(id, &connected)?;
-                    assign_streaming_pieces(
+                    assign_streaming_pieces_with_priorities(
                         &verified,
                         &availability,
                         &snapshot.files,
@@ -3192,14 +3593,23 @@ impl TorrentSession {
                         stream_priority,
                         &peer_hints,
                         snapshot.sequential_download,
+                        &piece_priorities,
                     )?
                 } else if snapshot.sequential_download {
-                    assign_sequential_pieces(&verified, &availability)?
+                    assign_prioritized_sequential_pieces(
+                        &verified,
+                        &availability,
+                        &piece_priorities,
+                    )?
                 } else {
-                    assign_rarest_pieces(&verified, &availability)?
+                    assign_prioritized_rarest_pieces(&verified, &availability, &piece_priorities)?
                 };
                 let assigned_before_limit = assignments.iter().map(Vec::len).sum::<usize>();
-                limit_piece_assignments(&mut assignments, MAX_PIECES_PER_PEER_ROUND);
+                let round_piece_limit = peer_round_piece_limit(
+                    verified.iter().any(|piece| *piece),
+                    stream_priority.is_some(),
+                );
+                limit_piece_assignments(&mut assignments, round_piece_limit);
                 let assigned_after_limit = assignments.iter().map(Vec::len).sum::<usize>();
                 if assigned_after_limit < assigned_before_limit {
                     self.log(
@@ -3235,7 +3645,11 @@ impl TorrentSession {
                         );
                     }
                     if received < peer_batch.len() {
-                        match connect_receiver.recv_timeout(Duration::from_millis(900)) {
+                        let remaining = batch_deadline.saturating_duration_since(Instant::now());
+                        if remaining.is_zero() {
+                            break;
+                        }
+                        match connect_receiver.recv_timeout(remaining) {
                             Ok((peer, result, elapsed)) => {
                                 received += 1;
                                 let connected_before = connected.len();
@@ -3274,38 +3688,70 @@ impl TorrentSession {
                     );
                     break;
                 }
+                self.set_downloading_pieces(id, assignments.iter().flatten().copied().collect())?;
 
+                let startup_probe_round = !verified.iter().any(|piece| *piece);
                 let mut idle = Vec::new();
+                let (download_sender, download_receiver) = std::sync::mpsc::channel();
                 let mut download_workers = Vec::new();
+                let round_progress_observed = Arc::new(AtomicBool::new(false));
+                let round_finished = Arc::new(AtomicBool::new(false));
+                let mut round_cancellations = Vec::new();
                 for (mut connected_peer, wanted) in connected.into_iter().zip(assignments) {
                     if wanted.is_empty() {
                         idle.push(connected_peer);
                         continue;
                     }
-                    let label = format!("{}:{}", connected_peer.peer.address, connected_peer.peer.port);
+                    let label = format!(
+                        "{}:{}",
+                        connected_peer.peer.address, connected_peer.peer.port
+                    );
+                    let sender = download_sender.clone();
+                    let round_cancelled = Arc::new(AtomicBool::new(false));
+                    round_cancellations.push(Arc::clone(&round_cancelled));
+                    let worker_round_progress = Arc::clone(&round_progress_observed);
                     let worker = std::thread::spawn(move || {
                         let started = Instant::now();
-                        let result = connected_peer.connection.download_pieces(&wanted);
-                        (connected_peer, result, started.elapsed())
+                        let result = connected_peer.connection.download_pieces_with_round_cancel(
+                            &wanted,
+                            Arc::clone(&round_cancelled),
+                        );
+                        if !result.pieces.is_empty() {
+                            worker_round_progress.store(true, Ordering::Release);
+                        }
+                        let was_round_cancelled = round_cancelled.load(Ordering::Acquire);
+                        let _ = sender.send((
+                            connected_peer,
+                            result,
+                            started.elapsed(),
+                            was_round_cancelled,
+                        ));
                     });
                     download_workers.push((label, worker));
                 }
+                drop(download_sender);
+
+                let straggler_grace = if startup_probe_round {
+                    PEER_STARTUP_STRAGGLER_GRACE
+                } else {
+                    PEER_STEADY_ROUND_STRAGGLER_GRACE
+                };
+                let straggler_guard = spawn_peer_round_straggler_guard(
+                    Arc::clone(&round_progress_observed),
+                    Arc::clone(&round_finished),
+                    Arc::clone(&snapshot.cancelled),
+                    round_cancellations.clone(),
+                    straggler_grace,
+                );
 
                 let mut round_progress = 0usize;
                 let mut peer_failed = false;
                 let mut advertised_dht_nodes = Vec::new();
-                for (label, worker) in download_workers {
-                    let (mut connected_peer, result, download_elapsed) = match worker.join() {
-                        Ok(value) => value,
-                        Err(_) => {
-                            peer_failed = true;
-                            errors.push(format!("{label}: peer download worker panicked"));
-                            continue;
-                        }
-                    };
+                for (mut connected_peer, result, download_elapsed, was_round_cancelled) in
+                    download_receiver
+                {
                     if let Some(dht_port) = connected_peer.connection.take_remote_dht_port() {
-                        advertised_dht_nodes
-                            .push((connected_peer.peer.address.clone(), dht_port));
+                        advertised_dht_nodes.push((connected_peer.peer.address.clone(), dht_port));
                     }
                     let pex_peers = connected_peer.connection.take_pex_peers();
                     pex_candidates_added += self.merge_pex_discovered_peers(
@@ -3317,6 +3763,7 @@ impl TorrentSession {
                     let peer = &connected_peer.peer;
                     let mut contributed_bytes = 0u64;
                     let mut contributed_pieces = 0usize;
+                    let mut newly_verified_indices = Vec::new();
                     for downloaded in result.pieces {
                         let index = downloaded.index as usize;
                         if verified.get(index).copied().unwrap_or(false) {
@@ -3326,6 +3773,7 @@ impl TorrentSession {
                         verified[index] = true;
                         contributed_bytes += downloaded.bytes.len() as u64;
                         contributed_pieces += 1;
+                        newly_verified_indices.push(downloaded.index);
                     }
                     if contributed_pieces > 0 && !first_piece_logged {
                         first_piece_logged = true;
@@ -3340,25 +3788,37 @@ impl TorrentSession {
                         );
                     }
                     round_progress += contributed_pieces;
+                    let scheduler_preempted = was_round_cancelled
+                        && result.error.as_deref() == Some("peer download cancelled");
+                    let reported_error = if scheduler_preempted {
+                        None
+                    } else {
+                        result.error.as_deref()
+                    };
                     self.mark_peer_piece_progress(
                         id,
                         &peer.address,
                         peer.port,
                         contributed_bytes,
                         contributed_pieces,
+                        &newly_verified_indices,
                         &verified,
                         snapshot.total_length,
                         snapshot.piece_length,
                         result.unavailable.len(),
                         Some(download_elapsed),
-                        result.error.as_deref(),
+                        reported_error,
                     )?;
-                    let download_rate = transfer_rate_bytes_per_second(contributed_bytes, download_elapsed);
+                    let download_rate =
+                        transfer_rate_bytes_per_second(contributed_bytes, download_elapsed);
+                    let request_pipeline_depth = connected_peer.connection.request_pipeline_depth();
+                    let remote_request_queue_limit =
+                        connected_peer.connection.remote_request_queue_limit();
                     self.log(
                         LogLevel::Info,
                         "peer",
                         format!(
-                            "{}:{} contributed {} verified pieces ({} bytes at {download_rate} B/s, {} unavailable); {} pieces remain",
+                            "{}:{} contributed {} verified pieces ({} bytes at {download_rate} B/s, request queue {request_pipeline_depth}/{remote_request_queue_limit}, {} unavailable); {} pieces remain",
                             peer.address,
                             peer.port,
                             contributed_pieces,
@@ -3368,12 +3828,17 @@ impl TorrentSession {
                         ),
                         Some(snapshot.id),
                     );
-                    if let Some(err) = result.error {
+                    if scheduler_preempted {
+                        idle.push(connected_peer);
+                    } else if let Some(err) = result.error {
                         peer_failed = true;
                         self.log(
                             LogLevel::Warn,
                             "peer",
-                            format!("{}:{} stopped after partial progress: {err}", peer.address, peer.port),
+                            format!(
+                                "{}:{} stopped after partial progress: {err}",
+                                peer.address, peer.port
+                            ),
                             Some(snapshot.id),
                         );
                         errors.push(format!("{}:{}: {err}", peer.address, peer.port));
@@ -3381,6 +3846,26 @@ impl TorrentSession {
                         idle.push(connected_peer);
                     }
                 }
+                round_finished.store(true, Ordering::Release);
+                if straggler_guard.join().unwrap_or(false) {
+                    self.log(
+                        LogLevel::Debug,
+                        "peer",
+                        if startup_probe_round {
+                            "released startup round after verified progress instead of waiting for stalled probe peers"
+                        } else {
+                            "preempted slower peer assignments after faster peers completed; rescheduling retained connections"
+                        },
+                        Some(snapshot.id),
+                    );
+                }
+                for (label, worker) in download_workers {
+                    if worker.join().is_err() {
+                        peer_failed = true;
+                        errors.push(format!("{label}: peer download worker panicked"));
+                    }
+                }
+                self.set_downloading_pieces(id, HashSet::new())?;
                 pending_dht_nodes.extend(advertised_dht_nodes);
                 connected = idle;
                 if round_progress == 0 && !peer_failed {
@@ -3414,7 +3899,9 @@ impl TorrentSession {
                 "peer",
                 format!(
                     "swarm download verified all {} pieces and wrote {} files ({} bytes)",
-                    verified.len(), summary.files_written, summary.bytes_written
+                    verified.len(),
+                    summary.files_written,
+                    summary.bytes_written
                 ),
                 Some(snapshot.id),
             );
@@ -3458,11 +3945,12 @@ impl TorrentSession {
         }
 
         let missing = verified.iter().filter(|piece| !**piece).count();
-        let coverage_detail = if last_coverage.connected_peers > 0 || last_coverage.missing_pieces > 0 {
-            format!("; {}", format_swarm_coverage(last_coverage))
-        } else {
-            String::new()
-        };
+        let coverage_detail =
+            if last_coverage.connected_peers > 0 || last_coverage.missing_pieces > 0 {
+                format!("; {}", format_swarm_coverage(last_coverage))
+            } else {
+                String::new()
+            };
         let detail = if errors.is_empty() {
             format!("swarm is missing {missing} pieces{coverage_detail}")
         } else {
@@ -3471,11 +3959,7 @@ impl TorrentSession {
                 errors.join("; ")
             )
         };
-        self.set_torrent_state(
-            id,
-            TorrentState::Error,
-            Some(detail.clone()),
-        )?;
+        self.set_torrent_state(id, TorrentState::Error, Some(detail.clone()))?;
         if !pending_dht_nodes.is_empty() {
             self.verify_peer_dht_nodes(pending_dht_nodes, snapshot.id);
         }
@@ -3526,7 +4010,12 @@ impl TorrentSession {
             return Err("torrent metadata is not available yet".to_string());
         }
 
-        self.log(LogLevel::Info, "storage", "rechecking stored torrent data", Some(snapshot.id));
+        self.log(
+            LogLevel::Info,
+            "storage",
+            "rechecking stored torrent data",
+            Some(snapshot.id),
+        );
         match storage::verify_stored_torrent(
             &snapshot.output_folder,
             &snapshot.name,
@@ -3535,8 +4024,11 @@ impl TorrentSession {
             &snapshot.piece_hashes,
         ) {
             Ok(check) => {
-                let file_progress =
-                    storage::file_progress_from_pieces(&snapshot.files, snapshot.piece_length, &check.pieces)?;
+                let file_progress = storage::file_progress_from_pieces(
+                    &snapshot.files,
+                    snapshot.piece_length,
+                    &check.pieces,
+                )?;
                 let mut torrents = self.torrents.lock().map_err(|_| "torrent lock poisoned")?;
                 let torrent = torrents
                     .iter_mut()
@@ -3546,6 +4038,7 @@ impl TorrentSession {
                 torrent.stats.file_progress = file_progress;
                 torrent.stats.finished = check.complete;
                 torrent.general.downloaded = check.bytes_verified;
+                torrent.live_verified_pieces = Some(check.pieces.clone());
                 torrent.stats.state = if check.complete {
                     completed_torrent_state(torrent)
                 } else {
@@ -3567,118 +4060,15 @@ impl TorrentSession {
             }
             Err(err) => {
                 self.set_torrent_state(id, TorrentState::MissingFiles, Some(err.clone()))?;
-                self.log(LogLevel::Warn, "storage", format!("recheck failed: {err}"), Some(snapshot.id));
+                self.log(
+                    LogLevel::Warn,
+                    "storage",
+                    format!("recheck failed: {err}"),
+                    Some(snapshot.id),
+                );
                 Err(err)
             }
         }
-    }
-
-    pub fn hash_torrent_file(&self, id: &str, file_index: usize) -> Result<TorrentFileHash, String> {
-        let (torrent_id, torrent_name, output_folder, files, file, finished) = {
-            let torrents = self.torrents.lock().map_err(|_| "torrent lock poisoned")?;
-            let torrent = torrents
-                .iter()
-                .find(|torrent| torrent.matches_id(id))
-                .ok_or_else(|| format!("torrent not found: {id}"))?;
-            let file = torrent
-                .files
-                .get(file_index)
-                .cloned()
-                .ok_or_else(|| format!("torrent file index is out of range: {file_index}"))?;
-            (
-                torrent.id,
-                torrent.name.clone(),
-                torrent.output_folder.clone(),
-                torrent.files.clone(),
-                file,
-                torrent.stats.finished,
-            )
-        };
-        if !finished {
-            return Err("file reputation lookup requires a completed, verified torrent".to_string());
-        }
-        if !file.included {
-            return Err("unchecked torrent files are not available for hashing".to_string());
-        }
-
-        let multi_file = files.len() > 1
-            || files
-                .first()
-                .is_some_and(|candidate| candidate.components.len() > 1);
-        let path = storage::output_path_for_file(
-            &output_folder,
-            &torrent_name,
-            &file,
-            multi_file,
-        )?;
-        let link_metadata = fs::symlink_metadata(&path)
-            .map_err(|err| format!("could not inspect torrent file for hashing: {err}"))?;
-        if link_metadata.file_type().is_symlink() || !link_metadata.file_type().is_file() {
-            return Err("torrent reputation checks require a regular, non-symlink file".to_string());
-        }
-        let canonical_root = fs::canonicalize(&output_folder)
-            .map_err(|err| format!("could not resolve torrent output folder: {err}"))?;
-        let canonical_path = fs::canonicalize(&path)
-            .map_err(|err| format!("could not resolve torrent file: {err}"))?;
-        if !canonical_path.starts_with(&canonical_root) {
-            return Err("torrent file resolves outside its output folder".to_string());
-        }
-        if link_metadata.len() != file.length {
-            return Err(format!(
-                "torrent file length changed: expected {}, found {}",
-                file.length,
-                link_metadata.len()
-            ));
-        }
-
-        self.log(
-            LogLevel::Info,
-            "security",
-            format!("computing local SHA-256 for '{}'", file.name),
-            Some(torrent_id),
-        );
-        let mut input = fs::File::open(&canonical_path)
-            .map_err(|err| format!("could not open torrent file for hashing: {err}"))?;
-        let mut hasher = sha256::Sha256::new();
-        let mut buffer = [0u8; 64 * 1024];
-        let mut bytes_read = 0u64;
-        loop {
-            let length = input
-                .read(&mut buffer)
-                .map_err(|err| format!("could not read torrent file for hashing: {err}"))?;
-            if length == 0 {
-                break;
-            }
-            bytes_read = bytes_read
-                .checked_add(length as u64)
-                .ok_or_else(|| "torrent file hash byte count overflowed".to_string())?;
-            hasher.update(&buffer[..length]);
-        }
-        if bytes_read != file.length {
-            return Err(format!(
-                "torrent file changed while hashing: expected {}, read {bytes_read}",
-                file.length
-            ));
-        }
-        let sha256 = sha256::hex(&hasher.finalize());
-        let virustotal_url = format!("https://www.virustotal.com/gui/file/{sha256}");
-        self.log(
-            LogLevel::Info,
-            "security",
-            format!(
-                "computed SHA-256 {} for '{}'; no file bytes were uploaded",
-                sha256, file.name
-            ),
-            Some(torrent_id),
-        );
-        Ok(TorrentFileHash {
-            file_index,
-            name: file.name,
-            path: canonical_path.to_string_lossy().into_owned(),
-            size: bytes_read,
-            sha256,
-            virustotal_url,
-        })
     }
 
     pub fn stream_file_availability(
@@ -3686,7 +4076,16 @@ impl TorrentSession {
         id: &str,
         file_index: usize,
     ) -> Result<TorrentFileAvailability, String> {
-        let (torrent_id, torrent_name, output_folder, files, file, info_hash, piece_length, piece_hashes, finished) = {
+        let (
+            output_folder,
+            files,
+            file,
+            info_hash,
+            piece_length,
+            piece_hashes,
+            finished,
+            live_verified,
+        ) = {
             let torrents = self.torrents.lock().map_err(|_| "torrent lock poisoned")?;
             let torrent = torrents
                 .iter()
@@ -3698,8 +4097,6 @@ impl TorrentSession {
                 .cloned()
                 .ok_or_else(|| format!("torrent file index is out of range: {file_index}"))?;
             (
-                torrent.id,
-                torrent.name.clone(),
                 torrent.output_folder.clone(),
                 torrent.files.clone(),
                 file,
@@ -3707,6 +4104,7 @@ impl TorrentSession {
                 torrent.general.piece_size,
                 torrent.piece_hashes.clone(),
                 torrent.stats.finished,
+                torrent.live_verified_pieces.clone(),
             )
         };
         if files.is_empty() || piece_hashes.is_empty() {
@@ -3736,45 +4134,34 @@ impl TorrentSession {
             });
         }
 
-        let store_key = sha1::hex(&info_hash);
-        let partial_store = storage::PartialPieceStore::open_existing(
-            &output_folder,
-            &store_key,
-            storage::total_file_length(&files)?,
-            piece_length,
-            &piece_hashes,
-        )?;
-        let pieces = partial_store
-            .as_ref()
-            .map(|store| store.verified_pieces().to_vec())
-            .unwrap_or_else(|| vec![false; piece_hashes.len()]);
-        let ranges = storage::verified_file_ranges_from_pieces(
-            &files,
-            file_index,
-            piece_length,
-            &pieces,
-        )?;
+        let mut partial_store_present = live_verified.is_some();
+        let pieces = if let Some(pieces) = live_verified {
+            pieces
+        } else {
+            let store_key = sha1::hex(&info_hash);
+            let partial_store = storage::PartialPieceStore::open_existing(
+                &output_folder,
+                &store_key,
+                storage::total_file_length(&files)?,
+                piece_length,
+                &piece_hashes,
+            )?;
+            partial_store_present = partial_store.is_some();
+            partial_store
+                .as_ref()
+                .map(|store| store.verified_pieces().to_vec())
+                .unwrap_or_else(|| vec![false; piece_hashes.len()])
+        };
+        let ranges =
+            storage::verified_file_ranges_from_pieces(&files, file_index, piece_length, &pieces)?;
         let verified_bytes = ranges.iter().map(|range| range.length).sum::<u64>();
-        self.log(
-            LogLevel::Debug,
-            "stream",
-            format!(
-                "file availability for '{}' in '{}': {} verified bytes across {} range(s)",
-                file.name,
-                torrent_name,
-                verified_bytes,
-                ranges.len()
-            ),
-            Some(torrent_id),
-        );
-
         Ok(TorrentFileAvailability {
             file_index,
             name: file.name,
             length: file.length,
             verified_bytes,
             complete: verified_bytes == file.length,
-            partial_store_present: partial_store.is_some(),
+            partial_store_present,
             ranges,
         })
     }
@@ -3801,6 +4188,7 @@ impl TorrentSession {
             piece_length,
             piece_hashes,
             finished,
+            live_verified,
         ) = {
             let torrents = self.torrents.lock().map_err(|_| "torrent lock poisoned")?;
             let torrent = torrents
@@ -3822,6 +4210,7 @@ impl TorrentSession {
                 torrent.general.piece_size,
                 torrent.piece_hashes.clone(),
                 torrent.stats.finished,
+                torrent.live_verified_pieces.clone(),
             )
         };
         if files.is_empty() || piece_hashes.is_empty() {
@@ -3838,15 +4227,12 @@ impl TorrentSession {
         }
 
         let bytes = if finished {
-            let multi_file = files.len() > 1
-                || files
-                    .first()
-                    .is_some_and(|candidate| candidate.components.len() > 1);
+            let wrap_in_torrent_folder = storage::requires_torrent_name_folder(&files);
             let path = storage::output_path_for_file(
                 &output_folder,
                 &torrent_name,
                 &file,
-                multi_file,
+                wrap_in_torrent_folder,
             )?;
             let link_metadata = fs::symlink_metadata(&path)
                 .map_err(|err| format!("could not inspect torrent stream file: {err}"))?;
@@ -3881,15 +4267,29 @@ impl TorrentSession {
             bytes
         } else {
             let store_key = sha1::hex(&info_hash);
-            let mut partial_store = storage::PartialPieceStore::open_existing(
-                &output_folder,
-                &store_key,
-                storage::total_file_length(&files)?,
-                piece_length,
-                &piece_hashes,
-            )?
-            .ok_or_else(|| "stream data is not buffered yet".to_string())?;
-            partial_store.read_verified_file_range(&files, file_index, offset, length)?
+            if let Some(verified) = live_verified {
+                storage::read_verified_partial_file_range(
+                    &output_folder,
+                    &store_key,
+                    storage::total_file_length(&files)?,
+                    &files,
+                    file_index,
+                    piece_length,
+                    &verified,
+                    offset,
+                    length,
+                )?
+            } else {
+                let mut partial_store = storage::PartialPieceStore::open_existing(
+                    &output_folder,
+                    &store_key,
+                    storage::total_file_length(&files)?,
+                    piece_length,
+                    &piece_hashes,
+                )?
+                .ok_or_else(|| "stream data is not buffered yet".to_string())?;
+                partial_store.read_verified_file_range(&files, file_index, offset, length)?
+            }
         };
 
         self.log(
@@ -3953,6 +4353,46 @@ impl TorrentSession {
         } else {
             request.playhead_offset.min(file_length - 1)
         };
+        let supplemental_file_indices = match request.supplemental_file_indices {
+            Some(indices) => {
+                let mut unique = Vec::new();
+                let mut total_length = 0u64;
+                for file_index in indices {
+                    if unique.contains(&file_index) || file_index == request.file_index {
+                        continue;
+                    }
+                    if unique.len() >= MAX_SUPPLEMENTAL_STREAM_FILES {
+                        return Err(format!(
+                            "at most {MAX_SUPPLEMENTAL_STREAM_FILES} supplemental stream files are allowed"
+                        ));
+                    }
+                    let supplemental = torrent.files.get(file_index).ok_or_else(|| {
+                        format!("supplemental torrent file index is out of range: {file_index}")
+                    })?;
+                    if !supplemental.included {
+                        return Err(
+                            "unchecked torrent files cannot receive stream priority".to_string()
+                        );
+                    }
+                    total_length = total_length
+                        .checked_add(supplemental.length)
+                        .ok_or_else(|| "supplemental stream size overflow".to_string())?;
+                    if total_length > MAX_SUPPLEMENTAL_STREAM_BYTES {
+                        return Err(format!(
+                            "supplemental stream files exceed the {MAX_SUPPLEMENTAL_STREAM_BYTES} byte limit"
+                        ));
+                    }
+                    unique.push(file_index);
+                }
+                unique
+            }
+            None => torrent
+                .stream_priority
+                .as_ref()
+                .filter(|priority| priority.file_index == request.file_index)
+                .map(|priority| priority.supplemental_file_indices.clone())
+                .unwrap_or_default(),
+        };
         let state = StreamPriorityState {
             file_index: request.file_index,
             playhead_offset,
@@ -3964,6 +4404,7 @@ impl TorrentSession {
                 request.lookahead_bytes,
                 DEFAULT_STREAM_LOOKAHEAD_BYTES,
             ),
+            supplemental_file_indices,
             updated_at_ms: timestamp_ms(),
         };
         let plan = stream_priority_piece_plan(&torrent.files, torrent.general.piece_size, &state)?;
@@ -3982,7 +4423,10 @@ impl TorrentSession {
                 "stream",
                 format!(
                     "prioritizing '{}' at byte {} ({} urgent piece(s), {} lookahead piece(s))",
-                    status.name, status.playhead_offset, status.urgent_pieces, status.lookahead_pieces
+                    status.name,
+                    status.playhead_offset,
+                    status.urgent_pieces,
+                    status.lookahead_pieces
                 ),
                 Some(torrent.id),
             );
@@ -4115,7 +4559,10 @@ impl TorrentSession {
             self.log(
                 LogLevel::Info,
                 "metadata",
-                format!("using {} existing peers before metadata fetch", snapshot.peers.len()),
+                format!(
+                    "using {} existing peers before metadata fetch",
+                    snapshot.peers.len()
+                ),
                 Some(snapshot.id),
             );
         }
@@ -4175,12 +4622,20 @@ impl TorrentSession {
             seeds,
             self.dht_node_id,
             snapshot.info_hash,
-            DhtLookupOptions { timeout, max_queries },
+            DhtLookupOptions {
+                timeout,
+                max_queries,
+            },
         ) {
             Ok(result) => result,
             Err(err) => {
                 self.set_torrent_state(id, TorrentState::DhtError, Some(err.clone()))?;
-                self.log(LogLevel::Warn, "dht", format!("DHT lookup failed: {err}"), Some(snapshot.id));
+                self.log(
+                    LogLevel::Warn,
+                    "dht",
+                    format!("DHT lookup failed: {err}"),
+                    Some(snapshot.id),
+                );
                 return Err(err);
             }
         };
@@ -4205,9 +4660,29 @@ impl TorrentSession {
             torrent.stats.state = if torrent.stats.finished {
                 completed_torrent_state(torrent)
             } else if torrent.piece_hashes.is_empty() {
-                TorrentState::Metadata
-            } else {
+                if matches!(
+                    torrent.stats.state,
+                    TorrentState::Discovering
+                        | TorrentState::Dht
+                        | TorrentState::DhtError
+                        | TorrentState::Queued
+                        | TorrentState::Metadata
+                ) {
+                    TorrentState::Metadata
+                } else {
+                    torrent.stats.state
+                }
+            } else if matches!(
+                torrent.stats.state,
+                TorrentState::Discovering
+                    | TorrentState::Dht
+                    | TorrentState::DhtError
+                    | TorrentState::Queued
+                    | TorrentState::Metadata
+            ) {
                 TorrentState::Queued
+            } else {
+                torrent.stats.state
             };
             torrent.stats.error = None;
         }
@@ -4239,7 +4714,11 @@ impl TorrentSession {
             if torrent.options.paused || !torrent.stats.finished {
                 return Ok(0);
             }
-            (torrent.id, torrent.info_hash, torrent.dht_announce_targets.clone())
+            (
+                torrent.id,
+                torrent.info_hash,
+                torrent.dht_announce_targets.clone(),
+            )
         };
         if targets.is_empty() {
             return Ok(0);
@@ -4262,11 +4741,18 @@ impl TorrentSession {
                 timeout,
             ) {
                 Ok(_) => announced += 1,
-                Err(err) => errors.push(format!("{}:{}: {err}", target.contact.address, target.contact.port)),
+                Err(err) => errors.push(format!(
+                    "{}:{}: {err}",
+                    target.contact.address, target.contact.port
+                )),
             }
         }
         self.log(
-            if announced > 0 { LogLevel::Info } else { LogLevel::Warn },
+            if announced > 0 {
+                LogLevel::Info
+            } else {
+                LogLevel::Warn
+            },
             "dht",
             format!(
                 "announce_peer finished: advertised to {announced}/{} token-issuing nodes",
@@ -4278,7 +4764,10 @@ impl TorrentSession {
             self.log(LogLevel::Debug, "dht", error.clone(), Some(torrent_id));
         }
         if announced == 0 {
-            return Err(format!("all DHT announce_peer queries failed: {}", errors.join("; ")));
+            return Err(format!(
+                "all DHT announce_peer queries failed: {}",
+                errors.join("; ")
+            ));
         }
         Ok(announced)
     }
@@ -4315,7 +4804,9 @@ impl TorrentSession {
                 "metadata fetch skipped: announce trackers or query DHT first to discover peers",
                 Some(snapshot.id),
             );
-            return Err("torrent has no discovered peers; announce trackers or query DHT first".to_string());
+            return Err(
+                "torrent has no discovered peers; announce trackers or query DHT first".to_string(),
+            );
         }
 
         self.set_torrent_state(id, TorrentState::FetchingMetadata, None)?;
@@ -4325,8 +4816,7 @@ impl TorrentSession {
             format!(
                 "trying {} discovered peers for metadata in batches of up to {}",
                 snapshot.peers.len(),
-                snapshot.peers.len()
-                    .min(MAX_PARALLEL_METADATA_PEERS)
+                snapshot.peers.len().min(MAX_PARALLEL_METADATA_PEERS)
             ),
             Some(snapshot.id),
         );
@@ -4340,7 +4830,9 @@ impl TorrentSession {
                 let info_hash = snapshot.info_hash;
                 let private = snapshot.private;
                 let peer_id = peer_id_for(snapshot.id);
-                let dht_port = (!private).then(|| self.dht_port()).filter(|port| *port != 0);
+                let dht_port = (!private)
+                    .then(|| self.dht_port())
+                    .filter(|port| *port != 0);
                 std::thread::spawn(move || {
                     let result = peerwire::fetch_metadata_from_peer(
                         &peer.address,
@@ -4357,9 +4849,9 @@ impl TorrentSession {
             drop(sender);
 
             for _ in 0..peer_batch.len() {
-                let (peer, result) = receiver
-                    .recv()
-                    .map_err(|_| "metadata workers stopped before reporting a result".to_string())?;
+                let (peer, result) = receiver.recv().map_err(|_| {
+                    "metadata workers stopped before reporting a result".to_string()
+                })?;
                 match result {
                     Ok(result) => {
                         if let Some(client) =
@@ -4372,7 +4864,12 @@ impl TorrentSession {
                                 Some(snapshot.id),
                             );
                         }
-                        let meta = Metainfo::from_info_bytes(&result.info_bytes, None, Vec::new(), Vec::new())?;
+                        let meta = Metainfo::from_info_bytes(
+                            &result.info_bytes,
+                            None,
+                            Vec::new(),
+                            Vec::new(),
+                        )?;
                         if !meta.private {
                             if let Some(dht_port) = result.remote_dht_port {
                                 if let Err(err) =
@@ -4391,7 +4888,13 @@ impl TorrentSession {
                             }
                         }
                         self.apply_fetched_metadata(id, meta)?;
-                        self.set_peer_connection(id, &peer.address, peer.port, "Metadata received", None)?;
+                        self.set_peer_connection(
+                            id,
+                            &peer.address,
+                            peer.port,
+                            "Metadata received",
+                            None,
+                        )?;
                         self.log(
                             LogLevel::Info,
                             "metadata",
@@ -4407,7 +4910,13 @@ impl TorrentSession {
                         return Ok(EmptyJsonResponse {});
                     }
                     Err(err) => {
-                        self.set_peer_connection(id, &peer.address, peer.port, "Error", Some(err.clone()))?;
+                        self.set_peer_connection(
+                            id,
+                            &peer.address,
+                            peer.port,
+                            "Error",
+                            Some(err.clone()),
+                        )?;
                         self.log(
                             LogLevel::Warn,
                             "metadata",
@@ -4425,7 +4934,8 @@ impl TorrentSession {
             TorrentState::MetadataError,
             Some("all discovered peers failed to provide metadata".to_string()),
         )?;
-        Err(last_error.unwrap_or_else(|| "all discovered peers failed to provide metadata".to_string()))
+        Err(last_error
+            .unwrap_or_else(|| "all discovered peers failed to provide metadata".to_string()))
     }
 
     pub fn delete(&self, id: &str, delete_files: bool) -> Result<EmptyJsonResponse, String> {
@@ -4508,24 +5018,77 @@ impl TorrentSession {
             Err(err) => self.log(
                 LogLevel::Error,
                 "storage",
-                format!("file deletion failed after {} ms: {err}", started.elapsed().as_millis()),
+                format!(
+                    "file deletion failed after {} ms: {err}",
+                    started.elapsed().as_millis()
+                ),
                 Some(cleanup.id),
             ),
         }
     }
 
-    pub fn update_files(&self, id: &str, only_files: Vec<usize>) -> Result<EmptyJsonResponse, String> {
-        self.update_task(id, |torrent| {
+    pub fn update_files(
+        &self,
+        id: &str,
+        only_files: Vec<usize>,
+    ) -> Result<EmptyJsonResponse, String> {
+        {
+            let mut torrents = self.torrents.lock().map_err(|_| "torrent lock poisoned")?;
+            let torrent = torrents
+                .iter_mut()
+                .find(|torrent| torrent.matches_id(id))
+                .ok_or_else(|| format!("torrent not found: {id}"))?;
             for (index, file) in torrent.files.iter_mut().enumerate() {
                 file.included = only_files.contains(&index);
             }
-            torrent.stats.file_progress = torrent
-                .files
-                .iter()
-                .map(|file| if file.included { 0 } else { file.length })
-                .collect();
-        })?;
+            if let Some(verified) = torrent.live_verified_pieces.as_ref() {
+                torrent.stats.file_progress = storage::file_progress_from_pieces(
+                    &torrent.files,
+                    torrent.general.piece_size,
+                    verified,
+                )?;
+            }
+        }
         self.persist_session_or_log(id.parse().ok());
+        Ok(EmptyJsonResponse {})
+    }
+
+    pub fn update_file_priority(
+        &self,
+        id: &str,
+        file_index: usize,
+        priority: u8,
+    ) -> Result<EmptyJsonResponse, String> {
+        if !(1..=3).contains(&priority) {
+            return Err("file priority must be Normal, High, or Maximum".to_string());
+        }
+        let torrent_id = {
+            let mut torrents = self.torrents.lock().map_err(|_| "torrent lock poisoned")?;
+            let torrent = torrents
+                .iter_mut()
+                .find(|torrent| torrent.matches_id(id))
+                .ok_or_else(|| format!("torrent not found: {id}"))?;
+            let file = torrent
+                .files
+                .get(file_index)
+                .ok_or_else(|| format!("file index {file_index} is out of range"))?;
+            if !file.included {
+                return Err("select this file before changing its download priority".to_string());
+            }
+            torrent.file_priorities = normalize_file_priorities(
+                std::mem::take(&mut torrent.file_priorities),
+                torrent.files.len(),
+            );
+            torrent.file_priorities[file_index] = priority;
+            torrent.id
+        };
+        self.log(
+            LogLevel::Info,
+            "priority",
+            format!("file {file_index} download priority changed to {priority}"),
+            Some(torrent_id),
+        );
+        self.persist_session_or_log(Some(torrent_id));
         Ok(EmptyJsonResponse {})
     }
 
@@ -4573,11 +5136,18 @@ impl TorrentSession {
     }
 
     pub fn logs(&self, torrent_id: Option<u64>) -> Vec<LogEntry> {
+        self.logs_after(torrent_id, None)
+    }
+
+    pub fn logs_after(&self, torrent_id: Option<u64>, after_id: Option<u64>) -> Vec<LogEntry> {
         self.logs
             .lock()
             .map(|logs| {
                 logs.iter()
-                    .filter(|entry| torrent_id.is_none() || entry.torrent_id == torrent_id)
+                    .filter(|entry| {
+                        (torrent_id.is_none() || entry.torrent_id == torrent_id)
+                            && after_id.map_or(true, |id| entry.id > id)
+                    })
                     .cloned()
                     .collect()
             })
@@ -4635,10 +5205,15 @@ impl TorrentSession {
     }
 
     fn restore_session(&self) {
-        if !self.session_file_path.is_file() {
+        let backup_path = state_backup_path(&self.session_file_path);
+        let session_path = if self.session_file_path.is_file() {
+            &self.session_file_path
+        } else if backup_path.is_file() {
+            &backup_path
+        } else {
             return;
-        }
-        let bytes = match fs::read(&self.session_file_path) {
+        };
+        let bytes = match fs::read(session_path) {
             Ok(bytes) => bytes,
             Err(err) => {
                 self.log(
@@ -4656,7 +5231,10 @@ impl TorrentSession {
                 self.log(
                     LogLevel::Warn,
                     "session",
-                    format!("persisted session version {} is not supported", manifest.version),
+                    format!(
+                        "persisted session version {} is not supported",
+                        manifest.version
+                    ),
                     None,
                 );
                 return;
@@ -4675,11 +5253,18 @@ impl TorrentSession {
         let mut restored = Vec::new();
         let mut highest_id = 0u64;
         for persisted in manifest.torrents {
-            if persisted.id == 0 || restored.iter().any(|torrent: &TorrentTask| torrent.id == persisted.id) {
+            if persisted.id == 0
+                || restored
+                    .iter()
+                    .any(|torrent: &TorrentTask| torrent.id == persisted.id)
+            {
                 self.log(
                     LogLevel::Warn,
                     "session",
-                    format!("skipped persisted torrent with invalid or duplicate ID {}", persisted.id),
+                    format!(
+                        "skipped persisted torrent with invalid or duplicate ID {}",
+                        persisted.id
+                    ),
                     None,
                 );
                 continue;
@@ -4718,6 +5303,8 @@ impl TorrentSession {
                 Ok(mut task) => {
                     apply_runtime_options(&mut task, &runtime_options);
                     task.completed_at_ms = persisted.completed_at_ms;
+                    task.file_priorities =
+                        normalize_file_priorities(persisted.file_priorities, task.files.len());
                     highest_id = highest_id.max(task.id);
                     restored.push(task);
                 }
@@ -4745,6 +5332,10 @@ impl TorrentSession {
     }
 
     fn persist_session(&self) -> Result<(), String> {
+        let _write_guard = self
+            .session_state_write
+            .lock()
+            .map_err(|_| "session state write lock poisoned".to_string())?;
         let manifest = {
             let torrents = self.torrents.lock().map_err(|_| "torrent lock poisoned")?;
             PersistedSession {
@@ -4770,7 +5361,7 @@ impl TorrentSession {
                         PersistedTorrent {
                             id: torrent.id,
                             source: torrent.source.clone(),
-                            destination: torrent.output_folder.to_string_lossy().into_owned(),
+                            destination: torrent.destination_root.to_string_lossy().into_owned(),
                             paused: torrent.options.paused,
                             overwrite: torrent.options.overwrite,
                             disable_trackers: torrent.options.disable_trackers,
@@ -4782,6 +5373,7 @@ impl TorrentSession {
                             sequential_download: torrent.options.sequential_download,
                             seed_ratio_limit: torrent.options.seed_ratio_limit,
                             completed_at_ms: torrent.completed_at_ms,
+                            file_priorities: torrent.file_priorities.clone(),
                         }
                     })
                     .collect(),
@@ -4793,16 +5385,7 @@ impl TorrentSession {
         }
         let bytes = serde_json::to_vec_pretty(&manifest)
             .map_err(|err| format!("could not encode persisted session: {err}"))?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&self.session_file_path)
-            .map_err(|err| format!("could not open persisted session: {err}"))?;
-        file.write_all(&bytes)
-            .map_err(|err| format!("could not write persisted session: {err}"))?;
-        file.sync_all()
-            .map_err(|err| format!("could not flush persisted session: {err}"))
+        write_state_file_atomic(&self.session_file_path, &bytes, "persisted session")
     }
 
     fn persist_session_or_log(&self, torrent_id: Option<u64>) {
@@ -4811,13 +5394,19 @@ impl TorrentSession {
         }
     }
 
-    fn build_task(&self, request: AddTorrentRequest, id: Option<u64>) -> Result<TorrentTask, String> {
-        let output_folder = request
+    fn build_task(
+        &self,
+        request: AddTorrentRequest,
+        id: Option<u64>,
+    ) -> Result<TorrentTask, String> {
+        let destination_root = request
             .destination
             .as_deref()
             .filter(|value| !value.trim().is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| self.default_output_dir.clone());
+        let output_folder =
+            output_folder_with_subfolder(&destination_root, request.sub_folder.as_deref())?;
         let options = TorrentOptions {
             paused: request.paused,
             overwrite: request.overwrite,
@@ -4834,6 +5423,7 @@ impl TorrentSession {
             TorrentSource::File(path) => self.task_from_file(
                 id.unwrap_or(0),
                 path,
+                destination_root,
                 output_folder,
                 options,
                 request.only_files.as_deref(),
@@ -4842,6 +5432,7 @@ impl TorrentSession {
             TorrentSource::Magnet(link) => self.task_from_magnet(
                 id.unwrap_or(0),
                 link,
+                destination_root,
                 output_folder,
                 options,
                 request.source.clone(),
@@ -4853,6 +5444,7 @@ impl TorrentSession {
         &self,
         id: u64,
         path: &str,
+        destination_root: PathBuf,
         output_folder: PathBuf,
         options: TorrentOptions,
         only_files: Option<&[usize]>,
@@ -4921,11 +5513,13 @@ impl TorrentSession {
         let upload_gate = peerwire::UploadGate::new(upload_slot_limit(options.max_connections));
         let download_limiter = peerwire::BandwidthLimiter::new(options.max_download_speed);
         let upload_limiter = peerwire::BandwidthLimiter::new(options.max_upload_speed);
+        let file_priorities = vec![1; files.len()];
         Ok(TorrentTask {
             id,
             source,
             info_hash: meta.info_hash,
             name: meta.name,
+            destination_root,
             output_folder,
             files,
             trackers,
@@ -4935,25 +5529,29 @@ impl TorrentSession {
             stats,
             general,
             options,
-                cancelled,
-                tracker_started: false,
-                dht_announce_targets: Vec::new(),
-                tracker_completed: false,
-                next_announce_at_ms: None,
+            cancelled,
+            tracker_started: false,
+            dht_announce_targets: Vec::new(),
+            tracker_completed: false,
+            next_announce_at_ms: None,
             added_at_ms: timestamp_ms(),
             completed_at_ms: None,
             upload_gate,
-                download_limiter,
-                upload_limiter,
-                peer_health: HashMap::new(),
-                stream_priority: None,
-            })
+            download_limiter,
+            upload_limiter,
+            peer_health: HashMap::new(),
+            stream_priority: None,
+            live_verified_pieces: None,
+            file_priorities,
+            downloading_pieces: HashSet::new(),
+        })
     }
 
     fn task_from_magnet(
         &self,
         id: u64,
         link: &str,
+        destination_root: PathBuf,
         output_folder: PathBuf,
         options: TorrentOptions,
         source: TorrentSource,
@@ -5025,6 +5623,7 @@ impl TorrentSession {
             source,
             info_hash: magnet.info_hash,
             name,
+            destination_root,
             output_folder,
             files: Vec::new(),
             trackers,
@@ -5046,6 +5645,9 @@ impl TorrentSession {
             upload_limiter,
             peer_health: HashMap::new(),
             stream_priority: None,
+            live_verified_pieces: None,
+            file_priorities: Vec::new(),
+            downloading_pieces: HashSet::new(),
         })
     }
 
@@ -5091,7 +5693,12 @@ impl TorrentSession {
             update(torrent);
             torrent.id
         };
-        self.log(LogLevel::Info, "session", "updated torrent state", Some(torrent_id));
+        self.log(
+            LogLevel::Info,
+            "session",
+            "updated torrent state",
+            Some(torrent_id),
+        );
         self.persist_session_or_log(Some(torrent_id));
         Ok(())
     }
@@ -5130,6 +5737,9 @@ impl TorrentSession {
             .ok_or_else(|| format!("torrent not found: {id}"))?;
         torrent.stats.state = state;
         torrent.stats.error = error;
+        if state != TorrentState::Downloading {
+            torrent.downloading_pieces.clear();
+        }
         Ok(())
     }
 
@@ -5280,6 +5890,17 @@ impl TorrentSession {
         torrent.stats.state = TorrentState::Resuming;
         torrent.stats.error = None;
         torrent.general.downloaded = progress_bytes;
+        torrent.live_verified_pieces = Some(verified.to_vec());
+        Ok(())
+    }
+
+    fn set_downloading_pieces(&self, id: &str, pieces: HashSet<u32>) -> Result<(), String> {
+        let mut torrents = self.torrents.lock().map_err(|_| "torrent lock poisoned")?;
+        let torrent = torrents
+            .iter_mut()
+            .find(|torrent| torrent.matches_id(id))
+            .ok_or_else(|| format!("torrent not found: {id}"))?;
+        torrent.downloading_pieces = pieces;
         Ok(())
     }
 
@@ -5290,6 +5911,7 @@ impl TorrentSession {
         port: u16,
         contributed_bytes: u64,
         contributed_pieces: usize,
+        newly_verified_indices: &[u32],
         verified: &[bool],
         total_length: u64,
         piece_length: u64,
@@ -5303,9 +5925,10 @@ impl TorrentSession {
             .find(|torrent| torrent.matches_id(id))
             .ok_or_else(|| format!("torrent not found: {id}"))?;
         let progress_bytes = verified_piece_bytes(total_length, piece_length, verified)?;
-        let file_progress = storage::file_progress_from_pieces(&torrent.files, piece_length, verified)?;
-        let transfer_rate =
-            download_elapsed.map(|elapsed| transfer_rate_bytes_per_second(contributed_bytes, elapsed));
+        let file_progress =
+            storage::file_progress_from_pieces(&torrent.files, piece_length, verified)?;
+        let transfer_rate = download_elapsed
+            .map(|elapsed| transfer_rate_bytes_per_second(contributed_bytes, elapsed));
         let displayed_download_speed = transfer_rate.unwrap_or(contributed_bytes);
         if let Some(peer) = torrent
             .peers
@@ -5335,10 +5958,8 @@ impl TorrentSession {
                 health.consecutive_failures = 0;
                 health.last_success_ms = Some(timestamp_ms());
                 if let Some(rate) = transfer_rate {
-                    health.recent_bytes_per_second = smooth_transfer_rate(
-                        health.recent_bytes_per_second,
-                        rate,
-                    );
+                    health.recent_bytes_per_second =
+                        smooth_transfer_rate(health.recent_bytes_per_second, rate);
                 }
             }
             if unavailable_pieces > 0 {
@@ -5358,9 +5979,22 @@ impl TorrentSession {
         torrent.stats.file_progress = file_progress;
         if let Some(live) = torrent.stats.live.as_mut() {
             live.download_speed = displayed_download_speed;
-            live.time_remaining = None;
+            let remaining_bytes = total_length.saturating_sub(progress_bytes);
+            live.time_remaining = (displayed_download_speed > 0)
+                .then(|| remaining_bytes.div_ceil(displayed_download_speed));
         }
         torrent.general.downloaded = progress_bytes;
+        let live_verified = torrent
+            .live_verified_pieces
+            .get_or_insert_with(|| vec![false; verified.len()]);
+        if live_verified.len() != verified.len() {
+            *live_verified = vec![false; verified.len()];
+        }
+        for piece_index in newly_verified_indices {
+            if let Some(piece) = live_verified.get_mut(*piece_index as usize) {
+                *piece = true;
+            }
+        }
         Ok(())
     }
 
@@ -5384,6 +6018,8 @@ impl TorrentSession {
             live.time_remaining = Some(0);
         }
         torrent.general.downloaded = torrent.stats.total_bytes;
+        torrent.live_verified_pieces = Some(vec![true; torrent.piece_hashes.len()]);
+        torrent.downloading_pieces.clear();
         update_completed_torrent_state(torrent);
         Ok(())
     }
@@ -5401,6 +6037,9 @@ impl TorrentSession {
         torrent.name = meta.name;
         torrent.files = meta.files;
         torrent.piece_hashes = meta.pieces;
+        torrent.live_verified_pieces = None;
+        torrent.file_priorities = vec![1; torrent.files.len()];
+        torrent.downloading_pieces.clear();
         torrent.web_seeds = webseed::initial_statuses(&meta.web_seeds);
         torrent.stats.state = if torrent.options.paused {
             TorrentState::Paused
@@ -5426,6 +6065,41 @@ impl TorrentSession {
 }
 
 impl TorrentTask {
+    fn summary(&self) -> TorrentSummary {
+        let live = self.stats.live.clone().unwrap_or(LiveStats {
+            download_speed: 0,
+            upload_speed: 0,
+            time_remaining: None,
+        });
+        let mut playable_file_count = 0;
+        let mut first_playable_file_index = None;
+        for (index, file) in self.files.iter().enumerate() {
+            if file.included && is_playable_media_name(&file.name) {
+                playable_file_count += 1;
+                first_playable_file_index.get_or_insert(index);
+            }
+        }
+        TorrentSummary {
+            id: Some(self.id).filter(|id| *id != 0),
+            info_hash: sha1::hex(&self.info_hash),
+            name: Some(self.name.clone()),
+            output_folder: self.output_folder.to_string_lossy().into_owned(),
+            stats: TorrentSummaryStats {
+                state: self.stats.state,
+                error: self.stats.error.clone(),
+                progress_bytes: self.stats.progress_bytes,
+                uploaded_bytes: self.stats.uploaded_bytes,
+                total_bytes: self.stats.total_bytes,
+                finished: self.stats.finished,
+                live,
+            },
+            peer_count: self.peers.len(),
+            file_count: self.files.len(),
+            playable_file_count,
+            first_playable_file_index,
+        }
+    }
+
     fn details(&self) -> TorrentDetails {
         let mut stats = self.stats.clone();
         stats.live = stats.live.or(Some(LiveStats {
@@ -5440,6 +6114,28 @@ impl TorrentTask {
             .completed_at_ms
             .map(|completed_at_ms| ((now.saturating_sub(completed_at_ms)) / 1_000) as u64)
             .unwrap_or_default();
+        let mut piece_states = self
+            .live_verified_pieces
+            .as_ref()
+            .filter(|pieces| pieces.len() == self.piece_hashes.len())
+            .map(|pieces| {
+                pieces
+                    .iter()
+                    .map(|verified| if *verified { 2 } else { 0 })
+                    .collect()
+            })
+            .unwrap_or_else(|| {
+                vec![if self.stats.finished { 2 } else { 0 }; self.piece_hashes.len()]
+            });
+        if self.stats.state == TorrentState::Downloading {
+            for piece_index in &self.downloading_pieces {
+                if let Some(state) = piece_states.get_mut(*piece_index as usize) {
+                    if *state == 0 {
+                        *state = 1;
+                    }
+                }
+            }
+        }
 
         TorrentDetails {
             id: Some(self.id).filter(|id| *id != 0),
@@ -5453,6 +6149,11 @@ impl TorrentTask {
             web_seeds: self.web_seeds.clone(),
             peers: self.peers.clone(),
             options: self.options.clone(),
+            file_priorities: normalize_file_priorities(
+                self.file_priorities.clone(),
+                self.files.len(),
+            ),
+            piece_states,
         }
     }
 
@@ -5552,6 +6253,14 @@ fn assign_rarest_pieces(
     verified: &[bool],
     peer_availability: &[Vec<bool>],
 ) -> Result<Vec<Vec<u32>>, String> {
+    assign_prioritized_rarest_pieces(verified, peer_availability, &[])
+}
+
+fn assign_prioritized_rarest_pieces(
+    verified: &[bool],
+    peer_availability: &[Vec<bool>],
+    piece_priorities: &[u8],
+) -> Result<Vec<Vec<u32>>, String> {
     let mut assignments = vec![Vec::new(); peer_availability.len()];
     let mut missing = verified
         .iter()
@@ -5562,18 +6271,22 @@ fn assign_rarest_pieces(
                 .iter()
                 .filter(|availability| availability.get(piece_index).copied().unwrap_or(false))
                 .count();
-            (rarity > 0).then_some((piece_index, rarity))
+            (rarity > 0).then_some((
+                piece_index,
+                rarity,
+                piece_priorities.get(piece_index).copied().unwrap_or(1),
+            ))
         })
         .collect::<Vec<_>>();
-    missing.sort_by_key(|(piece_index, rarity)| (*rarity, *piece_index));
+    missing.sort_by_key(|(piece_index, rarity, priority)| {
+        (std::cmp::Reverse(*priority), *rarity, *piece_index)
+    });
 
-    for (piece_index, _) in missing {
+    for (piece_index, _, _) in missing {
         let Some(peer_index) = peer_availability
             .iter()
             .enumerate()
-            .filter(|(_, availability)| {
-                availability.get(piece_index).copied().unwrap_or(false)
-            })
+            .filter(|(_, availability)| availability.get(piece_index).copied().unwrap_or(false))
             .min_by_key(|(peer_index, _)| (assignments[*peer_index].len(), *peer_index))
             .map(|(peer_index, _)| peer_index)
         else {
@@ -5590,17 +6303,32 @@ fn assign_sequential_pieces(
     verified: &[bool],
     peer_availability: &[Vec<bool>],
 ) -> Result<Vec<Vec<u32>>, String> {
+    assign_prioritized_sequential_pieces(verified, peer_availability, &[])
+}
+
+fn assign_prioritized_sequential_pieces(
+    verified: &[bool],
+    peer_availability: &[Vec<bool>],
+    piece_priorities: &[u8],
+) -> Result<Vec<Vec<u32>>, String> {
     let mut assignments = vec![Vec::new(); peer_availability.len()];
-    for (piece_index, complete) in verified.iter().enumerate() {
-        if *complete {
-            continue;
-        }
+    let mut missing = verified
+        .iter()
+        .enumerate()
+        .filter(|(_, complete)| !**complete)
+        .map(|(piece_index, _)| {
+            (
+                piece_index,
+                piece_priorities.get(piece_index).copied().unwrap_or(1),
+            )
+        })
+        .collect::<Vec<_>>();
+    missing.sort_by_key(|(piece_index, priority)| (std::cmp::Reverse(*priority), *piece_index));
+    for (piece_index, _) in missing {
         let Some(peer_index) = peer_availability
             .iter()
             .enumerate()
-            .filter(|(_, availability)| {
-                availability.get(piece_index).copied().unwrap_or(false)
-            })
+            .filter(|(_, availability)| availability.get(piece_index).copied().unwrap_or(false))
             .min_by_key(|(peer_index, _)| (assignments[*peer_index].len(), *peer_index))
             .map(|(peer_index, _)| peer_index)
         else {
@@ -5662,6 +6390,28 @@ fn assign_streaming_pieces(
     peer_hints: &[PeerSchedulingHint],
     fallback_sequential: bool,
 ) -> Result<Vec<Vec<u32>>, String> {
+    assign_streaming_pieces_with_priorities(
+        verified,
+        peer_availability,
+        files,
+        piece_length,
+        priority,
+        peer_hints,
+        fallback_sequential,
+        &[],
+    )
+}
+
+fn assign_streaming_pieces_with_priorities(
+    verified: &[bool],
+    peer_availability: &[Vec<bool>],
+    files: &[TorrentFile],
+    piece_length: u64,
+    priority: &StreamPriorityState,
+    peer_hints: &[PeerSchedulingHint],
+    fallback_sequential: bool,
+    piece_priorities: &[u8],
+) -> Result<Vec<Vec<u32>>, String> {
     let mut assignments = vec![Vec::new(); peer_availability.len()];
     let mut assigned = HashSet::<usize>::new();
     let plan = stream_priority_piece_plan(files, piece_length, priority)?;
@@ -5693,18 +6443,66 @@ fn assign_streaming_pieces(
                 .iter()
                 .filter(|availability| availability.get(piece_index).copied().unwrap_or(false))
                 .count();
-            (rarity > 0).then_some((piece_index, rarity))
+            (rarity > 0).then_some((
+                piece_index,
+                rarity,
+                piece_priorities.get(piece_index).copied().unwrap_or(1),
+            ))
         })
         .collect::<Vec<_>>();
     if fallback_sequential {
-        remaining.sort_by_key(|(piece_index, _)| *piece_index);
+        remaining
+            .sort_by_key(|(piece_index, _, priority)| (std::cmp::Reverse(*priority), *piece_index));
     } else {
-        remaining.sort_by_key(|(piece_index, rarity)| (*rarity, *piece_index));
+        remaining.sort_by_key(|(piece_index, rarity, priority)| {
+            (std::cmp::Reverse(*priority), *rarity, *piece_index)
+        });
     }
-    for (piece_index, _) in remaining {
+    for (piece_index, _, _) in remaining {
         let _ = assign_piece_to_best_peer(&mut assignments, peer_availability, piece_index)?;
     }
     Ok(assignments)
+}
+
+fn normalize_file_priorities(mut priorities: Vec<u8>, file_count: usize) -> Vec<u8> {
+    priorities.resize(file_count, 1);
+    priorities.truncate(file_count);
+    for priority in &mut priorities {
+        if !(1..=3).contains(priority) {
+            *priority = 1;
+        }
+    }
+    priorities
+}
+
+fn piece_priority_levels(
+    files: &[TorrentFile],
+    file_priorities: &[u8],
+    piece_length: u64,
+    piece_count: usize,
+) -> Vec<u8> {
+    let mut levels = vec![1; piece_count];
+    if piece_length == 0 {
+        return levels;
+    }
+    let mut file_offset = 0u64;
+    for (file_index, file) in files.iter().enumerate() {
+        if file.length > 0 {
+            let priority = file_priorities
+                .get(file_index)
+                .copied()
+                .unwrap_or(1)
+                .clamp(1, 3);
+            let first = (file_offset / piece_length) as usize;
+            let last =
+                (file_offset.saturating_add(file.length).saturating_sub(1) / piece_length) as usize;
+            for level in levels.iter_mut().take(last.saturating_add(1)).skip(first) {
+                *level = (*level).max(priority);
+            }
+        }
+        file_offset = file_offset.saturating_add(file.length);
+    }
+    levels
 }
 
 fn assign_piece_to_best_peer(
@@ -5721,9 +6519,8 @@ fn assign_piece_to_best_peer(
     else {
         return Ok(false);
     };
-    assignments[peer_index].push(
-        u32::try_from(piece_index).map_err(|_| "torrent has too many pieces".to_string())?,
-    );
+    assignments[peer_index]
+        .push(u32::try_from(piece_index).map_err(|_| "torrent has too many pieces".to_string())?);
     Ok(true)
 }
 
@@ -5756,9 +6553,8 @@ fn assign_piece_to_best_stream_peer(
     else {
         return Ok(false);
     };
-    assignments[peer_index].push(
-        u32::try_from(piece_index).map_err(|_| "torrent has too many pieces".to_string())?,
-    );
+    assignments[peer_index]
+        .push(u32::try_from(piece_index).map_err(|_| "torrent has too many pieces".to_string())?);
     Ok(true)
 }
 
@@ -5770,9 +6566,12 @@ fn stream_priority_piece_plan(
     if piece_length == 0 {
         return Err("piece length cannot be zero".to_string());
     }
-    let file = files
-        .get(priority.file_index)
-        .ok_or_else(|| format!("torrent file index is out of range: {}", priority.file_index))?;
+    let file = files.get(priority.file_index).ok_or_else(|| {
+        format!(
+            "torrent file index is out of range: {}",
+            priority.file_index
+        )
+    })?;
     if file.length == 0 {
         return Ok(StreamPiecePriorityPlan {
             urgent: Vec::new(),
@@ -5804,7 +6603,13 @@ fn stream_priority_piece_plan(
 
     let mut urgent = Vec::new();
     let mut urgent_seen = HashSet::new();
-    push_piece_range(&mut urgent, &mut urgent_seen, playhead, urgent_end, piece_length)?;
+    push_piece_range(
+        &mut urgent,
+        &mut urgent_seen,
+        playhead,
+        urgent_end,
+        piece_length,
+    )?;
     push_piece_range(
         &mut urgent,
         &mut urgent_seen,
@@ -5819,6 +6624,32 @@ fn stream_priority_piece_plan(
         file_end,
         piece_length,
     )?;
+    for file_index in &priority.supplemental_file_indices {
+        let supplemental = files.get(*file_index).ok_or_else(|| {
+            format!("supplemental torrent file index is out of range: {file_index}")
+        })?;
+        if supplemental.length == 0 {
+            continue;
+        }
+        let supplemental_start = files
+            .iter()
+            .take(*file_index)
+            .try_fold(0u64, |total, file| {
+                total
+                    .checked_add(file.length)
+                    .ok_or_else(|| "file offset overflow".to_string())
+            })?;
+        let supplemental_end = supplemental_start
+            .checked_add(supplemental.length)
+            .ok_or_else(|| "file offset overflow".to_string())?;
+        push_piece_range(
+            &mut urgent,
+            &mut urgent_seen,
+            supplemental_start,
+            supplemental_end,
+            piece_length,
+        )?;
+    }
 
     let mut lookahead = Vec::new();
     let mut lookahead_seen = urgent_seen;
@@ -5869,19 +6700,89 @@ fn limit_piece_assignments(assignments: &mut [Vec<u32>], max_per_peer: usize) {
     }
 }
 
+fn peer_round_piece_limit(has_verified_pieces: bool, streaming: bool) -> usize {
+    if !has_verified_pieces {
+        1
+    } else if streaming {
+        2
+    } else {
+        MAX_PIECES_PER_PEER_ROUND
+    }
+}
+
+fn spawn_peer_round_straggler_guard(
+    progress_observed: Arc<AtomicBool>,
+    round_finished: Arc<AtomicBool>,
+    torrent_cancelled: Arc<AtomicBool>,
+    cancellations: Vec<Arc<AtomicBool>>,
+    grace: Duration,
+) -> std::thread::JoinHandle<bool> {
+    std::thread::spawn(move || {
+        while !progress_observed.load(Ordering::Acquire) && !round_finished.load(Ordering::Acquire)
+        {
+            if torrent_cancelled.load(Ordering::Acquire) {
+                cancel_peer_rounds(cancellations);
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if !progress_observed.load(Ordering::Acquire) {
+            return false;
+        }
+        let deadline = Instant::now() + grace;
+        while Instant::now() < deadline {
+            if round_finished.load(Ordering::Acquire) {
+                return false;
+            }
+            if torrent_cancelled.load(Ordering::Acquire) {
+                cancel_peer_rounds(cancellations);
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        cancel_peer_rounds(cancellations);
+        true
+    })
+}
+
+fn cancel_peer_rounds(cancellations: Vec<Arc<AtomicBool>>) {
+    for cancellation in cancellations {
+        cancellation.store(true, Ordering::Release);
+    }
+}
+
+fn output_folder_with_subfolder(
+    destination_root: &Path,
+    sub_folder: Option<&str>,
+) -> Result<PathBuf, String> {
+    let Some(sub_folder) = sub_folder.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(destination_root.to_path_buf());
+    };
+    if sub_folder == "."
+        || sub_folder == ".."
+        || sub_folder
+            .chars()
+            .any(|ch| matches!(ch, '/' | '\\' | ':' | '\0'))
+    {
+        return Err("subfolder must be a single safe folder name".to_string());
+    }
+    Ok(destination_root.join(sub_folder))
+}
+
 fn delete_torrent_payload_files(
     output_root: &Path,
     torrent_name: &str,
     files: &[TorrentFile],
     info_hash: [u8; 20],
 ) -> Result<(usize, u64), String> {
-    let multi_file = files.len() > 1 || files.first().is_some_and(|file| file.components.len() > 1);
+    let wrap_in_torrent_folder = storage::requires_torrent_name_folder(files);
     let mut deleted_files = 0usize;
     let mut deleted_bytes = 0u64;
     let mut candidate_dirs = HashSet::<PathBuf>::new();
 
     for file in files {
-        let path = storage::output_path_for_file(output_root, torrent_name, file, multi_file)?;
+        let path =
+            storage::output_path_for_file(output_root, torrent_name, file, wrap_in_torrent_folder)?;
         if let Some(parent) = path.parent() {
             candidate_dirs.insert(parent.to_path_buf());
         }
@@ -5889,7 +6790,10 @@ fn delete_torrent_payload_files(
             Ok(metadata) if metadata.is_file() => {
                 deleted_bytes = deleted_bytes.saturating_add(metadata.len());
                 fs::remove_file(&path).map_err(|err| {
-                    format!("could not delete torrent file {}: {err}", path.to_string_lossy())
+                    format!(
+                        "could not delete torrent file {}: {err}",
+                        path.to_string_lossy()
+                    )
                 })?;
                 deleted_files += 1;
             }
@@ -5914,7 +6818,10 @@ fn delete_torrent_payload_files(
             Ok(metadata) if metadata.is_file() => {
                 deleted_bytes = deleted_bytes.saturating_add(metadata.len());
                 fs::remove_file(&path).map_err(|err| {
-                    format!("could not delete partial store file {}: {err}", path.to_string_lossy())
+                    format!(
+                        "could not delete partial store file {}: {err}",
+                        path.to_string_lossy()
+                    )
                 })?;
                 deleted_files += 1;
             }
@@ -5929,7 +6836,7 @@ fn delete_torrent_payload_files(
         }
     }
     candidate_dirs.insert(store_dir);
-    if multi_file {
+    if wrap_in_torrent_folder {
         candidate_dirs.insert(output_root.join(torrent_name));
     }
 
@@ -5976,9 +6883,10 @@ fn validate_runtime_options(
     };
     options.max_download_speed = validate_rate_limit(options.max_download_speed, "download")?;
     options.max_upload_speed = validate_rate_limit(options.max_upload_speed, "upload")?;
-    if options.seed_ratio_limit.is_some_and(|limit| {
-        !limit.is_finite() || !(0.0..=1_000.0).contains(&limit)
-    }) {
+    if options
+        .seed_ratio_limit
+        .is_some_and(|limit| !limit.is_finite() || !(0.0..=1_000.0).contains(&limit))
+    {
         return Err("seed ratio limit must be between 0 and 1000".to_string());
     }
     Ok(options)
@@ -5990,17 +6898,14 @@ fn validate_rate_limit(limit: Option<u64>, direction: &str) -> Result<Option<u64
         Some(limit) if limit < MIN_RATE_LIMIT => Err(format!(
             "{direction} rate limit must be at least 1 KiB/s, or 0 for unlimited"
         )),
-        Some(limit) if limit > MAX_RATE_LIMIT => Err(format!(
-            "{direction} rate limit cannot exceed 10 GiB/s"
-        )),
+        Some(limit) if limit > MAX_RATE_LIMIT => {
+            Err(format!("{direction} rate limit cannot exceed 10 GiB/s"))
+        }
         value => Ok(value),
     }
 }
 
-fn apply_runtime_options(
-    torrent: &mut TorrentTask,
-    options: &UpdateTorrentOptionsRequest,
-) {
+fn apply_runtime_options(torrent: &mut TorrentTask, options: &UpdateTorrentOptionsRequest) {
     torrent.options.max_connections = options.max_connections;
     torrent.options.max_download_speed = options.max_download_speed;
     torrent.options.max_upload_speed = options.max_upload_speed;
@@ -6135,7 +7040,9 @@ fn verified_seed_block(
         .get(piece_index)
         .ok_or_else(|| format!("seed piece index is out of range: {piece_index}"))?;
     if sha1::digest(&piece) != *expected_hash {
-        return Err(format!("stored seed piece {piece_index} failed SHA-1 verification"));
+        return Err(format!(
+            "stored seed piece {piece_index} failed SHA-1 verification"
+        ));
     }
     let start = usize::try_from(relative_start)
         .map_err(|_| "seed block offset is too large for this platform".to_string())?;
@@ -6250,6 +7157,58 @@ fn update_tracker_status(status: &mut TrackerStatus, response: &TrackerAnnounceR
     status.message = response.warning.clone();
 }
 
+fn apply_late_tracker_result(
+    torrents: &Arc<Mutex<Vec<TorrentTask>>>,
+    torrent_id: u64,
+    event: UdpAnnounceEvent,
+    url: &str,
+    result: Result<TrackerAnnounceResponse, String>,
+) {
+    let Ok(mut torrents) = torrents.lock() else {
+        return;
+    };
+    let Some(torrent) = torrents.iter_mut().find(|torrent| torrent.id == torrent_id) else {
+        return;
+    };
+    let Some(status_index) = torrent
+        .trackers
+        .iter()
+        .position(|tracker| tracker.url == url)
+    else {
+        return;
+    };
+    match result {
+        Ok(response) => {
+            update_tracker_status(&mut torrent.trackers[status_index], &response);
+            merge_peers(&mut torrent.peers, response.peers);
+            match event {
+                UdpAnnounceEvent::Started => torrent.tracker_started = true,
+                UdpAnnounceEvent::Completed => torrent.tracker_completed = true,
+                UdpAnnounceEvent::Stopped => {
+                    torrent.tracker_started = false;
+                    torrent.tracker_completed = false;
+                }
+                UdpAnnounceEvent::None => {}
+            }
+            if !matches!(event, UdpAnnounceEvent::Stopped) {
+                let next = timestamp_ms()
+                    .saturating_add(response.interval_seconds.saturating_mul(1_000) as u128);
+                torrent.next_announce_at_ms = Some(
+                    torrent
+                        .next_announce_at_ms
+                        .map(|current| current.min(next))
+                        .unwrap_or(next),
+                );
+            }
+        }
+        Err(error) => {
+            let status = &mut torrent.trackers[status_index];
+            status.state = "Error".to_string();
+            status.message = Some(error);
+        }
+    }
+}
+
 struct PeerSchedule {
     peers: Vec<PeerInfo>,
     candidate_peers: usize,
@@ -6257,7 +7216,7 @@ struct PeerSchedule {
     deferred_for_duplicate_ip: usize,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct DiscoveryOutcome {
     tracker_error: Option<String>,
     dht_error: Option<String>,
@@ -6291,25 +7250,30 @@ fn schedule_peers_for_download(torrent: &TorrentTask, max_connections: usize) ->
     }
     ready.sort_by(|left, right| {
         let left_health = torrent.peer_health.get(&peer_key(&left.address, left.port));
-        let right_health = torrent.peer_health.get(&peer_key(&right.address, right.port));
+        let right_health = torrent
+            .peer_health
+            .get(&peer_key(&right.address, right.port));
         peer_success_score(right_health)
             .cmp(&peer_success_score(left_health))
             .then_with(|| peer_rate_score(right_health).cmp(&peer_rate_score(left_health)))
             .then_with(|| peer_piece_score(right_health).cmp(&peer_piece_score(left_health)))
             .then_with(|| peer_byte_score(right_health).cmp(&peer_byte_score(left_health)))
             .then_with(|| peer_failure_count(left_health).cmp(&peer_failure_count(right_health)))
-            .then_with(|| peer_unavailable_count(left_health).cmp(&peer_unavailable_count(right_health)))
+            .then_with(|| {
+                peer_unavailable_count(left_health).cmp(&peer_unavailable_count(right_health))
+            })
             .then_with(|| peer_attempt_count(left_health).cmp(&peer_attempt_count(right_health)))
             .then_with(|| left.address.cmp(&right.address))
             .then_with(|| left.port.cmp(&right.port))
     });
     backed_off.sort_by(|left, right| {
-        let left_until = peer_backoff_until_ms(
-            torrent.peer_health.get(&peer_key(&left.address, left.port)),
-        )
-        .unwrap_or_default();
+        let left_until =
+            peer_backoff_until_ms(torrent.peer_health.get(&peer_key(&left.address, left.port)))
+                .unwrap_or_default();
         let right_until = peer_backoff_until_ms(
-            torrent.peer_health.get(&peer_key(&right.address, right.port)),
+            torrent
+                .peer_health
+                .get(&peer_key(&right.address, right.port)),
         )
         .unwrap_or_default();
         left_until
@@ -6415,9 +7379,7 @@ fn peer_backoff_duration_ms(consecutive_failures: u32) -> u128 {
 fn peer_backoff_until_ms(health: Option<&PeerHealth>) -> Option<u128> {
     let health = health?;
     let last_failure = health.last_failure_ms?;
-    Some(last_failure.saturating_add(peer_backoff_duration_ms(
-        health.consecutive_failures,
-    )))
+    Some(last_failure.saturating_add(peer_backoff_duration_ms(health.consecutive_failures)))
 }
 
 fn peer_is_in_backoff(health: Option<&PeerHealth>, now: u128) -> bool {
@@ -6425,15 +7387,21 @@ fn peer_is_in_backoff(health: Option<&PeerHealth>, now: u128) -> bool {
 }
 
 fn peer_success_score(health: Option<&PeerHealth>) -> u128 {
-    health.and_then(|health| health.last_success_ms).unwrap_or_default()
+    health
+        .and_then(|health| health.last_success_ms)
+        .unwrap_or_default()
 }
 
 fn peer_piece_score(health: Option<&PeerHealth>) -> u64 {
-    health.map(|health| health.pieces_downloaded).unwrap_or_default()
+    health
+        .map(|health| health.pieces_downloaded)
+        .unwrap_or_default()
 }
 
 fn peer_byte_score(health: Option<&PeerHealth>) -> u64 {
-    health.map(|health| health.bytes_downloaded).unwrap_or_default()
+    health
+        .map(|health| health.bytes_downloaded)
+        .unwrap_or_default()
 }
 
 fn peer_rate_score(health: Option<&PeerHealth>) -> u64 {
@@ -6449,7 +7417,9 @@ fn peer_failure_count(health: Option<&PeerHealth>) -> u32 {
 }
 
 fn peer_unavailable_count(health: Option<&PeerHealth>) -> u64 {
-    health.map(|health| health.unavailable_pieces).unwrap_or_default()
+    health
+        .map(|health| health.unavailable_pieces)
+        .unwrap_or_default()
 }
 
 fn peer_attempt_count(health: Option<&PeerHealth>) -> u32 {
@@ -6474,6 +7444,18 @@ fn smooth_transfer_rate(previous: u64, current: u64) -> u64 {
     ((u128::from(previous) * 3) + u128::from(current))
         .saturating_div(4)
         .min(u128::from(u64::MAX)) as u64
+}
+
+fn is_playable_media_name(name: &str) -> bool {
+    Path::new(name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "mp4" | "m4v" | "mov" | "webm" | "mkv" | "ogv" | "avi"
+            )
+        })
 }
 
 fn merge_peers(existing: &mut Vec<PeerInfo>, next: Vec<PeerInfo>) {
@@ -6515,10 +7497,7 @@ fn pex_seed_candidates(peers: &[PeerInfo], remote: Option<SocketAddr>) -> Vec<Pe
     out
 }
 
-fn merge_dht_announce_targets(
-    existing: &mut Vec<DhtAnnounceTarget>,
-    next: Vec<DhtAnnounceTarget>,
-) {
+fn merge_dht_announce_targets(existing: &mut Vec<DhtAnnounceTarget>, next: Vec<DhtAnnounceTarget>) {
     for target in next {
         if let Some(current) = existing
             .iter_mut()
@@ -6539,18 +7518,68 @@ fn verified_piece_bytes(
     if piece_length == 0 {
         return Err("piece length cannot be zero".to_string());
     }
-    verified.iter().enumerate().try_fold(0u64, |total, (index, complete)| {
-        if !complete {
-            return Ok(total);
+    verified
+        .iter()
+        .enumerate()
+        .try_fold(0u64, |total, (index, complete)| {
+            if !complete {
+                return Ok(total);
+            }
+            let start = (index as u64)
+                .checked_mul(piece_length)
+                .ok_or_else(|| "piece offset overflow".to_string())?;
+            let length = total_length.saturating_sub(start).min(piece_length);
+            total
+                .checked_add(length)
+                .ok_or_else(|| "verified byte count overflow".to_string())
+        })
+}
+
+fn state_backup_path(path: &Path) -> PathBuf {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("state");
+    path.with_extension(format!("{extension}.bak"))
+}
+
+fn write_state_file_atomic(path: &Path, bytes: &[u8], label: &str) -> Result<(), String> {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("state");
+    let temporary = path.with_extension(format!("{extension}.tmp"));
+    let backup = state_backup_path(path);
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temporary)
+        .map_err(|err| format!("could not open temporary {label}: {err}"))?;
+    file.write_all(bytes)
+        .map_err(|err| format!("could not write temporary {label}: {err}"))?;
+    file.sync_all()
+        .map_err(|err| format!("could not flush temporary {label}: {err}"))?;
+    drop(file);
+
+    if path.is_file() {
+        if backup.exists() {
+            fs::remove_file(&backup)
+                .map_err(|err| format!("could not replace {label} backup: {err}"))?;
         }
-        let start = (index as u64)
-            .checked_mul(piece_length)
-            .ok_or_else(|| "piece offset overflow".to_string())?;
-        let length = total_length.saturating_sub(start).min(piece_length);
-        total
-            .checked_add(length)
-            .ok_or_else(|| "verified byte count overflow".to_string())
-    })
+        fs::rename(path, &backup)
+            .map_err(|err| format!("could not preserve previous {label}: {err}"))?;
+    }
+    if let Err(err) = fs::rename(&temporary, path) {
+        if backup.is_file() {
+            let _ = fs::rename(&backup, path);
+        }
+        return Err(format!("could not activate new {label}: {err}"));
+    }
+    if backup.is_file() {
+        let _ = fs::remove_file(backup);
+    }
+    Ok(())
 }
 
 fn peer_id_for(id: u64) -> [u8; 20] {
@@ -6600,6 +7629,45 @@ mod tests {
     };
 
     #[test]
+    fn outbound_connection_budget_blocks_until_capacity_returns() {
+        let session = Arc::new(TorrentSession::new(temp_dir("session-outbound-budget")));
+        let cancelled = AtomicBool::new(false);
+        let mut permits = (0..MAX_OUTBOUND_CONNECT_ATTEMPTS)
+            .map(|_| {
+                session
+                    .acquire_outbound_connect(&cancelled)
+                    .expect("budget slot is available")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            session.active_outbound_connects.load(Ordering::Acquire),
+            MAX_OUTBOUND_CONNECT_ATTEMPTS
+        );
+
+        let waiting_session = Arc::clone(&session);
+        let waiting_cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&waiting_cancelled);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            let permit = waiting_session
+                .acquire_outbound_connect(worker_cancelled.as_ref())
+                .expect("released budget slot is acquired");
+            sender.send(permit).expect("permit result sends");
+        });
+
+        assert!(receiver.recv_timeout(Duration::from_millis(40)).is_err());
+        drop(permits.pop());
+        let returned = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("waiter receives released capacity");
+        drop(returned);
+        drop(permits);
+        waiting_cancelled.store(true, Ordering::Release);
+        worker.join().expect("budget waiter exits");
+        assert_eq!(session.active_outbound_connects.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
     fn rarest_first_assignment_is_unique_and_balanced() {
         let assignments = assign_rarest_pieces(
             &[false, false, false, true],
@@ -6615,10 +7683,104 @@ mod tests {
     }
 
     #[test]
+    fn file_priority_promotes_later_pieces_without_defeating_rarity() {
+        let files = vec![
+            TorrentFile {
+                name: "first.bin".to_string(),
+                components: vec!["first.bin".to_string()],
+                length: 4,
+                included: true,
+            },
+            TorrentFile {
+                name: "important.bin".to_string(),
+                components: vec!["important.bin".to_string()],
+                length: 8,
+                included: true,
+            },
+        ];
+        let priorities = piece_priority_levels(&files, &[1, 3], 4, 3);
+        assert_eq!(priorities, vec![1, 3, 3]);
+        let assignments = assign_prioritized_rarest_pieces(
+            &[false, false, false],
+            &[vec![true, true, true]],
+            &priorities,
+        )
+        .expect("priority assignments build");
+        assert_eq!(assignments, vec![vec![1, 2, 0]]);
+    }
+
+    #[test]
+    fn file_priority_applies_to_boundary_pieces_shared_by_files() {
+        let files = vec![
+            TorrentFile {
+                name: "small.bin".to_string(),
+                components: vec!["small.bin".to_string()],
+                length: 3,
+                included: true,
+            },
+            TorrentFile {
+                name: "next.bin".to_string(),
+                components: vec!["next.bin".to_string()],
+                length: 3,
+                included: true,
+            },
+        ];
+        assert_eq!(piece_priority_levels(&files, &[1, 3], 4, 2), vec![3, 3]);
+    }
+
+    #[test]
     fn piece_assignment_rounds_are_bounded_per_peer() {
         let mut assignments = vec![vec![0, 3, 6, 9, 12], vec![1, 4], vec![2, 5, 8, 11]];
         limit_piece_assignments(&mut assignments, 3);
         assert_eq!(assignments, vec![vec![0, 3, 6], vec![1, 4], vec![2, 5, 8]]);
+    }
+
+    #[test]
+    fn startup_and_streaming_rounds_commit_progress_quickly() {
+        assert_eq!(peer_round_piece_limit(false, false), 1);
+        assert_eq!(peer_round_piece_limit(false, true), 1);
+        assert_eq!(peer_round_piece_limit(true, true), 2);
+        assert_eq!(
+            peer_round_piece_limit(true, false),
+            MAX_PIECES_PER_PEER_ROUND
+        );
+    }
+
+    #[test]
+    fn successful_startup_probe_releases_round_stragglers_after_grace() {
+        let probe_succeeded = Arc::new(AtomicBool::new(false));
+        let round_finished = Arc::new(AtomicBool::new(false));
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let guard = spawn_peer_round_straggler_guard(
+            Arc::clone(&probe_succeeded),
+            round_finished,
+            Arc::new(AtomicBool::new(false)),
+            vec![Arc::clone(&cancellation)],
+            Duration::from_millis(25),
+        );
+
+        probe_succeeded.store(true, Ordering::Release);
+
+        assert!(guard.join().expect("straggler guard exits"));
+        assert!(cancellation.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn torrent_cancellation_is_forwarded_to_startup_probe_workers() {
+        let torrent_cancelled = Arc::new(AtomicBool::new(false));
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let guard = spawn_peer_round_straggler_guard(
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::clone(&torrent_cancelled),
+            vec![Arc::clone(&cancellation)],
+            Duration::from_secs(1),
+        );
+
+        torrent_cancelled.store(true, Ordering::Release);
+
+        assert!(!guard.join().expect("straggler guard exits"));
+        assert!(cancellation.load(Ordering::Acquire));
     }
 
     #[test]
@@ -6658,6 +7820,14 @@ mod tests {
     }
 
     #[test]
+    fn playable_media_detection_is_case_insensitive_and_path_aware() {
+        assert!(is_playable_media_name("Season 1/Episode 03.MKV"));
+        assert!(is_playable_media_name("movie.webm"));
+        assert!(!is_playable_media_name("movie.srt"));
+        assert!(!is_playable_media_name("video-without-extension"));
+    }
+
+    #[test]
     fn stream_priority_assignment_targets_selected_file_and_seek_window() {
         let files = vec![
             TorrentFile {
@@ -6678,6 +7848,7 @@ mod tests {
             playhead_offset: 8,
             urgent_bytes: 4,
             lookahead_bytes: 4,
+            supplemental_file_indices: Vec::new(),
             updated_at_ms: 1,
         };
 
@@ -6693,6 +7864,14 @@ mod tests {
         .expect("stream assignments build");
 
         assert_eq!(&assignments[0][..3], &[3, 1, 4]);
+
+        let supplemental_priority = StreamPriorityState {
+            supplemental_file_indices: vec![0],
+            ..priority.clone()
+        };
+        let supplemental_plan = stream_priority_piece_plan(&files, 4, &supplemental_priority)
+            .expect("supplemental stream priority plan builds");
+        assert!(supplemental_plan.urgent.contains(&0));
 
         let assignments = assign_streaming_pieces(
             &[false, false, false, true, false],
@@ -6908,9 +8087,15 @@ mod tests {
         let data = vec![17u8; block_size * 3];
         let info_hash = [31u8; 20];
         let fast_listener = TcpListener::bind("127.0.0.1:0").expect("fast peer binds");
-        let fast_port = fast_listener.local_addr().expect("fast peer address").port();
+        let fast_port = fast_listener
+            .local_addr()
+            .expect("fast peer address")
+            .port();
         let slow_listener = TcpListener::bind("127.0.0.1:0").expect("slow peer binds");
-        let slow_port = slow_listener.local_addr().expect("slow peer address").port();
+        let slow_port = slow_listener
+            .local_addr()
+            .expect("slow peer address")
+            .port();
 
         let fast_data = data.clone();
         let fast_seed = thread::spawn(move || {
@@ -6937,7 +8122,9 @@ mod tests {
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .expect("slow peer read timeout sets");
             let mut handshake = [0u8; HANDSHAKE_LEN];
-            socket.read_exact(&mut handshake).expect("slow peer reads handshake");
+            socket
+                .read_exact(&mut handshake)
+                .expect("slow peer reads handshake");
             socket
                 .write_all(&peer::build_handshake(info_hash, [22u8; 20]))
                 .expect("slow peer writes handshake");
@@ -6979,18 +8166,11 @@ mod tests {
             piece_hashes: vec![sha1::digest(&data)],
             cancelled: None,
         };
-        let fast_connection = peerwire::connect_peer_for_download(
-            "127.0.0.1",
-            fast_port,
-            plan.clone(),
-        )
-        .expect("fast endgame peer connects");
-        let slow_connection = peerwire::connect_peer_for_download(
-            "127.0.0.1",
-            slow_port,
-            plan,
-        )
-        .expect("slow endgame peer connects");
+        let fast_connection =
+            peerwire::connect_peer_for_download("127.0.0.1", fast_port, plan.clone())
+                .expect("fast endgame peer connects");
+        let slow_connection = peerwire::connect_peer_for_download("127.0.0.1", slow_port, plan)
+            .expect("slow endgame peer connects");
         let result = race_endgame_piece(
             vec![
                 ConnectedPeer {
@@ -7030,7 +8210,10 @@ mod tests {
         assert!(result.cancelled.iter().any(|peer| peer.port == slow_port));
         assert_eq!(result.reusable.len(), 2);
         drop(result.reusable);
-        assert_eq!(fast_seed.join().expect("fast peer exits").bytes_uploaded, data.len() as u64);
+        assert_eq!(
+            fast_seed.join().expect("fast peer exits").bytes_uploaded,
+            data.len() as u64
+        );
         assert_eq!(
             slow_seed.join().expect("slow peer exits"),
             vec![
@@ -7072,9 +8255,15 @@ mod tests {
             .info_hash;
 
         let first_listener = TcpListener::bind("127.0.0.1:0").expect("first peer binds");
-        let first_port = first_listener.local_addr().expect("first peer address").port();
+        let first_port = first_listener
+            .local_addr()
+            .expect("first peer address")
+            .port();
         let second_listener = TcpListener::bind("127.0.0.1:0").expect("second peer binds");
-        let second_port = second_listener.local_addr().expect("second peer address").port();
+        let second_port = second_listener
+            .local_addr()
+            .expect("second peer address")
+            .port();
         {
             let mut torrents = session.torrents.lock().expect("torrent lock");
             let torrent = torrents
@@ -7145,8 +8334,17 @@ mod tests {
             elapsed < Duration::from_millis(2_900),
             "parallel swarm took {elapsed:?}; fully sequential responses require at least 3.2 seconds"
         );
-        assert_eq!(first_seed.join().expect("first peer exits").bytes_uploaded, 4);
-        assert_eq!(second_seed.join().expect("second peer exits").bytes_uploaded, 5);
+        assert_eq!(
+            first_seed.join().expect("first peer exits").bytes_uploaded,
+            4
+        );
+        assert_eq!(
+            second_seed
+                .join()
+                .expect("second peer exits")
+                .bytes_uploaded,
+            5
+        );
         assert_eq!(
             storage::read_torrent_bytes(
                 &output_dir,
@@ -7198,9 +8396,15 @@ mod tests {
             .info_hash;
 
         let early_listener = TcpListener::bind("127.0.0.1:0").expect("early peer binds");
-        let early_port = early_listener.local_addr().expect("early peer address").port();
+        let early_port = early_listener
+            .local_addr()
+            .expect("early peer address")
+            .port();
         let late_listener = TcpListener::bind("127.0.0.1:0").expect("late peer binds");
-        let late_port = late_listener.local_addr().expect("late peer address").port();
+        let late_port = late_listener
+            .local_addr()
+            .expect("late peer address")
+            .port();
         {
             let mut torrents = session.torrents.lock().expect("torrent lock");
             let torrent = torrents
@@ -7246,8 +8450,8 @@ mod tests {
         let late_seed = thread::spawn(move || {
             let (mut stream, _) = late_listener.accept().expect("late peer accepts");
             thread::sleep(Duration::from_millis(1_200));
-            let handshake = peerwire::read_incoming_handshake(&mut stream)
-                .expect("late peer reads handshake");
+            let handshake =
+                peerwire::read_incoming_handshake(&mut stream).expect("late peer reads handshake");
             peerwire::seed_connected_peer(
                 stream,
                 handshake,
@@ -7270,7 +8474,10 @@ mod tests {
         session
             .download_from_peers(&id.to_string())
             .expect("swarm completes after admitting the late peer");
-        assert_eq!(early_seed.join().expect("early peer exits").bytes_uploaded, 4);
+        assert_eq!(
+            early_seed.join().expect("early peer exits").bytes_uploaded,
+            4
+        );
         assert_eq!(late_seed.join().expect("late peer exits").bytes_uploaded, 5);
         assert_eq!(
             storage::read_torrent_bytes(
@@ -7328,7 +8535,10 @@ mod tests {
             .expect("partial peer address")
             .port();
         let fresh_listener = TcpListener::bind("127.0.0.1:0").expect("fresh peer binds");
-        let fresh_port = fresh_listener.local_addr().expect("fresh peer address").port();
+        let fresh_port = fresh_listener
+            .local_addr()
+            .expect("fresh peer address")
+            .port();
         {
             let mut torrents = session.torrents.lock().expect("torrent lock");
             let torrent = torrents
@@ -7409,8 +8619,17 @@ mod tests {
             add_fresh_peer.join().expect("fresh peer is inserted");
         });
 
-        assert_eq!(partial_seed.join().expect("partial peer exits").bytes_uploaded, 4);
-        assert_eq!(fresh_seed.join().expect("fresh peer exits").bytes_uploaded, 5);
+        assert_eq!(
+            partial_seed
+                .join()
+                .expect("partial peer exits")
+                .bytes_uploaded,
+            4
+        );
+        assert_eq!(
+            fresh_seed.join().expect("fresh peer exits").bytes_uploaded,
+            5
+        );
         assert_eq!(
             storage::read_torrent_bytes(
                 &output_dir,
@@ -7556,7 +8775,9 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut socket, _) = listener.accept().expect("PEX client connects");
             let mut handshake = [0u8; HANDSHAKE_LEN];
-            socket.read_exact(&mut handshake).expect("client handshake reads");
+            socket
+                .read_exact(&mut handshake)
+                .expect("client handshake reads");
             assert!(peer::supports_extension_protocol(
                 &peer::parse_handshake_full(&handshake).expect("client handshake parses")
             ));
@@ -7598,7 +8819,9 @@ mod tests {
             socket
                 .write_all(&peer::build_bitfield(&[0b1110_0000]))
                 .expect("bitfield writes");
-            socket.write_all(&peer::build_unchoke()).expect("unchoke writes");
+            socket
+                .write_all(&peer::build_unchoke())
+                .expect("unchoke writes");
             for _ in 0..3 {
                 let PeerMessage::Request {
                     index,
@@ -7626,7 +8849,10 @@ mod tests {
                 && peer.port == 6881
                 && peer.connection == "PEX discovered"
         }));
-        assert_eq!(fs::read(output_dir.join("Example").join("dir").join("one.bin")).expect("file reads"), b"abc");
+        assert_eq!(
+            fs::read(output_dir.join("Example").join("dir").join("one.bin")).expect("file reads"),
+            b"abc"
+        );
 
         fs::remove_dir_all(root).expect("temp dir removes");
     }
@@ -7654,7 +8880,10 @@ mod tests {
         let id = add.id.expect("added torrent has id");
         let info_hash = {
             let mut torrents = session.torrents.lock().expect("torrent lock");
-            let torrent = torrents.iter_mut().find(|torrent| torrent.id == id).expect("torrent exists");
+            let torrent = torrents
+                .iter_mut()
+                .find(|torrent| torrent.id == id)
+                .expect("torrent exists");
             torrent.info_hash
         };
 
@@ -7662,7 +8891,10 @@ mod tests {
         let port = listener.local_addr().expect("listener address").port();
         {
             let mut torrents = session.torrents.lock().expect("torrent lock");
-            let torrent = torrents.iter_mut().find(|torrent| torrent.id == id).expect("torrent exists");
+            let torrent = torrents
+                .iter_mut()
+                .find(|torrent| torrent.id == id)
+                .expect("torrent exists");
             torrent.peers.push(PeerInfo {
                 address: "127.0.0.1".to_string(),
                 port,
@@ -7701,7 +8933,8 @@ mod tests {
 
         assert_eq!(seed_result.bytes_uploaded, data.len() as u64);
         assert_eq!(
-            fs::read(output_dir.join("Example").join("dir").join("one.bin")).expect("first file reads"),
+            fs::read(output_dir.join("Example").join("dir").join("one.bin"))
+                .expect("first file reads"),
             b"abc"
         );
         assert!(!output_dir.join("Example").join("two.bin").exists());
@@ -7750,7 +8983,10 @@ mod tests {
         };
 
         let first_listener = TcpListener::bind("127.0.0.1:0").expect("first listener binds");
-        let first_port = first_listener.local_addr().expect("first listener address").port();
+        let first_port = first_listener
+            .local_addr()
+            .expect("first listener address")
+            .port();
         {
             let mut torrents = session.torrents.lock().expect("torrent lock");
             let torrent = torrents
@@ -7791,7 +9027,10 @@ mod tests {
             .download_from_peers(&id.to_string())
             .expect_err("first swarm attempt remains incomplete");
         assert!(first_error.contains("missing 2 pieces"));
-        assert_eq!(first_seed.join().expect("first seed exits").bytes_uploaded, 4);
+        assert_eq!(
+            first_seed.join().expect("first seed exits").bytes_uploaded,
+            4
+        );
         let partial_path = output_dir
             .join(".novatorrent")
             .join(format!("{}.part", sha1::hex(&info_hash)));
@@ -7822,7 +9061,10 @@ mod tests {
         let id = resumed.id.expect("re-added torrent has id");
 
         let second_listener = TcpListener::bind("127.0.0.1:0").expect("second listener binds");
-        let second_port = second_listener.local_addr().expect("second listener address").port();
+        let second_port = second_listener
+            .local_addr()
+            .expect("second listener address")
+            .port();
         {
             let mut torrents = session.torrents.lock().expect("torrent lock");
             let torrent = torrents
@@ -7862,7 +9104,13 @@ mod tests {
         session
             .download_from_peers(&id.to_string())
             .expect("resumed swarm download completes");
-        assert_eq!(second_seed.join().expect("second seed exits").bytes_uploaded, 5);
+        assert_eq!(
+            second_seed
+                .join()
+                .expect("second seed exits")
+                .bytes_uploaded,
+            5
+        );
         assert!(!partial_path.exists());
         assert_eq!(
             storage::read_torrent_bytes(
@@ -7977,7 +9225,10 @@ mod tests {
             worker.join().expect("runtime worker exits");
         }
         for seed in seed_handles {
-            assert_eq!(seed.join().expect("seed exits").bytes_uploaded, data.len() as u64);
+            assert_eq!(
+                seed.join().expect("seed exits").bytes_uploaded,
+                data.len() as u64
+            );
         }
 
         for (id, output_dir) in torrent_ids {
@@ -8030,6 +9281,9 @@ mod tests {
                     },
                 )
                 .expect("runtime options update");
+            session
+                .update_file_priority(&id.to_string(), 2, 3)
+                .expect("file priority updates");
             {
                 let mut torrents = session.torrents.lock().expect("torrent lock");
                 let torrent = torrents
@@ -8046,7 +9300,10 @@ mod tests {
         let restored = session.list().torrents;
         assert_eq!(restored.len(), 1);
         assert_eq!(restored[0].id, Some(first_id));
-        assert_eq!(restored[0].output_folder, output_dir.to_string_lossy());
+        assert_eq!(
+            restored[0].output_folder,
+            output_dir.join("chosen").to_string_lossy()
+        );
         assert!(restored[0].options.paused);
         assert!(restored[0].options.overwrite);
         assert!(restored[0].options.disable_trackers);
@@ -8056,7 +9313,11 @@ mod tests {
         assert_eq!(restored[0].options.max_upload_speed, Some(64 * 1024));
         assert!(restored[0].options.sequential_download);
         assert_eq!(restored[0].options.seed_ratio_limit, Some(2.5));
-        assert_eq!(session.torrents.lock().expect("torrent lock")[0].completed_at_ms, Some(123_456));
+        assert_eq!(restored[0].file_priorities, vec![1, 1, 3]);
+        assert_eq!(
+            session.torrents.lock().expect("torrent lock")[0].completed_at_ms,
+            Some(123_456)
+        );
         assert_eq!(
             restored[0]
                 .files
@@ -8069,7 +9330,9 @@ mod tests {
         );
         assert!(session.runnable_ids().is_empty());
 
-        session.resume(&first_id.to_string()).expect("resume persists");
+        session
+            .resume(&first_id.to_string())
+            .expect("resume persists");
         assert_eq!(session.runnable_ids(), vec![first_id]);
         let second = session
             .add(AddTorrentRequest {
@@ -8091,6 +9354,149 @@ mod tests {
         let restored_again = TorrentSession::new(default_dir).list().torrents;
         assert_eq!(restored_again.len(), 1);
         assert_eq!(restored_again[0].id, second.id);
+        fs::remove_dir_all(root).expect("temp dir removes");
+    }
+
+    #[test]
+    fn shutdown_checkpoint_preserves_manual_pause_and_auto_resume_intent() {
+        let root = temp_dir("session-shutdown-intent");
+        let torrent_path = root.join("multi.torrent");
+        fs::write(&torrent_path, build_multi_file_torrent(b"abcdefghi")).expect("fixture writes");
+        let state_dir = root.join("state");
+        let session = TorrentSession::new_with_state_dir(root.join("downloads"), state_dir.clone());
+        let active = session
+            .add(AddTorrentRequest {
+                source: TorrentSource::File(torrent_path.to_string_lossy().into_owned()),
+                destination: Some(root.join("active").to_string_lossy().into_owned()),
+                paused: false,
+                overwrite: true,
+                disable_trackers: true,
+                only_files: None,
+                sub_folder: None,
+            })
+            .expect("active torrent adds")
+            .id
+            .expect("active ID");
+        let paused = session
+            .add(AddTorrentRequest {
+                source: TorrentSource::File(torrent_path.to_string_lossy().into_owned()),
+                destination: Some(root.join("paused").to_string_lossy().into_owned()),
+                paused: true,
+                overwrite: true,
+                disable_trackers: true,
+                only_files: None,
+                sub_folder: None,
+            })
+            .expect("paused torrent adds")
+            .id
+            .expect("paused ID");
+        session.prepare_shutdown();
+        drop(session);
+
+        let restored = TorrentSession::new_with_state_dir(root.join("downloads"), state_dir);
+        assert_eq!(restored.runnable_ids(), vec![active]);
+        assert!(
+            restored
+                .details(&paused.to_string())
+                .expect("paused details")
+                .options
+                .paused
+        );
+        fs::remove_dir_all(root).expect("temp dir removes");
+    }
+
+    #[test]
+    fn cached_metainfo_restores_after_original_torrent_file_is_removed() {
+        let root = temp_dir("session-metainfo-cache");
+        let torrent_path = root.join("temporary.torrent");
+        fs::write(&torrent_path, build_multi_file_torrent(b"abcdefghi")).expect("fixture writes");
+        let state_dir = root.join("state");
+        let id = {
+            let session =
+                TorrentSession::new_with_state_dir(root.join("downloads"), state_dir.clone());
+            session
+                .add(AddTorrentRequest {
+                    source: TorrentSource::File(torrent_path.to_string_lossy().into_owned()),
+                    destination: Some(root.join("output").to_string_lossy().into_owned()),
+                    paused: true,
+                    overwrite: true,
+                    disable_trackers: true,
+                    only_files: None,
+                    sub_folder: None,
+                })
+                .expect("torrent adds")
+                .id
+                .expect("torrent ID")
+        };
+        fs::remove_file(&torrent_path).expect("original metainfo removes");
+
+        let restored = TorrentSession::new_with_state_dir(root.join("downloads"), state_dir);
+        assert_eq!(
+            restored
+                .details(&id.to_string())
+                .expect("details restore")
+                .id,
+            Some(id)
+        );
+        fs::remove_dir_all(root).expect("temp dir removes");
+    }
+
+    #[test]
+    fn add_reports_existing_file_conflicts_before_starting_the_torrent() {
+        let root = temp_dir("add-existing-conflict");
+        let output_dir = root.join("out");
+        let existing_dir = output_dir.join("Example").join("dir");
+        let torrent_path = root.join("multi.torrent");
+        fs::create_dir_all(&existing_dir).expect("existing output directory creates");
+        fs::write(existing_dir.join("one.bin"), b"old").expect("existing output writes");
+        fs::write(&torrent_path, build_multi_file_torrent(b"abcdefghi")).expect("fixture writes");
+        let session = TorrentSession::new(root.join("state"));
+
+        let error = session
+            .add(AddTorrentRequest {
+                source: TorrentSource::File(torrent_path.to_string_lossy().into_owned()),
+                destination: Some(output_dir.to_string_lossy().into_owned()),
+                paused: false,
+                overwrite: false,
+                disable_trackers: true,
+                only_files: Some(vec![0]),
+                sub_folder: None,
+            })
+            .expect_err("existing output should be reported before adding");
+
+        assert!(error.contains("one.bin"));
+        assert!(error.contains("Replace existing files"));
+        assert!(session.list().torrents.is_empty());
+        fs::remove_dir_all(root).expect("temp dir removes");
+    }
+
+    #[test]
+    fn separates_downloads_session_state_and_logs_and_applies_safe_subfolders() {
+        let root = temp_dir("separate-download-and-state");
+        let downloads = root.join("Downloads");
+        let state = root.join("state");
+        let log_file = root.join("logs").join("novatorrent.log");
+        fs::create_dir_all(&state).expect("state directory creates");
+
+        let session = TorrentSession::new_with_state_and_log_file(
+            downloads.clone(),
+            state.clone(),
+            log_file.clone(),
+        );
+
+        assert_eq!(session.default_output_dir(), downloads);
+        assert_eq!(session.log_file_path(), log_file);
+        assert_eq!(
+            session.session_file_path(),
+            state.join("novatorrent-session.json")
+        );
+        assert_eq!(
+            output_folder_with_subfolder(session.default_output_dir(), Some("Big Buck"))
+                .expect("safe subfolder resolves"),
+            downloads.join("Big Buck")
+        );
+        assert!(output_folder_with_subfolder(&downloads, Some("../escape")).is_err());
+        assert!(output_folder_with_subfolder(&downloads, Some("nested/folder")).is_err());
         fs::remove_dir_all(root).expect("temp dir removes");
     }
 
@@ -8146,7 +9552,10 @@ mod tests {
             cookie: None,
         };
         let added = session
-            .handle_lsd_announce(&announce, "192.168.1.44:6771".parse().expect("source parses"))
+            .handle_lsd_announce(
+                &announce,
+                "192.168.1.44:6771".parse().expect("source parses"),
+            )
             .expect("LSD announce applies");
         assert_eq!(added, 1);
         let details = session.details(&id.to_string()).expect("details load");
@@ -8220,7 +9629,9 @@ mod tests {
             &piece_hashes,
         )
         .expect("partial store opens");
-        store.write_piece(0, &data[..4]).expect("first piece writes");
+        store
+            .write_piece(0, &data[..4])
+            .expect("first piece writes");
         drop(store);
 
         let partial = session
@@ -8247,7 +9658,9 @@ mod tests {
             &piece_hashes,
         )
         .expect("partial store reopens");
-        store.write_piece(1, &data[4..8]).expect("second piece writes");
+        store
+            .write_piece(1, &data[4..8])
+            .expect("second piece writes");
         drop(store);
 
         let complete = session
@@ -8284,11 +9697,7 @@ mod tests {
         out
     }
 
-    fn build_webseed_tracker_torrent(
-        data: &[u8],
-        tracker_url: &str,
-        webseed_url: &str,
-    ) -> Vec<u8> {
+    fn build_webseed_tracker_torrent(data: &[u8], tracker_url: &str, webseed_url: &str) -> Vec<u8> {
         let mut pieces = Vec::new();
         for hash in data.chunks(4).map(sha1::digest) {
             pieces.extend_from_slice(&hash);
@@ -8345,28 +9754,13 @@ mod tests {
         storage::write_torrent_bytes(&output_dir, "Example", &files, &data, true)
             .expect("stored files write");
 
-        assert!(session
-            .hash_torrent_file(&id.to_string(), 0)
-            .expect_err("unfinished torrent cannot be reputation checked")
-            .contains("completed, verified torrent"));
         session.recheck(&id.to_string()).expect("recheck completes");
         let details = session.details(&id.to_string()).expect("details load");
         let stats = details.stats.expect("stats");
-        let file_hash = session
-            .hash_torrent_file(&id.to_string(), 0)
-            .expect("verified torrent file hashes");
 
         assert_eq!(stats.state, "Seeding");
         assert_eq!(stats.progress_bytes, data.len() as u64);
         assert_eq!(stats.file_progress, vec![3, 4, 2]);
-        assert_eq!(
-            file_hash.sha256,
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-        assert_eq!(
-            file_hash.virustotal_url,
-            format!("https://www.virustotal.com/gui/file/{}", file_hash.sha256)
-        );
         fs::remove_dir_all(root).expect("temp dir removes");
     }
 
@@ -8397,11 +9791,17 @@ mod tests {
                 .iter()
                 .find(|torrent| torrent.id == id)
                 .expect("torrent exists");
-            (torrent.info_hash, torrent.files.clone(), torrent.piece_hashes.clone())
+            (
+                torrent.info_hash,
+                torrent.files.clone(),
+                torrent.piece_hashes.clone(),
+            )
         };
         storage::write_torrent_bytes(&output_dir, "Example", &files, &data, true)
             .expect("complete payload writes");
-        session.recheck(&id.to_string()).expect("stored payload verifies");
+        session
+            .recheck(&id.to_string())
+            .expect("stored payload verifies");
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("incoming listener binds");
         let port = listener.local_addr().expect("listener address").port();
@@ -8477,7 +9877,9 @@ mod tests {
         };
         storage::write_torrent_bytes(&output_dir, "Example", &files, &data, true)
             .expect("complete payload writes");
-        session.recheck(&id.to_string()).expect("stored payload verifies");
+        session
+            .recheck(&id.to_string())
+            .expect("stored payload verifies");
 
         assert_eq!(session.runnable_ids(), vec![id]);
         session
@@ -8528,7 +9930,9 @@ mod tests {
         };
         storage::write_torrent_bytes(&output_dir, "Example", &files, &data, true)
             .expect("complete payload writes");
-        session.recheck(&id.to_string()).expect("stored payload verifies");
+        session
+            .recheck(&id.to_string())
+            .expect("stored payload verifies");
         {
             let mut torrents = session.torrents.lock().expect("torrent lock");
             let torrent = torrents
@@ -8569,13 +9973,18 @@ mod tests {
             ))
             .expect("leecher handshake writes");
         let mut handshake = [0u8; HANDSHAKE_LEN];
-        socket.read_exact(&mut handshake).expect("seed handshake reads");
+        socket
+            .read_exact(&mut handshake)
+            .expect("seed handshake reads");
         assert!(peer::supports_extension_protocol(
             &peer::parse_handshake_full(&handshake).expect("seed handshake parses")
         ));
         assert!(matches!(
             read_peer_message_for_test(&mut socket).expect("seed extension handshake reads"),
-            PeerMessage::Extended { extension_id: 0, .. }
+            PeerMessage::Extended {
+                extension_id: 0,
+                ..
+            }
         ));
         socket
             .write_all(&peer::build_extended_message(
@@ -8608,7 +10017,10 @@ mod tests {
         socket
             .write_all(&peer::build_not_interested())
             .expect("leecher not interested writes");
-        assert_eq!(server.join().expect("incoming server exits").bytes_uploaded, 0);
+        assert_eq!(
+            server.join().expect("incoming server exits").bytes_uploaded,
+            0
+        );
 
         fs::remove_dir_all(root).expect("temp dir removes");
     }
@@ -8622,7 +10034,10 @@ mod tests {
         fs::write(&torrent_path, build_multi_file_torrent(&data)).expect("fixture writes");
 
         let tracker_listener = TcpListener::bind("127.0.0.1:0").expect("tracker binds");
-        let tracker_port = tracker_listener.local_addr().expect("tracker address").port();
+        let tracker_port = tracker_listener
+            .local_addr()
+            .expect("tracker address")
+            .port();
         let tracker_url = format!("http://127.0.0.1:{tracker_port}/announce");
         let tracker = thread::spawn(move || {
             let mut events = Vec::new();
@@ -8644,7 +10059,9 @@ mod tests {
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
                 );
-                stream.write_all(response.as_bytes()).expect("tracker headers write");
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("tracker headers write");
                 stream.write_all(body).expect("tracker body writes");
             }
             events
@@ -8679,7 +10096,9 @@ mod tests {
             });
         }
         session.set_listen_port(6999);
-        session.announce(&id.to_string()).expect("started announce succeeds");
+        session
+            .announce(&id.to_string())
+            .expect("started announce succeeds");
 
         let (info_hash, files, piece_hashes) = {
             let torrents = session.torrents.lock().expect("torrent lock");
@@ -8687,11 +10106,17 @@ mod tests {
                 .iter()
                 .find(|torrent| torrent.id == id)
                 .expect("torrent exists");
-            (torrent.info_hash, torrent.files.clone(), torrent.piece_hashes.clone())
+            (
+                torrent.info_hash,
+                torrent.files.clone(),
+                torrent.piece_hashes.clone(),
+            )
         };
         storage::write_torrent_bytes(&output_dir, "Example", &files, &data, true)
             .expect("complete payload writes");
-        session.recheck(&id.to_string()).expect("stored payload verifies");
+        session
+            .recheck(&id.to_string())
+            .expect("stored payload verifies");
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("incoming listener binds");
         let port = listener.local_addr().expect("listener address").port();
@@ -8719,12 +10144,21 @@ mod tests {
         )
         .expect("leecher downloads from session listener");
         assert_eq!(result.bytes, data);
-        assert_eq!(server.join().expect("incoming server exits").bytes_uploaded, data.len() as u64);
+        assert_eq!(
+            server.join().expect("incoming server exits").bytes_uploaded,
+            data.len() as u64
+        );
 
         let details = session.details(&id.to_string()).expect("details load");
-        assert_eq!(details.stats.expect("stats exist").state, "Seed ratio reached");
+        assert_eq!(
+            details.stats.expect("stats exist").state,
+            "Seed ratio reached"
+        );
         assert!(session.due_tracker_ids().is_empty());
-        assert_eq!(tracker.join().expect("tracker exits"), vec!["started", "stopped"]);
+        assert_eq!(
+            tracker.join().expect("tracker exits"),
+            vec!["started", "stopped"]
+        );
 
         fs::remove_dir_all(root).expect("temp dir removes");
     }
@@ -8735,7 +10169,10 @@ mod tests {
         let torrent_path = root.join("multi.torrent");
         fs::write(&torrent_path, build_multi_file_torrent(b"abcdefghi")).expect("fixture writes");
         let tracker_listener = TcpListener::bind("127.0.0.1:0").expect("tracker binds");
-        let tracker_port = tracker_listener.local_addr().expect("tracker address").port();
+        let tracker_port = tracker_listener
+            .local_addr()
+            .expect("tracker address")
+            .port();
         let tracker_url = format!("http://127.0.0.1:{tracker_port}/announce");
 
         let tracker = thread::spawn(move || {
@@ -8750,7 +10187,9 @@ mod tests {
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
                 );
-                stream.write_all(response.as_bytes()).expect("tracker headers write");
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("tracker headers write");
                 stream.write_all(body).expect("tracker body writes");
             }
             requests
@@ -8785,7 +10224,9 @@ mod tests {
             });
         }
         session.set_listen_port(6999);
-        session.announce(&id.to_string()).expect("announce succeeds");
+        session
+            .announce(&id.to_string())
+            .expect("announce succeeds");
         assert!(session.due_tracker_ids().is_empty());
         let files = session
             .torrents
@@ -8798,9 +10239,15 @@ mod tests {
             .clone();
         storage::write_torrent_bytes(&root.join("out"), "Example", &files, b"abcdefghi", true)
             .expect("complete data writes");
-        session.recheck(&id.to_string()).expect("complete data rechecks");
-        session.announce(&id.to_string()).expect("completed announce succeeds");
-        session.announce(&id.to_string()).expect("regular announce succeeds");
+        session
+            .recheck(&id.to_string())
+            .expect("complete data rechecks");
+        session
+            .announce(&id.to_string())
+            .expect("completed announce succeeds");
+        session
+            .announce(&id.to_string())
+            .expect("regular announce succeeds");
         session
             .delete(&id.to_string(), false)
             .expect("delete sends stopped announce");
@@ -8821,12 +10268,17 @@ mod tests {
         fs::write(&torrent_path, build_multi_file_torrent(b"abcdefghi")).expect("fixture writes");
 
         let fast_listener = TcpListener::bind("127.0.0.1:0").expect("fast tracker binds");
-        let fast_port = fast_listener.local_addr().expect("fast tracker address").port();
+        let fast_port = fast_listener
+            .local_addr()
+            .expect("fast tracker address")
+            .port();
         let fast_url = format!("http://127.0.0.1:{fast_port}/announce");
         let fast_tracker = thread::spawn(move || {
             let (mut stream, _) = fast_listener.accept().expect("fast announce connects");
             let mut buffer = [0u8; 4096];
-            let _ = stream.read(&mut buffer).expect("fast announce request reads");
+            let _ = stream
+                .read(&mut buffer)
+                .expect("fast announce request reads");
             let mut body = b"d8:intervali60e5:peers6:".to_vec();
             body.extend_from_slice(&[127, 0, 0, 1, 0x1a, 0xe1]);
             body.push(b'e');
@@ -8834,25 +10286,36 @@ mod tests {
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
             );
-            stream.write_all(response.as_bytes()).expect("fast tracker headers write");
+            stream
+                .write_all(response.as_bytes())
+                .expect("fast tracker headers write");
             stream.write_all(&body).expect("fast tracker body writes");
         });
 
         let slow_listener = TcpListener::bind("127.0.0.1:0").expect("slow tracker binds");
-        let slow_port = slow_listener.local_addr().expect("slow tracker address").port();
+        let slow_port = slow_listener
+            .local_addr()
+            .expect("slow tracker address")
+            .port();
         let slow_url = format!("http://127.0.0.1:{slow_port}/announce");
         let slow_tracker = thread::spawn(move || {
             let (mut stream, _) = slow_listener.accept().expect("slow announce connects");
             let mut buffer = [0u8; 4096];
-            let _ = stream.read(&mut buffer).expect("slow announce request reads");
+            let _ = stream
+                .read(&mut buffer)
+                .expect("slow announce request reads");
             thread::sleep(Duration::from_millis(1_400));
-            let body = b"d8:intervali60e5:peers0:e";
+            let mut body = b"d8:intervali60e5:peers6:".to_vec();
+            body.extend_from_slice(&[127, 0, 0, 1, 0x1a, 0xe2]);
+            body.push(b'e');
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
             );
-            stream.write_all(response.as_bytes()).expect("slow tracker headers write");
-            stream.write_all(body).expect("slow tracker body writes");
+            stream
+                .write_all(response.as_bytes())
+                .expect("slow tracker headers write");
+            stream.write_all(&body).expect("slow tracker body writes");
         });
 
         let session = TorrentSession::new(root.join("out"));
@@ -8894,7 +10357,9 @@ mod tests {
         session.set_listen_port(6999);
 
         let started = Instant::now();
-        session.announce(&id.to_string()).expect("announce succeeds");
+        session
+            .announce(&id.to_string())
+            .expect("announce succeeds");
         let elapsed = started.elapsed();
 
         assert!(
@@ -8915,6 +10380,27 @@ mod tests {
             .any(|peer| peer.address == "127.0.0.1" && peer.port == 6881));
         fast_tracker.join().expect("fast tracker exits");
         slow_tracker.join().expect("slow tracker exits");
+        let late_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let late_peer_present = session
+                .torrents
+                .lock()
+                .expect("torrent lock")
+                .iter()
+                .find(|torrent| torrent.id == id)
+                .expect("torrent exists")
+                .peers
+                .iter()
+                .any(|peer| peer.address == "127.0.0.1" && peer.port == 6882);
+            if late_peer_present {
+                break;
+            }
+            assert!(
+                Instant::now() < late_deadline,
+                "late tracker peer was discarded"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
 
         fs::remove_dir_all(root).expect("temp dir removes");
     }
@@ -8925,7 +10411,10 @@ mod tests {
         let torrent_path = root.join("multi.torrent");
         fs::write(&torrent_path, build_multi_file_torrent(b"abcdefghi")).expect("fixture writes");
         let tracker_listener = TcpListener::bind("127.0.0.1:0").expect("tracker binds");
-        let tracker_port = tracker_listener.local_addr().expect("tracker address").port();
+        let tracker_port = tracker_listener
+            .local_addr()
+            .expect("tracker address")
+            .port();
         let tracker_url = format!("http://127.0.0.1:{tracker_port}/announce");
 
         let tracker = thread::spawn(move || {
@@ -8948,7 +10437,9 @@ mod tests {
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
                 );
-                stream.write_all(response.as_bytes()).expect("tracker headers write");
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("tracker headers write");
                 stream.write_all(body).expect("tracker body writes");
             }
             events
@@ -9022,7 +10513,10 @@ mod tests {
         let events = std::sync::Arc::new(Mutex::new(Vec::new()));
 
         let tracker_listener = TcpListener::bind("127.0.0.1:0").expect("tracker binds");
-        let tracker_port = tracker_listener.local_addr().expect("tracker address").port();
+        let tracker_port = tracker_listener
+            .local_addr()
+            .expect("tracker address")
+            .port();
         let tracker_url = format!("http://127.0.0.1:{tracker_port}/announce");
         let tracker_events = std::sync::Arc::clone(&events);
         let tracker = thread::spawn(move || {
@@ -9038,19 +10532,27 @@ mod tests {
                 } else {
                     "none"
                 };
-                tracker_events.lock().expect("events lock").push(event.to_string());
+                tracker_events
+                    .lock()
+                    .expect("events lock")
+                    .push(event.to_string());
                 let body = b"d8:intervali60e5:peers0:e";
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
                 );
-                stream.write_all(response.as_bytes()).expect("tracker headers write");
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("tracker headers write");
                 stream.write_all(body).expect("tracker body writes");
             }
         });
 
         let webseed_listener = TcpListener::bind("127.0.0.1:0").expect("webseed binds");
-        let webseed_port = webseed_listener.local_addr().expect("webseed address").port();
+        let webseed_port = webseed_listener
+            .local_addr()
+            .expect("webseed address")
+            .port();
         let webseed_url = format!("http://127.0.0.1:{webseed_port}/file.bin");
         let webseed_events = std::sync::Arc::clone(&events);
         let webseed_data = data.clone();
@@ -9059,13 +10561,20 @@ mod tests {
             let mut buffer = [0u8; 4096];
             let length = stream.read(&mut buffer).expect("webseed request reads");
             assert!(String::from_utf8_lossy(&buffer[..length]).starts_with("GET /file.bin "));
-            webseed_events.lock().expect("events lock").push("webseed".to_string());
+            webseed_events
+                .lock()
+                .expect("events lock")
+                .push("webseed".to_string());
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 webseed_data.len()
             );
-            stream.write_all(response.as_bytes()).expect("webseed headers write");
-            stream.write_all(&webseed_data).expect("webseed body writes");
+            stream
+                .write_all(response.as_bytes())
+                .expect("webseed headers write");
+            stream
+                .write_all(&webseed_data)
+                .expect("webseed body writes");
         });
 
         fs::write(
@@ -9088,14 +10597,19 @@ mod tests {
             .expect("torrent adds");
         let id = added.id.expect("torrent has ID");
 
-        session.run_torrent(&id.to_string()).expect("runtime completes");
+        session
+            .run_torrent(&id.to_string())
+            .expect("runtime completes");
         tracker.join().expect("tracker exits");
         webseed.join().expect("webseed exits");
         assert_eq!(
             *events.lock().expect("events lock"),
             vec!["started", "webseed", "completed"]
         );
-        assert_eq!(fs::read(output_dir.join("file.bin")).expect("output reads"), data);
+        assert_eq!(
+            fs::read(output_dir.join("file.bin")).expect("output reads"),
+            data
+        );
 
         fs::remove_dir_all(root).expect("temp dir removes");
     }
@@ -9128,7 +10642,10 @@ mod tests {
         let port = listener.local_addr().expect("listener address").port();
         {
             let mut torrents = session.torrents.lock().expect("torrent lock");
-            let torrent = torrents.iter_mut().find(|torrent| torrent.id == id).expect("torrent exists");
+            let torrent = torrents
+                .iter_mut()
+                .find(|torrent| torrent.id == id)
+                .expect("torrent exists");
             assert!(torrent.files.is_empty());
             torrent.peers.push(PeerInfo {
                 address: "127.0.0.1".to_string(),
@@ -9146,7 +10663,9 @@ mod tests {
             serve_metadata_once(listener, info_hash, server_info);
         });
 
-        session.fetch_metadata(&id.to_string()).expect("metadata fetch completes");
+        session
+            .fetch_metadata(&id.to_string())
+            .expect("metadata fetch completes");
         server.join().expect("metadata server exits");
 
         let details = session.details(&id.to_string()).expect("details load");
@@ -9226,7 +10745,9 @@ mod tests {
             for _ in 0..4 {
                 let (length, source) = server.recv_from(&mut buffer).expect("DHT packet arrives");
                 let response = server_session.handle_dht_packet(&buffer[..length], source);
-                server.send_to(&response, source).expect("DHT response sends");
+                server
+                    .send_to(&response, source)
+                    .expect("DHT response sends");
             }
         });
         let client = UdpSocket::bind("127.0.0.1:0").expect("DHT client binds");
@@ -9237,7 +10758,9 @@ mod tests {
         let node_id = *b"abcdefghij0123456789";
         let info_hash = *b"mnopqrstuvwxyz123456";
         let exchange = |packet: &[u8]| {
-            client.send_to(packet, server_address).expect("DHT query sends");
+            client
+                .send_to(packet, server_address)
+                .expect("DHT query sends");
             let mut buffer = [0u8; 4096];
             let (length, _) = client.recv_from(&mut buffer).expect("DHT response arrives");
             buffer[..length].to_vec()
@@ -9258,12 +10781,7 @@ mod tests {
         assert!(initial.peers.is_empty());
 
         let announce = exchange(&dht::build_announce_peer_query(
-            b"a1",
-            node_id,
-            info_hash,
-            51413,
-            &token,
-            false,
+            b"a1", node_id, info_hash, 51413, &token, false,
         ));
         assert_eq!(
             dht::parse_dht_response(&announce)
@@ -9346,7 +10864,9 @@ mod tests {
         let spoofed_port = spoofed.local_addr().expect("spoofed DHT address").port();
         let spoofed_responder = thread::spawn(move || {
             let mut buffer = [0u8; 4096];
-            let (_, source) = spoofed.recv_from(&mut buffer).expect("spoofed ping arrives");
+            let (_, source) = spoofed
+                .recv_from(&mut buffer)
+                .expect("spoofed ping arrives");
             spoofed
                 .send_to(&dht::build_id_response(b"xx", [99u8; 20]), source)
                 .expect("spoofed response sends");
@@ -9403,11 +10923,15 @@ mod tests {
             }));
         }
 
-        let first = session.maintain_dht_routing().expect("first maintenance runs");
+        let first = session
+            .maintain_dht_routing()
+            .expect("first maintenance runs");
         assert_eq!(first.pinged, 2);
         assert_eq!(first.verified, 1);
         assert_eq!(first.evicted, 0);
-        let second = session.maintain_dht_routing().expect("second maintenance runs");
+        let second = session
+            .maintain_dht_routing()
+            .expect("second maintenance runs");
         assert_eq!(second.pinged, 1);
         assert_eq!(second.verified, 0);
         assert_eq!(second.evicted, 1);
@@ -9614,7 +11138,10 @@ mod tests {
         );
         let error = dht::parse_dht_error(&response).expect("private torrent error parses");
         assert_eq!(error.code, 203);
-        assert_eq!(error.message, "private torrent is not available through DHT");
+        assert_eq!(
+            error.message,
+            "private torrent is not available through DHT"
+        );
 
         fs::remove_dir_all(root).expect("temp dir removes");
     }
@@ -9649,7 +11176,9 @@ mod tests {
         };
         storage::write_torrent_bytes(&output_dir, "Example", &files, &data, true)
             .expect("complete data writes");
-        session.recheck(&id.to_string()).expect("complete data rechecks");
+        session
+            .recheck(&id.to_string())
+            .expect("complete data rechecks");
         session.set_listen_port(6999);
 
         let server = UdpSocket::bind("127.0.0.1:0").expect("local DHT socket binds");
@@ -9670,7 +11199,9 @@ mod tests {
                 .send_to(&lookup_response, client)
                 .expect("get_peers response sends");
 
-            let (length, client) = server.recv_from(&mut buffer).expect("announce_peer arrives");
+            let (length, client) = server
+                .recv_from(&mut buffer)
+                .expect("announce_peer arrives");
             let root = bencode::parse(&buffer[..length]).expect("announce_peer parses");
             assert_eq!(
                 root.dict_get(b"q").and_then(BencodeNode::as_bytes),
@@ -9681,7 +11212,10 @@ mod tests {
                 args.dict_get(b"info_hash").and_then(BencodeNode::as_bytes),
                 Some(&info_hash[..])
             );
-            assert_eq!(args.dict_get(b"port").and_then(BencodeNode::as_i64), Some(6999));
+            assert_eq!(
+                args.dict_get(b"port").and_then(BencodeNode::as_i64),
+                Some(6999)
+            );
             assert_eq!(
                 args.dict_get(b"token").and_then(BencodeNode::as_bytes),
                 Some(&b"seed-token"[..])
@@ -9713,9 +11247,10 @@ mod tests {
                 .state,
             "Seeding"
         );
-        assert!(session.logs(Some(id)).iter().any(|entry| {
-            entry.scope == "dht" && entry.message.contains("advertised to 1/1")
-        }));
+        assert!(session
+            .logs(Some(id))
+            .iter()
+            .any(|entry| { entry.scope == "dht" && entry.message.contains("advertised to 1/1") }));
 
         fs::remove_dir_all(root).expect("temp dir removes");
     }
@@ -9782,15 +11317,43 @@ mod tests {
         let root = temp_dir("session-logs");
         let session = TorrentSession::new(root.clone());
 
-        session.log(
-            LogLevel::Info,
-            "test",
-            "first line\nsecond line",
-            Some(42),
-        );
+        session.log(LogLevel::Debug, "test", "before cursor", Some(42));
+        let cursor = session.logs(Some(42)).last().expect("cursor log exists").id;
+        session.log(LogLevel::Info, "test", "first line\nsecond line", Some(42));
 
         let contents = fs::read_to_string(root.join("novatorrent.log")).expect("log file reads");
         assert!(contents.contains("[Info] scope=test torrent=42 message=first line second line"));
+        let incremental = session.logs_after(Some(42), Some(cursor));
+        assert_eq!(incremental.len(), 1);
+        assert_eq!(incremental[0].message, "first line\nsecond line");
+        fs::remove_dir_all(root).expect("temp dir removes");
+    }
+
+    #[test]
+    fn list_summaries_keeps_grid_fields_without_cloning_details() {
+        let root = temp_dir("session-summaries");
+        let torrent_path = root.join("multi.torrent");
+        fs::write(&torrent_path, build_multi_file_torrent(b"abcdefghi")).expect("fixture writes");
+        let session = TorrentSession::new(root.join("default"));
+        session
+            .add(AddTorrentRequest {
+                source: TorrentSource::File(torrent_path.to_string_lossy().into_owned()),
+                destination: Some(root.join("out").to_string_lossy().into_owned()),
+                paused: true,
+                overwrite: false,
+                disable_trackers: false,
+                only_files: None,
+                sub_folder: None,
+            })
+            .expect("torrent adds");
+
+        let summaries = session.list_summaries().torrents;
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].file_count, 3);
+        assert_eq!(summaries[0].playable_file_count, 0);
+        assert_eq!(summaries[0].first_playable_file_index, None);
+        assert_eq!(summaries[0].stats.total_bytes, 9);
+        assert_eq!(summaries[0].stats.state, TorrentState::Paused);
         fs::remove_dir_all(root).expect("temp dir removes");
     }
 
@@ -9808,7 +11371,9 @@ mod tests {
             .expect("write timeout sets");
 
         let mut handshake = [0u8; HANDSHAKE_LEN];
-        socket.read_exact(&mut handshake).expect("client handshake arrives");
+        socket
+            .read_exact(&mut handshake)
+            .expect("client handshake arrives");
         let handshake = peer::parse_handshake_full(&handshake).expect("client handshake parses");
         assert_eq!(handshake.info_hash, info_hash);
         assert!(peer::supports_extension_protocol(&handshake));
@@ -9819,7 +11384,8 @@ mod tests {
             ))
             .expect("server handshake writes");
 
-        let message = read_peer_message_for_test(&mut socket).expect("client extension handshake arrives");
+        let message =
+            read_peer_message_for_test(&mut socket).expect("client extension handshake arrives");
         let PeerMessage::Extended {
             extension_id: 0,
             payload,
@@ -9893,12 +11459,17 @@ mod tests {
         response.extend_from_slice(b"ee1:t");
         write_bencoded_bytes(&mut response, &transaction_id);
         response.extend_from_slice(b"1:y1:re");
-        socket.send_to(&response, client).expect("DHT response sends");
+        socket
+            .send_to(&response, client)
+            .expect("DHT response sends");
     }
 
     fn assert_dht_get_peers_query(input: &[u8], expected_info_hash: [u8; 20]) -> Vec<u8> {
         let root = bencode::parse(input).expect("DHT query parses");
-        assert_eq!(root.dict_get(b"y").and_then(BencodeNode::as_bytes), Some(&b"q"[..]));
+        assert_eq!(
+            root.dict_get(b"y").and_then(BencodeNode::as_bytes),
+            Some(&b"q"[..])
+        );
         assert_eq!(
             root.dict_get(b"q").and_then(BencodeNode::as_bytes),
             Some(&b"get_peers"[..])

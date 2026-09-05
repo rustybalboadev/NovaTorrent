@@ -5,7 +5,7 @@ export const mockTorrents: TorrentDetails[] = [
     id: 1,
     info_hash: "0f3a6cf4a0c4dbceee5f5ff623672540ac5dbb78",
     name: "Ubuntu 26.04 Desktop ISO",
-    output_folder: "C:\\Users\\rusty\\Downloads\\NovaTorrent",
+    output_folder: "C:\\Users\\Example\\Downloads\\NovaTorrent",
     stats: {
       state: "live",
       progress_bytes: 2382364672,
@@ -71,7 +71,7 @@ export const mockTorrents: TorrentDetails[] = [
     id: 3,
     info_hash: "39d91f87f80ec1417f47982be2537a896a2299b0",
     name: "Public Domain Archive",
-    output_folder: "C:\\Users\\rusty\\Downloads\\NovaTorrent",
+    output_folder: "C:\\Users\\Example\\Downloads\\NovaTorrent",
     stats: {
       state: "complete",
       progress_bytes: 812646400,
@@ -105,7 +105,7 @@ export const mockPreview: TorrentDetails = {
   id: null,
   info_hash: "5e5c81a2eec16b31a4d2d37d15bd20f2a2df7631",
   name: "Example Collection",
-  output_folder: "C:\\Users\\rusty\\Downloads\\NovaTorrent",
+  output_folder: "C:\\Users\\Example\\Downloads\\NovaTorrent",
   files: [
     {
       name: "Example Collection/readme.txt",

@@ -1,3 +1,5 @@
+import { isPlayableMediaName } from "@/lib/media";
+
 export type TorrentSource =
   | {
       kind: "magnet";
@@ -13,6 +15,8 @@ export type TorrentFile = {
   components: string[];
   length: number;
   included: boolean;
+  downloaded?: number;
+  priority?: number;
   attributes?: Record<string, unknown>;
 };
 
@@ -106,10 +110,28 @@ export type TorrentDetails = {
   web_seeds?: WebSeedStatus[];
   peers?: TorrentPeer[];
   options?: TorrentOptions | null;
+  file_priorities?: number[];
+  piece_states?: number[];
 };
 
 export type TorrentListResponse = {
   torrents: TorrentDetails[];
+};
+
+export type TorrentSummary = {
+  id?: number | null;
+  info_hash: string;
+  name?: string | null;
+  output_folder: string;
+  stats: TorrentStats;
+  peer_count: number;
+  file_count: number;
+  playable_file_count: number;
+  first_playable_file_index?: number | null;
+};
+
+export type TorrentSummaryListResponse = {
+  torrents: TorrentSummary[];
 };
 
 export type AddTorrentRequest = {
@@ -127,23 +149,6 @@ export type AddTorrentResponse = {
   details: TorrentDetails;
   output_folder: string;
   seen_peers?: string[] | null;
-};
-
-export type SafeTestTorrent = {
-  label: string;
-  path: string;
-  source_url: string;
-  sha256: string;
-  payload_size: number;
-};
-
-export type TorrentFileHash = {
-  file_index: number;
-  name: string;
-  path: string;
-  size: number;
-  sha256: string;
-  virustotal_url: string;
 };
 
 export type VerifiedByteRange = {
@@ -166,6 +171,13 @@ export type StreamPriorityRequest = {
   playheadOffset: number;
   urgentBytes?: number | null;
   lookaheadBytes?: number | null;
+  supplementalFileIndices?: number[] | null;
+};
+
+export type SubtitleFileText = {
+  file_index: number;
+  name: string;
+  text: string;
 };
 
 export type StreamPriorityStatus = {
@@ -210,6 +222,8 @@ export type TorrentRow = {
   uploadSpeed: number;
   eta: number | null;
   peerCount: number | null;
+  playableFileCount: number;
+  firstPlayableFileIndex: number | null;
   files: TorrentFile[];
   general: TorrentGeneral | null;
   trackers: TorrentTracker[];
@@ -233,6 +247,9 @@ export function normalizeTorrent(torrent: TorrentDetails): TorrentRow {
   const total = stats?.total_bytes ?? torrent.files?.reduce((sum, file) => sum + file.length, 0) ?? 0;
   const downloaded = stats?.progress_bytes ?? 0;
   const progress = total > 0 ? (downloaded / total) * 100 : stats?.finished ? 100 : 0;
+  const playableFileIndices = (torrent.files ?? [])
+    .map((file, index) => (file.included && isPlayableMediaName(file.name) ? index : -1))
+    .filter((index) => index >= 0);
 
   return {
     id: String(torrent.id ?? torrent.info_hash),
@@ -248,7 +265,13 @@ export function normalizeTorrent(torrent: TorrentDetails): TorrentRow {
     uploadSpeed: normalizeSpeed(stats?.live?.upload_speed),
     eta: normalizeDuration(stats?.live?.time_remaining),
     peerCount: normalizePeers(stats?.live),
-    files: torrent.files ?? [],
+    playableFileCount: playableFileIndices.length,
+    firstPlayableFileIndex: playableFileIndices[0] ?? null,
+    files: (torrent.files ?? []).map((file, index) => ({
+      ...file,
+      downloaded: stats?.file_progress?.[index] ?? 0,
+      priority: torrent.file_priorities?.[index] ?? 1
+    })),
     general: torrent.general ?? null,
     trackers: torrent.trackers ?? [],
     webSeeds: torrent.web_seeds ?? [],
@@ -257,6 +280,27 @@ export function normalizeTorrent(torrent: TorrentDetails): TorrentRow {
     raw: torrent
   };
 }
+
+export function normalizeTorrentSummary(torrent: TorrentSummary): TorrentRow {
+  const summaryDetails: TorrentDetails = {
+    id: torrent.id,
+    info_hash: torrent.info_hash,
+    name: torrent.name,
+    output_folder: torrent.output_folder,
+    stats: torrent.stats,
+    general: {
+      total_size: torrent.stats.total_bytes,
+      file_count: torrent.file_count
+    }
+  };
+  return {
+    ...normalizeTorrent(summaryDetails),
+    peerCount: torrent.peer_count,
+    playableFileCount: torrent.playable_file_count,
+    firstPlayableFileIndex: torrent.first_playable_file_index ?? null
+  };
+}
+
 
 function normalizeState(stats?: TorrentStats | null) {
   if (!stats) return "Queued";

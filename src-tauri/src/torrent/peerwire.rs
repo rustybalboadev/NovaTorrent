@@ -1,7 +1,7 @@
 use std::{
     collections::VecDeque,
     io::{Read, Write},
-    net::{TcpListener, TcpStream, ToSocketAddrs},
+    net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Condvar, Mutex,
@@ -12,8 +12,7 @@ use std::{
 use crate::torrent::{
     metadata::{self, MetadataMessageType},
     peer::{self, PeerMessage, HANDSHAKE_LEN},
-    pex,
-    piece,
+    pex, piece,
 };
 
 const MAX_PEER_FRAME_LENGTH: usize = 4 * 1024 * 1024;
@@ -22,9 +21,8 @@ const LOCAL_UT_METADATA_ID: u8 = 3;
 const LOCAL_UT_PEX_ID: u8 = 4;
 const DEFAULT_REQUEST_PIPELINE_DEPTH: usize = 16;
 const MIN_REQUEST_PIPELINE_DEPTH: usize = 2;
-const MAX_REQUEST_PIPELINE_DEPTH: usize = 32;
-const FAST_PIECE_TARGET: Duration = Duration::from_millis(750);
-const SLOW_PIECE_TARGET: Duration = Duration::from_secs(4);
+const MAX_REQUEST_PIPELINE_DEPTH: usize = 500;
+const REQUEST_PIPELINE_TIME_TARGET: Duration = Duration::from_secs(3);
 const PEER_READ_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const PEER_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(8);
@@ -261,6 +259,7 @@ pub struct PeerDownloadConnection {
     cancelled: Option<Arc<AtomicBool>>,
     download_limiter: Option<BandwidthLimiter>,
     request_pipeline_depth: usize,
+    remote_request_queue_limit: usize,
 }
 
 impl PeerDownloadConnection {
@@ -270,6 +269,15 @@ impl PeerDownloadConnection {
 
     pub fn availability(&self) -> &[bool] {
         &self.availability
+    }
+
+    pub fn request_pipeline_depth(&self) -> usize {
+        self.request_pipeline_depth
+            .min(self.remote_request_queue_limit)
+    }
+
+    pub fn remote_request_queue_limit(&self) -> usize {
+        self.remote_request_queue_limit
     }
 
     pub fn take_remote_dht_port(&mut self) -> Option<u16> {
@@ -294,78 +302,67 @@ impl PeerDownloadConnection {
             *slot = true;
         }
 
-        let mut downloaded = Vec::new();
         let mut unavailable = Vec::new();
-        for position in 0..self.pieces.len() {
-            let piece_plan = self.pieces[position].clone();
-            if !wanted[piece_plan.index as usize] {
-                continue;
-            }
-            if let Err(err) = ensure_download_active(self.cancelled.as_deref()) {
-                return peer_piece_error(self.peer_id, downloaded, unavailable, err);
-            }
-            if self.choked {
-                if let Err(err) = wait_until_unchoked(
-                    &mut self.stream,
-                    &mut self.availability,
-                    &mut self.choked,
-                    self.accept_dht_port,
-                    &mut self.remote_dht_port,
-                    &mut self.pex_peers,
-                    self.cancelled.as_deref(),
-                ) {
-                    return peer_piece_error(self.peer_id, downloaded, unavailable, err);
-                }
-            }
-            if !peer_has_piece(&self.availability, piece_plan.index) {
-                unavailable.push(piece_plan.index);
-                continue;
-            }
-            let piece_started = Instant::now();
-            let piece_bytes = match download_piece_pipelined(
+        if let Err(err) = ensure_download_active(self.cancelled.as_deref()) {
+            return peer_piece_error(self.peer_id, Vec::new(), unavailable, err);
+        }
+        if self.choked {
+            if let Err(err) = wait_until_unchoked(
                 &mut self.stream,
-                &piece_plan,
-                self.request_pipeline_depth,
                 &mut self.availability,
                 &mut self.choked,
                 self.accept_dht_port,
                 &mut self.remote_dht_port,
                 &mut self.pex_peers,
+                &mut self.remote_request_queue_limit,
                 self.cancelled.as_deref(),
-                self.download_limiter.as_ref(),
             ) {
-                Ok(bytes) => {
-                    self.request_pipeline_depth = adapt_request_pipeline_depth(
-                        self.request_pipeline_depth,
-                        bytes.len(),
-                        piece_started.elapsed(),
-                        false,
-                    );
-                    bytes
-                }
-                Err(err) => {
-                    self.request_pipeline_depth = adapt_request_pipeline_depth(
-                        self.request_pipeline_depth,
-                        piece_plan.length as usize,
-                        piece_started.elapsed(),
-                        true,
-                    );
-                    return peer_piece_error(self.peer_id, downloaded, unavailable, err);
-                }
-            };
-
-            if !piece::verify_piece(&piece_bytes, piece_plan.hash) {
-                return peer_piece_error(
-                    self.peer_id,
-                    downloaded,
-                    unavailable,
-                    format!("piece {} failed SHA-1 verification", piece_plan.index),
-                );
+                return peer_piece_error(self.peer_id, Vec::new(), unavailable, err);
             }
-            downloaded.push(DownloadedPiece {
-                index: piece_plan.index,
-                bytes: piece_bytes,
-            });
+        }
+
+        let mut selected = Vec::new();
+        for piece_plan in &self.pieces {
+            if !wanted[piece_plan.index as usize] {
+                continue;
+            }
+            if peer_has_piece(&self.availability, piece_plan.index) {
+                selected.push(piece_plan.clone());
+            } else {
+                unavailable.push(piece_plan.index);
+            }
+        }
+
+        let batch_started = Instant::now();
+        let outcome = download_piece_batch_pipelined(
+            &mut self.stream,
+            &selected,
+            self.request_pipeline_depth,
+            &mut self.availability,
+            &mut self.choked,
+            self.accept_dht_port,
+            &mut self.remote_dht_port,
+            &mut self.pex_peers,
+            self.cancelled.as_deref(),
+            self.download_limiter.as_ref(),
+            &mut self.remote_request_queue_limit,
+        );
+        let (mut downloaded, error) = match outcome {
+            Ok(downloaded) => (downloaded, None),
+            Err((downloaded, error)) => (downloaded, Some(error)),
+        };
+        downloaded.sort_by_key(|piece| piece.index);
+        let downloaded_bytes = downloaded.iter().map(|piece| piece.bytes.len()).sum();
+        self.request_pipeline_depth = adapt_request_pipeline_depth(
+            self.request_pipeline_depth,
+            downloaded_bytes,
+            batch_started.elapsed(),
+            error.is_some(),
+        )
+        .min(self.remote_request_queue_limit);
+
+        if let Some(error) = error {
+            return peer_piece_error(self.peer_id, downloaded, unavailable, error);
         }
 
         PeerPieceDownloadResult {
@@ -536,13 +533,16 @@ pub fn connect_peer_for_download_with_limiter(
 ) -> Result<PeerDownloadConnection, String> {
     ensure_download_active(plan.cancelled.as_deref())?;
     let local_dht_port = plan.dht_port.filter(|port| *port != 0);
-    let socket_addr = (address, port)
+    let socket_addrs = (address, port)
         .to_socket_addrs()
         .map_err(|err| format!("could not resolve peer address: {err}"))?
-        .next()
-        .ok_or_else(|| "peer address did not resolve".to_string())?;
-    let mut stream = TcpStream::connect_timeout(&socket_addr, PEER_CONNECT_TIMEOUT)
-        .map_err(|err| format!("could not connect to peer: {err}"))?;
+        .collect::<Vec<_>>();
+    let mut stream = connect_to_first_available_peer(
+        &socket_addrs,
+        PEER_CONNECT_TIMEOUT,
+        plan.cancelled.as_deref(),
+        "peer",
+    )?;
     stream
         .set_read_timeout(Some(PEER_READ_POLL_INTERVAL))
         .map_err(|err| format!("could not set peer read timeout: {err}"))?;
@@ -569,13 +569,19 @@ pub fn connect_peer_for_download_with_limiter(
     let accept_dht_port = local_dht_port.is_some() && peer::supports_dht(&handshake);
     if accept_dht_port {
         stream
-            .write_all(&peer::build_port(local_dht_port.expect("DHT port is present")))
+            .write_all(&peer::build_port(
+                local_dht_port.expect("DHT port is present"),
+            ))
             .map_err(|err| format!("could not send DHT port message: {err}"))?;
     }
-    let accept_pex = plan.enable_pex && peer::supports_extension_protocol(&handshake);
-    if accept_pex {
-        let local_extension_handshake =
-            metadata::build_extension_handshake_with_pex(None, None, Some(LOCAL_UT_PEX_ID));
+    let supports_extensions = peer::supports_extension_protocol(&handshake);
+    let accept_pex = plan.enable_pex && supports_extensions;
+    if supports_extensions {
+        let local_extension_handshake = metadata::build_extension_handshake_with_pex(
+            None,
+            None,
+            accept_pex.then_some(LOCAL_UT_PEX_ID),
+        );
         stream
             .write_all(&peer::build_extended_message(0, &local_extension_handshake))
             .map_err(|err| format!("could not send PEX extension handshake: {err}"))?;
@@ -590,6 +596,7 @@ pub fn connect_peer_for_download_with_limiter(
     let mut choked = true;
     let mut remote_dht_port = None;
     let mut pex_peers = Vec::new();
+    let mut remote_request_queue_limit = MAX_REQUEST_PIPELINE_DEPTH;
     wait_until_unchoked(
         &mut stream,
         &mut availability,
@@ -597,6 +604,7 @@ pub fn connect_peer_for_download_with_limiter(
         accept_dht_port,
         &mut remote_dht_port,
         &mut pex_peers,
+        &mut remote_request_queue_limit,
         plan.cancelled.as_deref(),
     )?;
 
@@ -611,7 +619,8 @@ pub fn connect_peer_for_download_with_limiter(
         pex_peers,
         cancelled: plan.cancelled,
         download_limiter,
-        request_pipeline_depth: DEFAULT_REQUEST_PIPELINE_DEPTH,
+        request_pipeline_depth: DEFAULT_REQUEST_PIPELINE_DEPTH.min(remote_request_queue_limit),
+        remote_request_queue_limit,
     })
 }
 
@@ -621,13 +630,16 @@ pub fn fetch_metadata_from_peer(
     plan: MetadataFetchPlan,
 ) -> Result<MetadataFetchResult, String> {
     let local_dht_port = plan.dht_port.filter(|port| *port != 0);
-    let socket_addr = (address, port)
+    let socket_addrs = (address, port)
         .to_socket_addrs()
         .map_err(|err| format!("could not resolve metadata peer address: {err}"))?
-        .next()
-        .ok_or_else(|| "metadata peer address did not resolve".to_string())?;
-    let mut stream = TcpStream::connect_timeout(&socket_addr, PEER_CONNECT_TIMEOUT)
-        .map_err(|err| format!("could not connect to metadata peer: {err}"))?;
+        .collect::<Vec<_>>();
+    let mut stream = connect_to_first_available_peer(
+        &socket_addrs,
+        PEER_CONNECT_TIMEOUT,
+        None,
+        "metadata peer",
+    )?;
     stream
         .set_read_timeout(Some(Duration::from_secs(8)))
         .map_err(|err| format!("could not set metadata peer read timeout: {err}"))?;
@@ -657,7 +669,9 @@ pub fn fetch_metadata_from_peer(
     let accept_dht_port = local_dht_port.is_some() && peer::supports_dht(&handshake);
     if accept_dht_port {
         stream
-            .write_all(&peer::build_port(local_dht_port.expect("DHT port is present")))
+            .write_all(&peer::build_port(
+                local_dht_port.expect("DHT port is present"),
+            ))
             .map_err(|err| format!("could not send metadata peer DHT port: {err}"))?;
     }
 
@@ -667,11 +681,8 @@ pub fn fetch_metadata_from_peer(
         .map_err(|err| format!("could not send extension handshake: {err}"))?;
 
     let mut remote_dht_port = None;
-    let extension = read_metadata_extension_handshake(
-        &mut stream,
-        accept_dht_port,
-        &mut remote_dht_port,
-    )?;
+    let extension =
+        read_metadata_extension_handshake(&mut stream, accept_dht_port, &mut remote_dht_port)?;
     let remote_metadata_id = extension
         .ut_metadata
         .ok_or_else(|| "metadata peer did not advertise ut_metadata".to_string())?;
@@ -717,7 +728,10 @@ pub fn fetch_metadata_from_peer(
     })
 }
 
-pub fn seed_single_peer(listener: TcpListener, plan: PeerSeedPlan) -> Result<PeerSeedResult, String> {
+pub fn seed_single_peer(
+    listener: TcpListener,
+    plan: PeerSeedPlan,
+) -> Result<PeerSeedResult, String> {
     let (mut stream, _) = listener
         .accept()
         .map_err(|err| format!("could not accept peer connection: {err}"))?;
@@ -726,6 +740,9 @@ pub fn seed_single_peer(listener: TcpListener, plan: PeerSeedPlan) -> Result<Pee
 }
 
 pub fn read_incoming_handshake(stream: &mut TcpStream) -> Result<peer::PeerHandshake, String> {
+    stream
+        .set_nodelay(true)
+        .map_err(|err| format!("could not enable TCP_NODELAY for incoming peer: {err}"))?;
     stream
         .set_read_timeout(Some(Duration::from_secs(20)))
         .map_err(|err| format!("could not set incoming peer read timeout: {err}"))?;
@@ -770,10 +787,12 @@ pub fn seed_connected_peer_with_gate(
             read_block: {
                 let bytes = Arc::clone(&bytes);
                 Arc::new(move |offset, length| {
-                    let start = usize::try_from(offset)
-                        .map_err(|_| "seed block offset is too large for this platform".to_string())?;
-                    let length = usize::try_from(length)
-                        .map_err(|_| "seed block length is too large for this platform".to_string())?;
+                    let start = usize::try_from(offset).map_err(|_| {
+                        "seed block offset is too large for this platform".to_string()
+                    })?;
+                    let length = usize::try_from(length).map_err(|_| {
+                        "seed block length is too large for this platform".to_string()
+                    })?;
                     let end = start
                         .checked_add(length)
                         .ok_or_else(|| "seed block range overflowed".to_string())?;
@@ -847,7 +866,9 @@ pub fn seed_connected_peer_with_reader_and_gate(
         .map_err(|err| format!("could not send seed handshake: {err}"))?;
     if accept_dht_port {
         stream
-            .write_all(&peer::build_port(local_dht_port.expect("DHT port is present")))
+            .write_all(&peer::build_port(
+                local_dht_port.expect("DHT port is present"),
+            ))
             .map_err(|err| format!("could not send seed DHT port message: {err}"))?;
     }
     if accept_pex {
@@ -880,7 +901,9 @@ pub fn seed_connected_peer_with_reader_and_gate(
         }
     }
     stream
-        .write_all(&peer::build_bitfield(&build_availability_bitfield(&available_pieces)))
+        .write_all(&peer::build_bitfield(&build_availability_bitfield(
+            &available_pieces,
+        )))
         .map_err(|err| format!("could not send seed bitfield: {err}"))?;
     let mut upload_slot = if let Some(gate) = upload_gate {
         match gate.try_acquire()? {
@@ -913,7 +936,11 @@ pub fn seed_connected_peer_with_reader_and_gate(
                 begin,
                 length,
             } => {
-                if !available_pieces.get(index as usize).copied().unwrap_or(false) {
+                if !available_pieces
+                    .get(index as usize)
+                    .copied()
+                    .unwrap_or(false)
+                {
                     return Err(format!("leecher requested unavailable piece {index}"));
                 }
                 if length == 0 || length > piece::DEFAULT_BLOCK_SIZE {
@@ -962,13 +989,13 @@ pub fn seed_connected_peer_with_reader_and_gate(
                             .write_all(&peer::build_choke())
                             .map_err(|err| format!("could not rotate upload slot: {err}"))?;
                         drop(upload_slot.take());
-                        upload_slot = Some(
-                            gate.acquire_timeout(UPLOAD_SLOT_WAIT_TIMEOUT)?
-                                .ok_or_else(|| "timed out while rotating upload slot".to_string())?,
-                        );
-                        stream
-                            .write_all(&peer::build_unchoke())
-                            .map_err(|err| format!("could not resume rotated upload slot: {err}"))?;
+                        upload_slot =
+                            Some(gate.acquire_timeout(UPLOAD_SLOT_WAIT_TIMEOUT)?.ok_or_else(
+                                || "timed out while rotating upload slot".to_string(),
+                            )?);
+                        stream.write_all(&peer::build_unchoke()).map_err(|err| {
+                            format!("could not resume rotated upload slot: {err}")
+                        })?;
                         upload_rotations += 1;
                         upload_lease_started = Instant::now();
                     }
@@ -1065,7 +1092,10 @@ fn read_metadata_piece(
                 match message.message_type {
                     MetadataMessageType::Data => {
                         if message.total_size != Some(metadata_size) {
-                            return Err("metadata piece total_size does not match extension handshake".to_string());
+                            return Err(
+                                "metadata piece total_size does not match extension handshake"
+                                    .to_string(),
+                            );
                         }
                         return Ok(message);
                     }
@@ -1103,6 +1133,7 @@ fn wait_until_unchoked(
     accept_dht_port: bool,
     remote_dht_port: &mut Option<u16>,
     pex_peers: &mut Vec<peer::PeerInfo>,
+    remote_request_queue_limit: &mut usize,
     cancelled: Option<&AtomicBool>,
 ) -> Result<(), String> {
     while *choked {
@@ -1115,9 +1146,175 @@ fn wait_until_unchoked(
             accept_dht_port,
             remote_dht_port,
             pex_peers,
+            remote_request_queue_limit,
         )?;
     }
     Ok(())
+}
+
+struct BatchPieceAssembly {
+    plan: piece::PiecePlan,
+    bytes: Vec<u8>,
+    remaining_blocks: usize,
+}
+
+fn download_piece_batch_pipelined(
+    stream: &mut TcpStream,
+    piece_plans: &[piece::PiecePlan],
+    pipeline_depth: usize,
+    availability: &mut [bool],
+    choked: &mut bool,
+    accept_dht_port: bool,
+    remote_dht_port: &mut Option<u16>,
+    pex_peers: &mut Vec<peer::PeerInfo>,
+    cancelled: Option<&AtomicBool>,
+    download_limiter: Option<&BandwidthLimiter>,
+    remote_request_queue_limit: &mut usize,
+) -> Result<Vec<DownloadedPiece>, (Vec<DownloadedPiece>, String)> {
+    let mut assemblies = piece_plans
+        .iter()
+        .cloned()
+        .map(|plan| BatchPieceAssembly {
+            bytes: vec![0u8; plan.length as usize],
+            remaining_blocks: plan.blocks.len(),
+            plan,
+        })
+        .collect::<Vec<_>>();
+    let requests = piece_plans
+        .iter()
+        .flat_map(|plan| plan.blocks.iter().cloned())
+        .collect::<Vec<_>>();
+    let mut next_request = 0usize;
+    let mut pending = Vec::<piece::BlockRequest>::new();
+    let mut downloaded = Vec::new();
+
+    while next_request < requests.len() || !pending.is_empty() {
+        if let Err(error) = ensure_download_active(cancelled) {
+            cancel_pending_batch_requests(stream, &pending);
+            return Err((downloaded, error));
+        }
+        let queue_limit = pipeline_depth.min(*remote_request_queue_limit).max(1);
+        while pending.len() < queue_limit && next_request < requests.len() {
+            let request = requests[next_request].clone();
+            if let Err(error) = stream.write_all(&peer::build_request(
+                request.piece_index,
+                request.begin,
+                request.length,
+            )) {
+                cancel_pending_batch_requests(stream, &pending);
+                return Err((downloaded, format!("could not send piece request: {error}")));
+            }
+            pending.push(request);
+            next_request += 1;
+        }
+
+        let message = match read_peer_message_cancellable(stream, cancelled) {
+            Ok(message) => message,
+            Err(read_error) => {
+                cancel_pending_batch_requests(stream, &pending);
+                let error = ensure_download_active(cancelled)
+                    .err()
+                    .unwrap_or(read_error);
+                return Err((downloaded, error));
+            }
+        };
+        match message {
+            PeerMessage::Piece {
+                index,
+                begin,
+                block,
+            } => {
+                let Some(pending_index) = pending
+                    .iter()
+                    .position(|request| request.piece_index == index && request.begin == begin)
+                else {
+                    continue;
+                };
+                let request = pending.swap_remove(pending_index);
+                if block.len() != request.length as usize {
+                    cancel_pending_batch_requests(stream, &pending);
+                    return Err((
+                        downloaded,
+                        format!(
+                            "peer returned block length {} for piece {index} offset {begin}; expected {}",
+                            block.len(),
+                            request.length
+                        ),
+                    ));
+                }
+                let Some(assembly) = assemblies.iter_mut().find(|item| item.plan.index == index)
+                else {
+                    continue;
+                };
+                let start = begin as usize;
+                let Some(end) = start.checked_add(block.len()) else {
+                    cancel_pending_batch_requests(stream, &pending);
+                    return Err((downloaded, "peer block offset overflowed".to_string()));
+                };
+                let Some(target) = assembly.bytes.get_mut(start..end) else {
+                    cancel_pending_batch_requests(stream, &pending);
+                    return Err((
+                        downloaded,
+                        format!("peer returned bytes outside piece {index} at offset {begin}"),
+                    ));
+                };
+                target.copy_from_slice(&block);
+                assembly.remaining_blocks = assembly.remaining_blocks.saturating_sub(1);
+                if let Some(limiter) = download_limiter {
+                    if let Err(error) = limiter.throttle(block.len(), cancelled) {
+                        cancel_pending_batch_requests(stream, &pending);
+                        return Err((downloaded, error));
+                    }
+                }
+                if assembly.remaining_blocks == 0 {
+                    if !piece::verify_piece(&assembly.bytes, assembly.plan.hash) {
+                        cancel_pending_batch_requests(stream, &pending);
+                        return Err((
+                            downloaded,
+                            format!("piece {index} failed SHA-1 verification"),
+                        ));
+                    }
+                    downloaded.push(DownloadedPiece {
+                        index,
+                        bytes: std::mem::take(&mut assembly.bytes),
+                    });
+                }
+            }
+            other => {
+                if let Err(error) = update_peer_state(
+                    other,
+                    availability,
+                    choked,
+                    accept_dht_port,
+                    remote_dht_port,
+                    pex_peers,
+                    remote_request_queue_limit,
+                ) {
+                    cancel_pending_batch_requests(stream, &pending);
+                    return Err((downloaded, error));
+                }
+            }
+        }
+        if *choked {
+            cancel_pending_batch_requests(stream, &pending);
+            return Err((
+                downloaded,
+                "peer choked with pipelined block requests outstanding".to_string(),
+            ));
+        }
+    }
+
+    Ok(downloaded)
+}
+
+fn cancel_pending_batch_requests(stream: &mut TcpStream, pending: &[piece::BlockRequest]) {
+    for request in pending {
+        let _ = stream.write_all(&peer::build_cancel(
+            request.piece_index,
+            request.begin,
+            request.length,
+        ));
+    }
 }
 
 fn download_piece_pipelined(
@@ -1131,12 +1328,14 @@ fn download_piece_pipelined(
     pex_peers: &mut Vec<peer::PeerInfo>,
     cancelled: Option<&AtomicBool>,
     download_limiter: Option<&BandwidthLimiter>,
+    remote_request_queue_limit: &mut usize,
 ) -> Result<Vec<u8>, String> {
     let mut piece_bytes = vec![0u8; piece_plan.length as usize];
     let mut next_request = 0usize;
     let mut pending = Vec::<(u32, u32)>::new();
-    let pipeline_depth =
-        pipeline_depth.clamp(MIN_REQUEST_PIPELINE_DEPTH, MAX_REQUEST_PIPELINE_DEPTH);
+    let pipeline_depth = pipeline_depth
+        .clamp(MIN_REQUEST_PIPELINE_DEPTH, MAX_REQUEST_PIPELINE_DEPTH)
+        .min((*remote_request_queue_limit).max(1));
 
     while next_request < piece_plan.blocks.len() || !pending.is_empty() {
         while next_request < piece_plan.blocks.len() && pending.len() < pipeline_depth {
@@ -1145,9 +1344,11 @@ fn download_piece_pipelined(
                 return Err(err);
             }
             let block = &piece_plan.blocks[next_request];
-            if let Err(err) = stream
-                .write_all(&peer::build_request(block.piece_index, block.begin, block.length))
-            {
+            if let Err(err) = stream.write_all(&peer::build_request(
+                block.piece_index,
+                block.begin,
+                block.length,
+            )) {
                 cancel_pending_requests(stream, piece_plan.index, &pending);
                 return Err(format!("could not send piece request: {err}"));
             }
@@ -1178,9 +1379,8 @@ fn download_piece_pipelined(
                 if index != piece_plan.index {
                     continue;
                 }
-                let Some(pending_index) = pending
-                    .iter()
-                    .position(|(begin, _)| *begin == block_begin)
+                let Some(pending_index) =
+                    pending.iter().position(|(begin, _)| *begin == block_begin)
                 else {
                     continue;
                 };
@@ -1219,6 +1419,7 @@ fn download_piece_pipelined(
                 accept_dht_port,
                 remote_dht_port,
                 pex_peers,
+                remote_request_queue_limit,
             )?,
         }
         if *choked {
@@ -1240,15 +1441,68 @@ fn adapt_request_pipeline_depth(
         return (current / 2).max(MIN_REQUEST_PIPELINE_DEPTH);
     }
 
-    let elapsed_millis = elapsed.as_millis().max(1);
-    let bytes_per_second = (bytes as u128).saturating_mul(1_000) / elapsed_millis;
-    if elapsed <= FAST_PIECE_TARGET || bytes_per_second >= 512 * 1024 {
-        return (current + 2).min(MAX_REQUEST_PIPELINE_DEPTH);
-    }
-    if elapsed >= SLOW_PIECE_TARGET || bytes_per_second < 64 * 1024 {
+    if bytes == 0 {
         return current.saturating_sub(1).max(MIN_REQUEST_PIPELINE_DEPTH);
     }
-    current
+
+    let elapsed_micros = elapsed.as_micros().max(1);
+    let bytes_per_second = (bytes as u128).saturating_mul(1_000_000) / elapsed_micros;
+    let target_bytes =
+        bytes_per_second.saturating_mul(REQUEST_PIPELINE_TIME_TARGET.as_micros()) / 1_000_000;
+    let block_size = piece::DEFAULT_BLOCK_SIZE as u128;
+    let target = target_bytes
+        .saturating_add(block_size - 1)
+        .checked_div(block_size)
+        .unwrap_or(MAX_REQUEST_PIPELINE_DEPTH as u128)
+        .min(MAX_REQUEST_PIPELINE_DEPTH as u128) as usize;
+    let target = target.clamp(MIN_REQUEST_PIPELINE_DEPTH, MAX_REQUEST_PIPELINE_DEPTH);
+
+    // Smooth toward the measured bandwidth/time product. Increasing by one quarter
+    // of the gap fills fast paths promptly without letting one burst allocate the
+    // maximum queue. Decreases use the same damping; failures above remain immediate.
+    if target > current {
+        current + (target - current).div_ceil(4)
+    } else if target < current {
+        current - (current - target).div_ceil(4)
+    } else {
+        current
+    }
+}
+
+fn connect_to_first_available_peer(
+    addresses: &[SocketAddr],
+    timeout: Duration,
+    cancelled: Option<&AtomicBool>,
+    label: &str,
+) -> Result<TcpStream, String> {
+    if addresses.is_empty() {
+        return Err(format!("{label} address did not resolve"));
+    }
+
+    let mut failures = Vec::new();
+    let mut attempted = Vec::new();
+    for address in addresses {
+        if attempted.contains(address) {
+            continue;
+        }
+        attempted.push(*address);
+        ensure_download_active(cancelled)?;
+        match TcpStream::connect_timeout(address, timeout) {
+            Ok(stream) => match stream.set_nodelay(true) {
+                Ok(()) => return Ok(stream),
+                Err(err) => failures.push(format!(
+                    "{address}: connected but could not enable TCP_NODELAY: {err}"
+                )),
+            },
+            Err(err) => failures.push(format!("{address}: {err}")),
+        }
+    }
+
+    Err(format!(
+        "could not connect to {label} using {} resolved address(es): {}",
+        attempted.len(),
+        failures.join("; ")
+    ))
 }
 
 fn cancel_pending_requests(stream: &mut TcpStream, piece_index: u32, pending: &[(u32, u32)]) {
@@ -1275,6 +1529,7 @@ fn update_peer_state(
     accept_dht_port: bool,
     remote_dht_port: &mut Option<u16>,
     pex_peers: &mut Vec<peer::PeerInfo>,
+    remote_request_queue_limit: &mut usize,
 ) -> Result<(), String> {
     match message {
         PeerMessage::KeepAlive => {}
@@ -1292,11 +1547,21 @@ fn update_peer_state(
             *remote_dht_port = Some(port);
         }
         PeerMessage::Extended {
+            extension_id: 0,
+            payload,
+        } => {
+            if let Some(limit) = metadata::parse_extension_handshake(&payload)?.request_queue_limit
+            {
+                *remote_request_queue_limit = limit.clamp(1, MAX_REQUEST_PIPELINE_DEPTH);
+            }
+        }
+        PeerMessage::Extended {
             extension_id,
             payload,
         } if extension_id == LOCAL_UT_PEX_ID => {
-            let message = pex::parse_pex_message(&payload)?;
-            merge_pex_peers(pex_peers, pex::pex_peers_to_peer_info(&message.added));
+            if let Ok(message) = pex::parse_pex_message(&payload) {
+                merge_pex_peers(pex_peers, pex::pex_peers_to_peer_info(&message.added));
+            }
         }
         PeerMessage::Interested
         | PeerMessage::NotInterested
@@ -1447,7 +1712,8 @@ fn peer_has_piece(availability: &[bool], piece_index: u32) -> bool {
 }
 
 fn checked_total_length(total_length: u64) -> Result<usize, String> {
-    usize::try_from(total_length).map_err(|_| "torrent is too large for this peer download buffer".to_string())
+    usize::try_from(total_length)
+        .map_err(|_| "torrent is too large for this peer download buffer".to_string())
 }
 
 fn checked_piece_length(piece_length: u64) -> Result<usize, String> {
@@ -1489,8 +1755,7 @@ mod tests {
     #[test]
     fn applies_bitfield_high_bit_first() {
         let mut availability = vec![false; 10];
-        apply_bitfield(&[0b1010_0000, 0b0100_0000], &mut availability)
-            .expect("bitfield applies");
+        apply_bitfield(&[0b1010_0000, 0b0100_0000], &mut availability).expect("bitfield applies");
 
         assert_eq!(
             availability,
@@ -1504,9 +1769,11 @@ mod tests {
         assert!(apply_bitfield(&[0b1000_0000], &mut availability)
             .expect_err("short bitfield is rejected")
             .contains("length mismatch"));
-        assert!(apply_bitfield(&[0b1000_0000, 0b0100_0001], &mut availability)
-            .expect_err("non-zero spare bit is rejected")
-            .contains("spare bits"));
+        assert!(
+            apply_bitfield(&[0b1000_0000, 0b0100_0001], &mut availability)
+                .expect_err("non-zero spare bit is rejected")
+                .contains("spare bits")
+        );
     }
 
     #[test]
@@ -1537,20 +1804,68 @@ mod tests {
     fn request_pipeline_depth_adapts_to_peer_progress() {
         assert_eq!(
             adapt_request_pipeline_depth(8, 512 * 1024, Duration::from_millis(500), false),
-            10
+            54
         );
         assert_eq!(
             adapt_request_pipeline_depth(8, 16 * 1024, Duration::from_secs(5), false),
-            7
+            6
         );
         assert_eq!(
             adapt_request_pipeline_depth(3, 16 * 1024, Duration::from_millis(20), true),
             MIN_REQUEST_PIPELINE_DEPTH
         );
         assert_eq!(
-            adapt_request_pipeline_depth(99, 512 * 1024, Duration::from_millis(1), false),
+            adapt_request_pipeline_depth(500, 512 * 1024, Duration::from_millis(1), false),
             MAX_REQUEST_PIPELINE_DEPTH
         );
+    }
+
+    #[test]
+    fn remote_extension_handshake_caps_request_pipeline() {
+        let mut availability = vec![false; 1];
+        let mut choked = true;
+        let mut dht_port = None;
+        let mut pex_peers = Vec::new();
+        let mut remote_request_queue_limit = MAX_REQUEST_PIPELINE_DEPTH;
+
+        update_peer_state(
+            PeerMessage::Extended {
+                extension_id: 0,
+                payload: b"d1:mde4:reqqi7ee".to_vec(),
+            },
+            &mut availability,
+            &mut choked,
+            false,
+            &mut dht_port,
+            &mut pex_peers,
+            &mut remote_request_queue_limit,
+        )
+        .expect("extension handshake updates peer state");
+
+        assert_eq!(remote_request_queue_limit, 7);
+    }
+
+    #[test]
+    fn peer_connection_falls_back_to_later_resolved_address() {
+        let unavailable = TcpListener::bind("127.0.0.1:0").expect("bind unavailable address");
+        let unavailable_address = unavailable.local_addr().expect("unavailable local address");
+        drop(unavailable);
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fallback listener");
+        let fallback_address = listener.local_addr().expect("fallback local address");
+        let accept = thread::spawn(move || listener.accept().expect("accept fallback connection"));
+
+        let stream = connect_to_first_available_peer(
+            &[unavailable_address, fallback_address],
+            Duration::from_millis(250),
+            None,
+            "test peer",
+        )
+        .expect("later address connects");
+        assert_eq!(stream.peer_addr().expect("peer address"), fallback_address);
+        assert!(stream.nodelay().expect("TCP_NODELAY state"));
+        drop(stream);
+        accept.join().expect("join fallback acceptor");
     }
 
     #[test]
@@ -1588,12 +1903,18 @@ mod tests {
 
         drop(active);
         assert_eq!(
-            acquired_rx.recv_timeout(Duration::from_secs(1)).expect("first waiter runs"),
+            acquired_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("first waiter runs"),
             1
         );
-        release_first_tx.send(()).expect("first waiter release sends");
+        release_first_tx
+            .send(())
+            .expect("first waiter release sends");
         assert_eq!(
-            acquired_rx.recv_timeout(Duration::from_secs(1)).expect("second waiter runs"),
+            acquired_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("second waiter runs"),
             2
         );
         first_waiter.join().expect("first waiter exits");
@@ -1603,7 +1924,10 @@ mod tests {
     fn wait_for_upload_waiters(gate: &UploadGate, expected: usize) {
         let started = Instant::now();
         while gate.waiting_count() < expected {
-            assert!(started.elapsed() < Duration::from_secs(1), "upload waiter did not queue");
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "upload waiter did not queue"
+            );
             thread::yield_now();
         }
     }
@@ -1728,7 +2052,9 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut socket, _) = listener.accept().expect("PEX client connects");
             let mut handshake = [0u8; HANDSHAKE_LEN];
-            socket.read_exact(&mut handshake).expect("client handshake reads");
+            socket
+                .read_exact(&mut handshake)
+                .expect("client handshake reads");
             assert!(peer::supports_extension_protocol(
                 &peer::parse_handshake_full(&handshake).expect("client handshake parses")
             ));
@@ -1770,7 +2096,9 @@ mod tests {
             socket
                 .write_all(&peer::build_bitfield(&[0b1000_0000]))
                 .expect("bitfield writes");
-            socket.write_all(&peer::build_unchoke()).expect("unchoke writes");
+            socket
+                .write_all(&peer::build_unchoke())
+                .expect("unchoke writes");
             let PeerMessage::Request {
                 index,
                 begin,
@@ -1806,6 +2134,30 @@ mod tests {
         assert_eq!(result.pieces[0].bytes, data);
         drop(connection);
         server.join().expect("PEX peer exits");
+    }
+
+    #[test]
+    fn malformed_pex_does_not_end_peer_connection() {
+        let mut availability = vec![false; 1];
+        let mut choked = false;
+        let mut remote_dht_port = None;
+        let mut pex_peers = Vec::new();
+        let mut remote_request_queue_limit = MAX_REQUEST_PIPELINE_DEPTH;
+
+        update_peer_state(
+            PeerMessage::Extended {
+                extension_id: LOCAL_UT_PEX_ID,
+                payload: b"not-bencode".to_vec(),
+            },
+            &mut availability,
+            &mut choked,
+            false,
+            &mut remote_dht_port,
+            &mut pex_peers,
+            &mut remote_request_queue_limit,
+        )
+        .expect("optional malformed PEX is ignored");
+        assert!(pex_peers.is_empty());
     }
 
     #[test]
@@ -1855,7 +2207,9 @@ mod tests {
             ))
             .expect("leecher handshake writes");
         let mut handshake = [0u8; HANDSHAKE_LEN];
-        socket.read_exact(&mut handshake).expect("seed handshake reads");
+        socket
+            .read_exact(&mut handshake)
+            .expect("seed handshake reads");
         assert!(peer::supports_extension_protocol(
             &peer::parse_handshake_full(&handshake).expect("seed handshake parses")
         ));
@@ -1972,7 +2326,9 @@ mod tests {
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .expect("pipeline read timeout sets");
             let mut handshake = [0u8; HANDSHAKE_LEN];
-            socket.read_exact(&mut handshake).expect("client handshake reads");
+            socket
+                .read_exact(&mut handshake)
+                .expect("client handshake reads");
             assert_eq!(
                 peer::parse_handshake_full(&handshake)
                     .expect("client handshake parses")
@@ -1989,7 +2345,9 @@ mod tests {
             socket
                 .write_all(&peer::build_bitfield(&[0b1000_0000]))
                 .expect("bitfield writes");
-            socket.write_all(&peer::build_unchoke()).expect("unchoke writes");
+            socket
+                .write_all(&peer::build_unchoke())
+                .expect("unchoke writes");
 
             let mut requests = Vec::new();
             for _ in 0..3 {
@@ -2004,7 +2362,10 @@ mod tests {
                 requests.push((index, begin, length));
             }
             assert_eq!(
-                requests.iter().map(|(_, begin, _)| *begin).collect::<Vec<_>>(),
+                requests
+                    .iter()
+                    .map(|(_, begin, _)| *begin)
+                    .collect::<Vec<_>>(),
                 vec![0, piece::DEFAULT_BLOCK_SIZE, piece::DEFAULT_BLOCK_SIZE * 2]
             );
             for (index, begin, length) in requests.into_iter().rev() {
@@ -2037,6 +2398,105 @@ mod tests {
     }
 
     #[test]
+    fn pipelines_requests_across_piece_boundaries() {
+        let block_size = piece::DEFAULT_BLOCK_SIZE as usize;
+        let data = (0..block_size * 4)
+            .map(|value| (value % 251) as u8)
+            .collect::<Vec<_>>();
+        let piece_hashes = data
+            .chunks(block_size)
+            .map(sha1::digest)
+            .collect::<Vec<_>>();
+        let info_hash = [41u8; 20];
+        let listener = TcpListener::bind("127.0.0.1:0").expect("cross-piece peer binds");
+        let port = listener
+            .local_addr()
+            .expect("cross-piece peer address")
+            .port();
+        let server_data = data.clone();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("cross-piece client connects");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("cross-piece read timeout sets");
+            let mut handshake = [0u8; HANDSHAKE_LEN];
+            socket
+                .read_exact(&mut handshake)
+                .expect("client handshake reads");
+            socket
+                .write_all(&peer::build_handshake(info_hash, [42u8; 20]))
+                .expect("server handshake writes");
+            assert!(matches!(
+                read_peer_message(&mut socket).expect("interested reads"),
+                PeerMessage::Interested
+            ));
+            socket
+                .write_all(&peer::build_bitfield(&[0b1111_0000]))
+                .expect("bitfield writes");
+            socket
+                .write_all(&peer::build_unchoke())
+                .expect("unchoke writes");
+
+            let mut requests = Vec::new();
+            for _ in 0..4 {
+                let PeerMessage::Request {
+                    index,
+                    begin,
+                    length,
+                } = read_peer_message(&mut socket).expect("cross-piece request reads")
+                else {
+                    panic!("expected cross-piece request");
+                };
+                requests.push((index, begin, length));
+            }
+            assert_eq!(
+                requests
+                    .iter()
+                    .map(|(index, _, _)| *index)
+                    .collect::<Vec<_>>(),
+                vec![0, 1, 2, 3]
+            );
+            for (index, begin, length) in requests.into_iter().rev() {
+                let start = index as usize * block_size + begin as usize;
+                let end = start + length as usize;
+                socket
+                    .write_all(&peer::build_piece(index, begin, &server_data[start..end]))
+                    .expect("cross-piece block writes");
+            }
+        });
+
+        let mut connection = connect_peer_for_download(
+            "127.0.0.1",
+            port,
+            PeerDownloadPlan {
+                info_hash,
+                peer_id: [43u8; 20],
+                dht_port: None,
+                enable_pex: false,
+                total_length: data.len() as u64,
+                piece_length: block_size as u64,
+                piece_hashes,
+                cancelled: None,
+            },
+        )
+        .expect("cross-piece peer connects");
+        let result = connection.download_pieces(&[0, 1, 2, 3]);
+
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert_eq!(result.pieces.len(), 4);
+        assert_eq!(
+            result
+                .pieces
+                .iter()
+                .flat_map(|piece| piece.bytes.iter().copied())
+                .collect::<Vec<_>>(),
+            data
+        );
+        drop(connection);
+        server.join().expect("cross-piece peer exits");
+    }
+
+    #[test]
     fn cancellation_sends_cancels_for_pipelined_requests() {
         let total_length = piece::DEFAULT_BLOCK_SIZE as usize * 3;
         let data = vec![7u8; total_length];
@@ -2051,7 +2511,9 @@ mod tests {
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .expect("cancel read timeout sets");
             let mut handshake = [0u8; HANDSHAKE_LEN];
-            socket.read_exact(&mut handshake).expect("client handshake reads");
+            socket
+                .read_exact(&mut handshake)
+                .expect("client handshake reads");
             socket
                 .write_all(&peer::build_handshake(info_hash, *b"-NV0001-PIPECANCEL01"))
                 .expect("server handshake writes");
@@ -2062,7 +2524,9 @@ mod tests {
             socket
                 .write_all(&peer::build_bitfield(&[0b1000_0000]))
                 .expect("bitfield writes");
-            socket.write_all(&peer::build_unchoke()).expect("unchoke writes");
+            socket
+                .write_all(&peer::build_unchoke())
+                .expect("unchoke writes");
 
             for _ in 0..3 {
                 assert!(matches!(
@@ -2160,7 +2624,11 @@ mod tests {
         assert_eq!(result.unavailable, vec![1]);
         assert!(result.error.is_none());
         assert_eq!(
-            result.pieces.iter().map(|piece| piece.index).collect::<Vec<_>>(),
+            result
+                .pieces
+                .iter()
+                .map(|piece| piece.index)
+                .collect::<Vec<_>>(),
             vec![0, 2]
         );
         assert_eq!(result.pieces[0].bytes, b"abcd");
@@ -2208,8 +2676,11 @@ mod tests {
                 .expect("write timeout sets");
 
             let mut handshake = [0u8; HANDSHAKE_LEN];
-            socket.read_exact(&mut handshake).expect("client handshake arrives");
-            let handshake = peer::parse_handshake_full(&handshake).expect("client handshake parses");
+            socket
+                .read_exact(&mut handshake)
+                .expect("client handshake arrives");
+            let handshake =
+                peer::parse_handshake_full(&handshake).expect("client handshake parses");
             assert_eq!(handshake.info_hash, info_hash);
             assert!(peer::supports_extension_protocol(&handshake));
             assert!(peer::supports_dht(&handshake));
@@ -2230,7 +2701,8 @@ mod tests {
                 .write_all(&peer::build_port(49002))
                 .expect("server DHT port writes");
 
-            let message = read_peer_message(&mut socket).expect("client extension handshake arrives");
+            let message =
+                read_peer_message(&mut socket).expect("client extension handshake arrives");
             let PeerMessage::Extended {
                 extension_id: 0,
                 payload,

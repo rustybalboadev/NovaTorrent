@@ -19,9 +19,10 @@ export function formatRate(value = 0) {
 
 export function formatEta(seconds?: number | null) {
   if (!seconds || seconds <= 0 || !Number.isFinite(seconds)) return "-";
+  if (seconds < 60) return "<1m";
   const hours = Math.floor(seconds / 3600);
   const minutes = Math.floor((seconds % 3600) / 60);
-  if (hours > 24) return `${Math.floor(hours / 24)}d ${hours % 24}h`;
+  if (hours >= 24) return `${Math.floor(hours / 24)}d ${hours % 24}h`;
   if (hours > 0) return `${hours}h ${minutes}m`;
   return `${minutes}m`;
 }

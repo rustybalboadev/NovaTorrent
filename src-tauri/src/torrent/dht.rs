@@ -1,7 +1,8 @@
 use std::{
     collections::HashSet,
-    net::{Ipv6Addr, ToSocketAddrs, UdpSocket},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    io::ErrorKind,
+    net::{Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -9,14 +10,14 @@ use serde::{Deserialize, Serialize};
 use crate::torrent::{
     bencode::{self, BencodeNode},
     peer::PeerInfo,
-    sha1,
-    tracker,
+    sha1, tracker,
 };
 
 pub const DHT_BUCKET_COUNT: usize = 160;
 pub const DHT_BUCKET_SIZE: usize = 8;
 pub const DHT_GOOD_WINDOW_MS: u128 = 15 * 60 * 1_000;
 pub const DHT_MAX_CONSECUTIVE_FAILURES: u8 = 2;
+pub const DHT_LOOKUP_ALPHA: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DhtNode {
@@ -189,12 +190,7 @@ impl DhtRoutingTable {
         self.upsert(node, now_ms, RoutingObservation::Candidate)
     }
 
-    fn upsert(
-        &mut self,
-        node: DhtNode,
-        now_ms: u128,
-        observation: RoutingObservation,
-    ) -> bool {
+    fn upsert(&mut self, node: DhtNode, now_ms: u128, observation: RoutingObservation) -> bool {
         if node.port == 0 {
             return false;
         }
@@ -448,7 +444,11 @@ pub fn build_ping_query(transaction_id: &[u8], node_id: [u8; 20]) -> Vec<u8> {
     out
 }
 
-pub fn build_find_node_query(transaction_id: &[u8], node_id: [u8; 20], target: [u8; 20]) -> Vec<u8> {
+pub fn build_find_node_query(
+    transaction_id: &[u8],
+    node_id: [u8; 20],
+    target: [u8; 20],
+) -> Vec<u8> {
     build_find_node_query_with_want(transaction_id, node_id, target, &[])
 }
 
@@ -470,7 +470,11 @@ pub fn build_find_node_query_with_want(
     out
 }
 
-pub fn build_get_peers_query(transaction_id: &[u8], node_id: [u8; 20], info_hash: [u8; 20]) -> Vec<u8> {
+pub fn build_get_peers_query(
+    transaction_id: &[u8],
+    node_id: [u8; 20],
+    info_hash: [u8; 20],
+) -> Vec<u8> {
     build_get_peers_query_with_want(transaction_id, node_id, info_hash, &[])
 }
 
@@ -588,7 +592,12 @@ pub fn parse_dht_query(input: &[u8]) -> Result<DhtQuery, String> {
                 implied_port,
             }
         }
-        _ => return Err(format!("unknown DHT method: {}", String::from_utf8_lossy(method))),
+        _ => {
+            return Err(format!(
+                "unknown DHT method: {}",
+                String::from_utf8_lossy(method)
+            ))
+        }
     };
     Ok(DhtQuery {
         transaction_id,
@@ -706,7 +715,10 @@ pub fn lookup_peers(
     let mut candidates = seeds
         .iter()
         .cloned()
-        .map(|contact| DhtCandidate { contact, node_id: None })
+        .map(|contact| DhtCandidate {
+            contact,
+            node_id: None,
+        })
         .collect::<Vec<_>>();
     let mut seen_nodes = HashSet::new();
     for candidate in &candidates {
@@ -720,80 +732,99 @@ pub fn lookup_peers(
     let max_queries = options.max_queries.max(1);
 
     while queried_nodes.len() < max_queries {
-        let Some(index) = select_next_candidate(&candidates, &queried_nodes, &info_hash) else {
-            break;
-        };
-        let candidate = candidates.remove(index);
-        let endpoint = candidate.contact.endpoint();
-        if !queried_nodes.insert(candidate.contact.key()) {
-            continue;
-        }
-
-        let transaction_id = lookup_transaction_id(queried_nodes.len() as u16);
-        let packet = build_get_peers_query(&transaction_id, node_id, info_hash);
-        let response = match send_krpc_query(&endpoint, &packet, options.timeout) {
-            Ok(response) => response,
-            Err(err) => {
-                errors.push(format!("{endpoint}: {err}"));
-                continue;
-            }
-        };
-
-        let response = match parse_dht_response(&response) {
-            Ok(response) => response,
-            Err(response_err) => {
-                let message = parse_dht_error(&response)
-                    .map(|err| format!("DHT error {}: {}", err.code, err.message))
-                    .unwrap_or(response_err);
-                errors.push(format!("{endpoint}: {message}"));
-                continue;
-            }
-        };
-
-        if response.transaction_id != transaction_id {
-            errors.push(format!("{endpoint}: DHT transaction ID mismatch"));
-            continue;
-        }
-
-        if let Some(token) = response.token.clone() {
-            if let Some(existing) = announce_targets
-                .iter_mut()
-                .find(|target| target.contact == candidate.contact)
-            {
-                existing.token = token;
-            } else {
-                announce_targets.push(DhtAnnounceTarget {
-                    contact: candidate.contact.clone(),
-                    token,
-                });
-            }
-        }
-
-        merge_lookup_peers(&mut peers, response.peers);
-        for node in response.nodes {
-            if node.port == 0 {
-                continue;
-            }
-            let contact = DhtContact {
-                address: node.address.clone(),
-                port: node.port,
+        let mut wave = Vec::new();
+        while wave.len() < DHT_LOOKUP_ALPHA && queried_nodes.len() < max_queries {
+            let Some(index) = select_next_candidate(&candidates, &queried_nodes, &info_hash) else {
+                break;
             };
-            if routing_table.insert(node.clone()) && seen_nodes.insert(contact.key()) {
-                candidates.push(DhtCandidate {
-                    contact,
-                    node_id: Some(node.id),
-                });
+            let candidate = candidates.remove(index);
+            if !queried_nodes.insert(candidate.contact.key()) {
+                continue;
             }
+            let transaction_id = lookup_transaction_id(queried_nodes.len() as u16);
+            wave.push((candidate, transaction_id));
         }
-        let ignored_ipv6_nodes = response
-            .nodes6
-            .into_iter()
-            .filter(|node| node.port != 0)
-            .count();
-        if ignored_ipv6_nodes > 0 {
-            errors.push(format!(
-                "ignored {ignored_ipv6_nodes} IPv6 DHT nodes because dual-stack routing is not active"
-            ));
+        if wave.is_empty() {
+            break;
+        }
+
+        let mut workers = Vec::with_capacity(wave.len());
+        for (candidate, transaction_id) in wave {
+            workers.push(std::thread::spawn(move || {
+                let endpoint = candidate.contact.endpoint();
+                let packet = build_get_peers_query(&transaction_id, node_id, info_hash);
+                let result = send_krpc_query(&endpoint, &packet, options.timeout);
+                (candidate, transaction_id, endpoint, result)
+            }));
+        }
+
+        for worker in workers {
+            let Ok((candidate, transaction_id, endpoint, response_bytes)) = worker.join() else {
+                errors.push("DHT lookup worker panicked".to_string());
+                continue;
+            };
+            let response_bytes = match response_bytes {
+                Ok(response) => response,
+                Err(err) => {
+                    errors.push(format!("{endpoint}: {err}"));
+                    continue;
+                }
+            };
+            let response = match parse_dht_response(&response_bytes) {
+                Ok(response) => response,
+                Err(response_err) => {
+                    let message = parse_dht_error(&response_bytes)
+                        .map(|err| format!("DHT error {}: {}", err.code, err.message))
+                        .unwrap_or(response_err);
+                    errors.push(format!("{endpoint}: {message}"));
+                    continue;
+                }
+            };
+            if response.transaction_id != transaction_id {
+                errors.push(format!("{endpoint}: DHT transaction ID mismatch"));
+                continue;
+            }
+
+            if let Some(token) = response.token.clone() {
+                if let Some(existing) = announce_targets
+                    .iter_mut()
+                    .find(|target| target.contact == candidate.contact)
+                {
+                    existing.token = token;
+                } else {
+                    announce_targets.push(DhtAnnounceTarget {
+                        contact: candidate.contact.clone(),
+                        token,
+                    });
+                }
+            }
+
+            merge_lookup_peers(&mut peers, response.peers);
+            for node in response.nodes {
+                if node.port == 0 {
+                    continue;
+                }
+                let contact = DhtContact {
+                    address: node.address.clone(),
+                    port: node.port,
+                };
+                if routing_table.insert(node.clone()) && seen_nodes.insert(contact.key()) {
+                    candidates.push(DhtCandidate {
+                        contact,
+                        node_id: Some(node.id),
+                    });
+                }
+            }
+            let ignored_ipv6_nodes = response
+                .nodes6
+                .into_iter()
+                .filter(|node| node.port != 0)
+                .count();
+            if ignored_ipv6_nodes > 0 {
+                errors.push(format!(
+                    "ignored {ignored_ipv6_nodes} IPv6 DHT nodes because dual-stack routing is not active"
+                ));
+            }
         }
 
         if !peers.is_empty() {
@@ -932,30 +963,92 @@ pub fn parse_dht_error(input: &[u8]) -> Result<DhtError, String> {
     })
 }
 
-pub fn send_krpc_query(
-    address: &str,
+pub fn send_krpc_query(address: &str, packet: &[u8], timeout: Duration) -> Result<Vec<u8>, String> {
+    let destinations = address
+        .to_socket_addrs()
+        .map_err(|err| format!("could not resolve DHT node: {err}"))?
+        .collect::<Vec<_>>();
+    send_krpc_query_to_destinations(&destinations, packet, timeout)
+}
+
+fn send_krpc_query_to_destinations(
+    destinations: &[SocketAddr],
     packet: &[u8],
     timeout: Duration,
 ) -> Result<Vec<u8>, String> {
-    let destination = address
-        .to_socket_addrs()
-        .map_err(|err| format!("could not resolve DHT node: {err}"))?
-        .next()
-        .ok_or_else(|| "DHT node address did not resolve".to_string())?;
-    let socket = UdpSocket::bind("0.0.0.0:0")
-        .map_err(|err| format!("could not bind DHT UDP socket: {err}"))?;
-    socket
-        .set_read_timeout(Some(timeout))
-        .map_err(|err| format!("could not set DHT read timeout: {err}"))?;
-    socket
-        .send_to(packet, destination)
-        .map_err(|err| format!("could not send DHT query: {err}"))?;
+    if destinations.is_empty() {
+        return Err("DHT node address did not resolve".to_string());
+    }
+
+    let mut sockets = Vec::new();
+    let mut attempted = HashSet::new();
+    let mut failures = Vec::new();
+    for destination in destinations.iter().copied() {
+        if !attempted.insert(destination) {
+            continue;
+        }
+        let bind_address = if destination.is_ipv6() {
+            "[::]:0"
+        } else {
+            "0.0.0.0:0"
+        };
+        let setup = (|| -> Result<UdpSocket, String> {
+            let socket = UdpSocket::bind(bind_address)
+                .map_err(|err| format!("could not bind UDP socket: {err}"))?;
+            socket
+                .connect(destination)
+                .map_err(|err| format!("could not connect UDP socket: {err}"))?;
+            socket
+                .set_nonblocking(true)
+                .map_err(|err| format!("could not make UDP socket nonblocking: {err}"))?;
+            socket
+                .send(packet)
+                .map_err(|err| format!("could not send query: {err}"))?;
+            Ok(socket)
+        })();
+        match setup {
+            Ok(socket) => sockets.push((destination, socket)),
+            Err(err) => failures.push(format!("{destination}: {err}")),
+        }
+    }
+    if sockets.is_empty() {
+        return Err(format!(
+            "could not query any resolved DHT address: {}",
+            failures.join("; ")
+        ));
+    }
+
+    let deadline = Instant::now() + timeout;
     let mut buffer = vec![0u8; 2048];
-    let (length, _) = socket
-        .recv_from(&mut buffer)
-        .map_err(|err| format!("could not receive DHT response: {err}"))?;
-    buffer.truncate(length);
-    Ok(buffer)
+    loop {
+        for (destination, socket) in &sockets {
+            match socket.recv(&mut buffer) {
+                Ok(length) => {
+                    buffer.truncate(length);
+                    return Ok(buffer);
+                }
+                Err(err) if err.kind() == ErrorKind::WouldBlock => {}
+                Err(err) => {
+                    failures.push(format!("{destination}: could not receive response: {err}"))
+                }
+            }
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        std::thread::sleep((deadline - now).min(Duration::from_millis(5)));
+    }
+
+    Err(format!(
+        "DHT query timed out across {} resolved address(es){}",
+        sockets.len(),
+        if failures.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", failures.join("; "))
+        }
+    ))
 }
 
 pub fn ping_node(
@@ -963,12 +1056,7 @@ pub fn ping_node(
     transaction_id: &[u8],
     node_id: [u8; 20],
 ) -> Result<DhtResponse, String> {
-    ping_node_with_timeout(
-        address,
-        transaction_id,
-        node_id,
-        Duration::from_secs(5),
-    )
+    ping_node_with_timeout(address, transaction_id, node_id, Duration::from_secs(5))
 }
 
 pub fn ping_node_with_timeout(
@@ -1026,8 +1114,7 @@ pub fn parse_compact_nodes6(bytes: &[u8]) -> Result<Vec<DhtNode>, String> {
     for chunk in bytes.chunks_exact(38) {
         let id = bytes_to_20(&chunk[..20])?;
         let address = Ipv6Addr::from(
-            <[u8; 16]>::try_from(&chunk[20..36])
-                .expect("sixteen-byte IPv6 compact node slice"),
+            <[u8; 16]>::try_from(&chunk[20..36]).expect("sixteen-byte IPv6 compact node slice"),
         )
         .to_string();
         let port = u16::from_be_bytes([chunk[36], chunk[37]]);
@@ -1238,12 +1325,15 @@ fn parse_compact_peer_value(bytes: &[u8]) -> Result<Vec<PeerInfo>, String> {
             }])
         }
         len if len % 6 == 0 => tracker::parse_compact_peers(bytes),
-        _ => Err("DHT compact peer value must be 6-byte IPv4 or 18-byte IPv6 contact data".to_string()),
+        _ => Err(
+            "DHT compact peer value must be 6-byte IPv4 or 18-byte IPv6 contact data".to_string(),
+        ),
     }
 }
 
 fn bytes_to_20(bytes: &[u8]) -> Result<[u8; 20], String> {
-    bytes.try_into()
+    bytes
+        .try_into()
         .map_err(|_| "DHT node id must be 20 bytes".to_string())
 }
 
@@ -1267,7 +1357,7 @@ fn write_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{net::UdpSocket, thread};
+    use std::{net::UdpSocket, thread, time::Instant};
 
     #[test]
     fn builds_ping_query_matching_bep5_shape() {
@@ -1281,11 +1371,8 @@ mod tests {
 
     #[test]
     fn builds_find_node_query() {
-        let query = build_find_node_query(
-            b"aa",
-            *b"abcdefghij0123456789",
-            *b"mnopqrstuvwxyz123456",
-        );
+        let query =
+            build_find_node_query(b"aa", *b"abcdefghij0123456789", *b"mnopqrstuvwxyz123456");
 
         assert_eq!(
             query,
@@ -1295,11 +1382,8 @@ mod tests {
 
     #[test]
     fn builds_get_peers_query() {
-        let query = build_get_peers_query(
-            b"aa",
-            *b"abcdefghij0123456789",
-            *b"mnopqrstuvwxyz123456",
-        );
+        let query =
+            build_get_peers_query(b"aa", *b"abcdefghij0123456789", *b"mnopqrstuvwxyz123456");
 
         assert_eq!(
             query,
@@ -1373,14 +1457,9 @@ mod tests {
             upload_speed: 0,
             connection: "DHT".to_string(),
         };
-        let response = build_get_peers_response(
-            b"aa",
-            *b"abcdefghij0123456789",
-            b"token",
-            &[peer],
-            &[],
-        )
-        .expect("get_peers response builds");
+        let response =
+            build_get_peers_response(b"aa", *b"abcdefghij0123456789", b"token", &[peer], &[])
+                .expect("get_peers response builds");
         let parsed = parse_dht_response(&response).expect("get_peers response parses");
         assert_eq!(parsed.token.as_deref(), Some(&b"token"[..]));
         assert_eq!(parsed.peers[0].address, "127.0.0.1");
@@ -1406,7 +1485,10 @@ mod tests {
         compact.extend_from_slice(&0u16.to_be_bytes());
         compact.extend_from_slice(&build_compact_node(&node).expect("node compacts"));
 
-        assert_eq!(parse_compact_nodes(&compact).expect("nodes parse"), vec![node]);
+        assert_eq!(
+            parse_compact_nodes(&compact).expect("nodes parse"),
+            vec![node]
+        );
     }
 
     #[test]
@@ -1490,7 +1572,10 @@ mod tests {
         }));
 
         assert_eq!(table.len(), 1);
-        assert_eq!(table.closest_nodes([0u8; 20], 1)[0].id, node_id_with_last_byte(2));
+        assert_eq!(
+            table.closest_nodes([0u8; 20], 1)[0].id,
+            node_id_with_last_byte(2)
+        );
     }
 
     #[test]
@@ -1658,6 +1743,39 @@ mod tests {
     }
 
     #[test]
+    fn dht_query_uses_first_response_across_resolved_addresses() {
+        let unresponsive = UdpSocket::bind("127.0.0.1:0").expect("unresponsive socket binds");
+        let unresponsive_address = unresponsive.local_addr().expect("unresponsive address");
+        let responsive = UdpSocket::bind("127.0.0.1:0").expect("responsive socket binds");
+        let responsive_address = responsive.local_addr().expect("responsive address");
+        let server = thread::spawn(move || {
+            let mut buffer = [0u8; 32];
+            let (length, client) = responsive.recv_from(&mut buffer).expect("query arrives");
+            assert_eq!(&buffer[..length], b"query");
+            responsive
+                .send_to(b"response", client)
+                .expect("response sends");
+        });
+
+        let started = Instant::now();
+        let response = send_krpc_query_to_destinations(
+            &[unresponsive_address, responsive_address],
+            b"query",
+            Duration::from_secs(1),
+        )
+        .expect("responsive destination wins");
+
+        server.join().expect("server exits");
+        assert_eq!(response, b"response");
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "fallback waited for the unresponsive address: {:?}",
+            started.elapsed()
+        );
+        drop(unresponsive);
+    }
+
+    #[test]
     fn pings_local_dht_node_over_udp() {
         let server = UdpSocket::bind("127.0.0.1:0").expect("local UDP socket binds");
         let address = server.local_addr().expect("server has address").to_string();
@@ -1672,10 +1790,7 @@ mod tests {
                 build_ping_query(b"aa", query_node_id).as_slice()
             );
             server
-                .send_to(
-                    b"d1:rd2:id20:mnopqrstuvwxyz123456e1:t2:aa1:y1:re",
-                    client,
-                )
+                .send_to(b"d1:rd2:id20:mnopqrstuvwxyz123456e1:t2:aa1:y1:re", client)
                 .expect("response sends");
         });
 
@@ -1743,9 +1858,14 @@ mod tests {
         let info_hash = *b"mnopqrstuvwxyz123456";
         let server = thread::spawn(move || {
             let mut buffer = [0u8; 2048];
-            let (length, client) = socket.recv_from(&mut buffer).expect("announce query arrives");
+            let (length, client) = socket
+                .recv_from(&mut buffer)
+                .expect("announce query arrives");
             let root = bencode::parse(&buffer[..length]).expect("announce query parses");
-            assert_eq!(root.dict_get(b"y").and_then(BencodeNode::as_bytes), Some(&b"q"[..]));
+            assert_eq!(
+                root.dict_get(b"y").and_then(BencodeNode::as_bytes),
+                Some(&b"q"[..])
+            );
             assert_eq!(
                 root.dict_get(b"q").and_then(BencodeNode::as_bytes),
                 Some(&b"announce_peer"[..])
@@ -1755,7 +1875,10 @@ mod tests {
                 args.dict_get(b"info_hash").and_then(BencodeNode::as_bytes),
                 Some(&info_hash[..])
             );
-            assert_eq!(args.dict_get(b"port").and_then(BencodeNode::as_i64), Some(6999));
+            assert_eq!(
+                args.dict_get(b"port").and_then(BencodeNode::as_i64),
+                Some(6999)
+            );
             assert_eq!(
                 args.dict_get(b"implied_port").and_then(BencodeNode::as_i64),
                 Some(0)
@@ -1773,7 +1896,9 @@ mod tests {
             response.extend_from_slice(b"e1:t");
             write_bytes(&mut response, transaction_id);
             response.extend_from_slice(b"1:y1:re");
-            socket.send_to(&response, client).expect("announce response sends");
+            socket
+                .send_to(&response, client)
+                .expect("announce response sends");
         });
 
         let response = announce_peer(
@@ -1814,8 +1939,14 @@ mod tests {
             let mut buffer = [0u8; 2048];
             let (length, client) = seed.recv_from(&mut buffer).expect("seed query arrives");
             let transaction_id = assert_get_peers_query(&buffer[..length], info_hash);
-            let response = build_nodes_response(&transaction_id, *b"seednode-abcdefghijk", &[closer_node], b"tk");
-            seed.send_to(&response, client).expect("seed response sends");
+            let response = build_nodes_response(
+                &transaction_id,
+                *b"seednode-abcdefghijk",
+                &[closer_node],
+                b"tk",
+            );
+            seed.send_to(&response, client)
+                .expect("seed response sends");
         });
 
         let closer_handle = thread::spawn(move || {
@@ -1836,7 +1967,9 @@ mod tests {
                 }],
                 b"tk",
             );
-            closer.send_to(&response, client).expect("closer response sends");
+            closer
+                .send_to(&response, client)
+                .expect("closer response sends");
         });
 
         let result = lookup_peers(
@@ -1867,9 +2000,60 @@ mod tests {
         assert!(result.errors.is_empty());
     }
 
+    #[test]
+    fn lookup_peers_queries_seed_wave_concurrently() {
+        let info_hash = *b"mnopqrstuvwxyz123456";
+        let mut contacts = Vec::new();
+        let mut servers = Vec::new();
+        for index in 0..DHT_LOOKUP_ALPHA {
+            let socket = UdpSocket::bind("127.0.0.1:0").expect("DHT seed binds");
+            contacts.push(DhtContact {
+                address: "127.0.0.1".to_string(),
+                port: socket.local_addr().expect("DHT seed address").port(),
+            });
+            servers.push(thread::spawn(move || {
+                let mut buffer = [0u8; 2048];
+                let (length, client) = socket.recv_from(&mut buffer).expect("DHT query arrives");
+                let transaction_id = assert_get_peers_query(&buffer[..length], info_hash);
+                thread::sleep(Duration::from_millis(400));
+                let mut node_id = *b"seednode-abcdefghijk";
+                node_id[0] = index as u8;
+                let response = build_nodes_response(&transaction_id, node_id, &[], b"tk");
+                socket
+                    .send_to(&response, client)
+                    .expect("DHT response sends");
+            }));
+        }
+
+        let started = Instant::now();
+        let result = lookup_peers(
+            &contacts,
+            *b"abcdefghij0123456789",
+            info_hash,
+            DhtLookupOptions {
+                timeout: Duration::from_secs(2),
+                max_queries: DHT_LOOKUP_ALPHA,
+            },
+        )
+        .expect("parallel lookup succeeds");
+        let elapsed = started.elapsed();
+
+        for server in servers {
+            server.join().expect("DHT seed exits");
+        }
+        assert_eq!(result.queried_nodes, DHT_LOOKUP_ALPHA);
+        assert!(
+            elapsed < Duration::from_millis(900),
+            "DHT seed queries ran serially: {elapsed:?}"
+        );
+    }
+
     fn assert_get_peers_query(input: &[u8], expected_info_hash: [u8; 20]) -> Vec<u8> {
         let root = bencode::parse(input).expect("query bencode parses");
-        assert_eq!(root.dict_get(b"y").and_then(BencodeNode::as_bytes), Some(&b"q"[..]));
+        assert_eq!(
+            root.dict_get(b"y").and_then(BencodeNode::as_bytes),
+            Some(&b"q"[..])
+        );
         assert_eq!(
             root.dict_get(b"q").and_then(BencodeNode::as_bytes),
             Some(&b"get_peers"[..])
@@ -1885,7 +2069,12 @@ mod tests {
             .to_vec()
     }
 
-    fn build_nodes_response(transaction_id: &[u8], node_id: [u8; 20], nodes: &[DhtNode], token: &[u8]) -> Vec<u8> {
+    fn build_nodes_response(
+        transaction_id: &[u8],
+        node_id: [u8; 20],
+        nodes: &[DhtNode],
+        token: &[u8],
+    ) -> Vec<u8> {
         let mut compact = Vec::new();
         for node in nodes {
             compact.extend_from_slice(&build_compact_node(node).expect("node compacts"));
@@ -1902,7 +2091,12 @@ mod tests {
         out
     }
 
-    fn build_values_response(transaction_id: &[u8], node_id: [u8; 20], peers: &[PeerInfo], token: &[u8]) -> Vec<u8> {
+    fn build_values_response(
+        transaction_id: &[u8],
+        node_id: [u8; 20],
+        peers: &[PeerInfo],
+        token: &[u8],
+    ) -> Vec<u8> {
         let mut out = b"d1:rd2:id".to_vec();
         write_bytes(&mut out, &node_id);
         out.extend_from_slice(b"5:token");

@@ -56,6 +56,15 @@
     min-height: 100%;
   }
 
+  html {
+    background: hsl(var(--background));
+    color-scheme: light;
+  }
+
+  html.dark {
+    color-scheme: dark;
+  }
+
   body {
     @apply bg-background text-foreground antialiased;
     font-family:
@@ -71,15 +80,8 @@
 
 @layer utilities {
   .panel {
-    @apply border bg-card text-card-foreground shadow-panel;
+    @apply border bg-card text-card-foreground;
     border-radius: 8px;
-  }
-
-  .surface-grid {
-    background-image:
-      linear-gradient(hsl(var(--border) / 0.42) 1px, transparent 1px),
-      linear-gradient(90deg, hsl(var(--border) / 0.42) 1px, transparent 1px);
-    background-size: 40px 40px;
   }
 
   .truncate-path {

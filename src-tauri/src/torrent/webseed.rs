@@ -12,11 +12,7 @@ use std::{
 use native_tls::TlsConnector;
 use serde::{Deserialize, Serialize};
 
-use crate::torrent::{
-    metainfo::TorrentFile,
-    peerwire::BandwidthLimiter,
-    sha1, storage,
-};
+use crate::torrent::{metainfo::TorrentFile, peerwire::BandwidthLimiter, sha1, storage};
 
 const MAX_WEBSEED_REDIRECTS: usize = 3;
 
@@ -56,7 +52,12 @@ pub fn initial_statuses(urls: &[String]) -> Vec<WebSeedStatus> {
         .collect()
 }
 
-pub fn build_file_url(seed_url: &str, torrent_name: &str, file: &TorrentFile, multi_file: bool) -> String {
+pub fn build_file_url(
+    seed_url: &str,
+    torrent_name: &str,
+    file: &TorrentFile,
+    multi_file: bool,
+) -> String {
     if !seed_url.ends_with('/') {
         return seed_url.to_string();
     }
@@ -203,15 +204,16 @@ pub fn download_torrent_cancellable_with_limiter(
         ));
     }
     let pieces_verified = verify_pieces(&body, piece_length, piece_hashes)?;
-    let summary = storage::write_torrent_bytes(
-        output_folder,
-        torrent_name,
-        files,
-        &body,
-        overwrite,
-    )?;
-    let output_path = if multi_file {
+    let summary =
+        storage::write_torrent_bytes(output_folder, torrent_name, files, &body, overwrite)?;
+    let output_path = if storage::requires_torrent_name_folder(files) {
         output_folder.join(torrent_name)
+    } else if multi_file {
+        files
+            .first()
+            .and_then(|file| file.components.first())
+            .map(|folder| output_folder.join(folder))
+            .unwrap_or_else(|| output_folder.to_path_buf())
     } else {
         summary
             .paths
@@ -285,7 +287,11 @@ pub fn build_http_get_request(endpoint: &HttpEndpoint, range: Option<(u64, u64)>
     )
 }
 
-pub fn verify_pieces(data: &[u8], piece_length: u64, piece_hashes: &[[u8; 20]]) -> Result<usize, String> {
+pub fn verify_pieces(
+    data: &[u8],
+    piece_length: u64,
+    piece_hashes: &[[u8; 20]],
+) -> Result<usize, String> {
     if piece_length == 0 {
         return Err("piece length cannot be zero".to_string());
     }
@@ -348,12 +354,11 @@ fn get_http_response(
     cancelled: &AtomicBool,
     download_limiter: Option<&BandwidthLimiter>,
 ) -> Result<Vec<u8>, String> {
-    let address = (endpoint.host.as_str(), endpoint.port)
+    let addresses = (endpoint.host.as_str(), endpoint.port)
         .to_socket_addrs()
         .map_err(|err| format!("could not resolve webseed host: {err}"))?
-        .next()
-        .ok_or_else(|| "webseed host did not resolve to an address".to_string())?;
-    let mut stream = connect_http_webseed_stream(endpoint, address)?;
+        .collect::<Vec<_>>();
+    let mut stream = connect_http_webseed_addresses(endpoint, &addresses, cancelled)?;
     let max_response_length = usize::try_from(expected_length)
         .map_err(|_| "webseed file is too large for this platform".to_string())?
         .checked_add(1024 * 1024)
@@ -373,7 +378,9 @@ fn get_http_response(
             Ok(0) => break,
             Ok(length) => {
                 if response.len().saturating_add(length) > max_response_length {
-                    return Err("webseed response exceeded the expected file length allowance".to_string());
+                    return Err(
+                        "webseed response exceeded the expected file length allowance".to_string(),
+                    );
                 }
                 response.extend_from_slice(&buffer[..length]);
                 if let Some(limiter) = download_limiter {
@@ -446,6 +453,32 @@ fn ensure_not_cancelled(cancelled: &AtomicBool) -> Result<(), String> {
 trait WebSeedHttpStream: Read + Write {}
 
 impl<T: Read + Write> WebSeedHttpStream for T {}
+
+fn connect_http_webseed_addresses(
+    endpoint: &HttpEndpoint,
+    addresses: &[std::net::SocketAddr],
+    cancelled: &AtomicBool,
+) -> Result<Box<dyn WebSeedHttpStream>, String> {
+    if addresses.is_empty() {
+        return Err("webseed host did not resolve to an address".to_string());
+    }
+
+    let mut failures = Vec::new();
+    for (index, address) in addresses.iter().copied().enumerate() {
+        if addresses[..index].contains(&address) {
+            continue;
+        }
+        ensure_not_cancelled(cancelled)?;
+        match connect_http_webseed_stream(endpoint, address) {
+            Ok(stream) => return Ok(stream),
+            Err(err) => failures.push(format!("{address}: {err}")),
+        }
+    }
+    Err(format!(
+        "could not connect to webseed using any resolved address: {}",
+        failures.join("; ")
+    ))
+}
 
 fn connect_http_webseed_stream(
     endpoint: &HttpEndpoint,
@@ -569,7 +602,6 @@ fn encode_path_component(component: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::torrent::metainfo::Metainfo;
     use std::{
         fs,
         net::TcpListener,
@@ -588,13 +620,23 @@ mod tests {
 
     #[test]
     fn builds_single_file_url_from_folder_seed() {
-        let url = build_file_url("http://mirror.test/pub/", "example.bin", &file("example.bin", 1), false);
+        let url = build_file_url(
+            "http://mirror.test/pub/",
+            "example.bin",
+            &file("example.bin", 1),
+            false,
+        );
         assert_eq!(url, "http://mirror.test/pub/example.bin");
     }
 
     #[test]
     fn preserves_complete_file_seed_url() {
-        let url = build_file_url("http://mirror.test/pub/example.bin", "example.bin", &file("example.bin", 1), false);
+        let url = build_file_url(
+            "http://mirror.test/pub/example.bin",
+            "example.bin",
+            &file("example.bin", 1),
+            false,
+        );
         assert_eq!(url, "http://mirror.test/pub/example.bin");
     }
 
@@ -629,7 +671,10 @@ mod tests {
     #[test]
     fn parses_http_response_body() {
         let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
-        assert_eq!(parse_http_response(response).expect("response parses"), b"hello".to_vec());
+        assert_eq!(
+            parse_http_response(response).expect("response parses"),
+            b"hello".to_vec()
+        );
     }
 
     #[test]
@@ -656,7 +701,8 @@ mod tests {
 
     #[test]
     fn decodes_chunked_response_body() {
-        let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+        let response =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
         assert_eq!(
             parse_http_response(response).expect("chunked response parses"),
             b"hello".to_vec()
@@ -682,9 +728,7 @@ mod tests {
             let (mut stream, _) = server.accept().expect("target accepts");
             let mut request = [0u8; 512];
             let length = stream.read(&mut request).expect("target request reads");
-            assert!(
-                String::from_utf8_lossy(&request[..length]).starts_with("GET /payload.bin ")
-            );
+            assert!(String::from_utf8_lossy(&request[..length]).starts_with("GET /payload.bin "));
             stream
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
                 .expect("target response writes");
@@ -776,7 +820,9 @@ mod tests {
                         .as_bytes(),
                     )
                     .expect("webseed response headers write");
-                stream.write_all(body).expect("webseed response body writes");
+                stream
+                    .write_all(body)
+                    .expect("webseed response body writes");
             }
         });
 
@@ -804,73 +850,11 @@ mod tests {
         );
         assert!(!output.join("Example").join("two.bin").exists());
         assert_eq!(
-            fs::read(output.join("Example").join("three.bin"))
-                .expect("last selected file reads"),
+            fs::read(output.join("Example").join("three.bin")).expect("last selected file reads"),
             b"hi"
         );
         server.join().expect("webseed server exits");
         fs::remove_dir_all(output).expect("webseed output removes");
-    }
-
-    #[test]
-    #[ignore = "downloads the safe Alpine fixture over the network"]
-    fn downloads_alpine_safe_fixture_from_http_webseed() {
-        let bytes = include_bytes!("../../../fixtures/safe/alpine-minirootfs-3.23.3-x86_64.tar.gz.torrent");
-        let meta = Metainfo::from_bytes(bytes).expect("small safe fixture parses");
-        let seed = meta
-            .web_seeds
-            .iter()
-            .find(|url| url.starts_with("http://dl-cdn.alpinelinux.org/alpine/"))
-            .expect("fixture includes official Alpine HTTP webseed");
-        download_and_verify_alpine_webseed(&meta, seed);
-    }
-
-    #[test]
-    #[ignore = "downloads the safe Alpine fixture over HTTPS"]
-    fn downloads_alpine_safe_fixture_from_https_webseed() {
-        let bytes = include_bytes!("../../../fixtures/safe/alpine-minirootfs-3.23.3-x86_64.tar.gz.torrent");
-        let meta = Metainfo::from_bytes(bytes).expect("small safe fixture parses");
-        let seed = meta
-            .web_seeds
-            .iter()
-            .find(|url| url.starts_with("http://dl-cdn.alpinelinux.org/alpine/"))
-            .expect("fixture includes official Alpine HTTP webseed");
-        let seed = seed.replacen("http://", "https://", 1);
-        download_and_verify_alpine_webseed(&meta, &seed);
-    }
-
-    fn download_and_verify_alpine_webseed(meta: &Metainfo, seed: &str) {
-        let file = meta.files.first().expect("fixture has one file");
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock is after epoch")
-            .as_millis();
-        let output_dir = std::env::temp_dir().join(format!(
-            "novatorrent-live-webseed-{}-{unique}",
-            std::process::id()
-        ));
-
-        let result = download_single_file(
-            seed,
-            &meta.name,
-            &output_dir,
-            file,
-            meta.piece_length,
-            &meta.pieces,
-            false,
-        )
-        .expect("safe Alpine webseed downloads and verifies");
-
-        assert_eq!(result.bytes_written, meta.total_length);
-        assert_eq!(result.pieces_verified, meta.pieces.len());
-        assert_eq!(
-            fs::metadata(&result.output_path)
-                .expect("downloaded file exists")
-                .len(),
-            meta.total_length
-        );
-
-        fs::remove_dir_all(&output_dir).expect("live test output can be removed");
     }
 
     fn temp_dir_path(label: &str) -> PathBuf {

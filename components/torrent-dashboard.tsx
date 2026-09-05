@@ -1,16 +1,17 @@
 "use client";
 
 import * as React from "react";
+import Image from "next/image";
 import * as ContextMenu from "@radix-ui/react-context-menu";
 import * as Dialog from "@radix-ui/react-dialog";
 import {
-  Activity,
   BarChart3,
   CheckCircle2,
+  ChevronDown,
   Clapperboard,
   Download,
-  ExternalLink,
   FileCog,
+  Loader2,
   Magnet,
   Moon,
   Network,
@@ -23,7 +24,6 @@ import {
   Search,
   Settings2,
   ScrollText,
-  ShieldCheck,
   Sun,
   Trash2,
   Upload,
@@ -41,44 +41,43 @@ import { Switch } from "@/components/ui/switch";
 import {
   announceTorrent,
   backendLogFilePath,
-  backendLogs,
+  backendLogsAfter,
   deleteTorrent,
   downloadPeerTorrent,
   downloadWebSeedTorrent,
   fetchMetadataTorrent,
-  hashTorrentFile,
-  listTorrents,
+  listTorrentSummaries,
   openAddTorrentWindow,
   openMediaWindow,
-  openVirusTotalReport,
   pauseTorrent,
   queryDhtTorrent,
   recheckTorrent,
   resolveMagnetTorrent,
   resumeTorrent,
-  clearStreamPriority,
+  closeMediaWindow,
   setStreamPriority,
   streamFileAvailability,
   takePendingOpenSources,
   torrentDetails,
+  updateTorrentFilePriority,
   updateTorrentFiles,
   updateTorrentOptions
 } from "@/lib/tauri-api";
 import {
   normalizeTorrent,
+  normalizeTorrentSummary,
   type LogEntry,
   type StreamPriorityStatus,
   type TorrentFileAvailability,
-  type TorrentFileHash,
   type TorrentRow,
   type UpdateTorrentOptionsRequest
 } from "@/lib/torrent-types";
+import { isPlayableMediaName } from "@/lib/media";
 import { cn, formatBytes, formatEta, formatRate, percent } from "@/lib/utils";
 
 const filters = ["All", "Downloading", "Seeding", "Paused", "Complete", "Error"] as const;
-const inspectorTabs = ["Status", "General", "Peers", "Trackers", "Web Seeds", "Files", "Security", "Options", "Logs"] as const;
+const inspectorTabs = ["Details", "Connections", "Files", "Options", "Logs"] as const;
 const completedStates = new Set(["Complete", "Seeding", "Seed Ratio Reached"]);
-const playableExtensions = new Set(["mp4", "m4v", "mov", "webm", "mkv", "ogv", "avi"]);
 
 type MediaSession = {
   torrentId: string;
@@ -86,6 +85,15 @@ type MediaSession = {
   availability: TorrentFileAvailability;
   priority: StreamPriorityStatus;
 };
+
+type MediaPlayerClosedPayload = {
+  torrentId: string;
+  fileIndex: number;
+};
+
+type TorrentAction = "pause" | "resume" | "announce" | "dht" | "resolve" | "webseed" | "peers" | "metadata" | "recheck" | "delete" | "deleteFiles";
+
+const downloadingStates = new Set(["Queued", "Discovering", "Downloading", "Resuming", "Partial", "Metadata", "Fetching Metadata", "DHT"]);
 
 export function TorrentDashboard() {
   const { resolvedTheme, setTheme } = useTheme();
@@ -97,12 +105,20 @@ export function TorrentDashboard() {
   const [fileSelections, setFileSelections] = React.useState<Record<string, Set<number>>>({});
   const [error, setError] = React.useState<string | null>(null);
   const [bottomHeight, setBottomHeight] = React.useState(300);
-  const [inspectorTab, setInspectorTab] = React.useState<(typeof inspectorTabs)[number]>("Status");
+  const [inspectorTab, setInspectorTab] = React.useState<(typeof inspectorTabs)[number]>("Details");
   const [logs, setLogs] = React.useState<LogEntry[]>([]);
+  const [logsError, setLogsError] = React.useState<string | null>(null);
   const [logFilePath, setLogFilePath] = React.useState<string | null>(null);
   const [mediaSession, setMediaSession] = React.useState<MediaSession | null>(null);
   const [mediaBusy, setMediaBusy] = React.useState(false);
+  const [mediaBusyTorrentId, setMediaBusyTorrentId] = React.useState<string | null>(null);
   const [mediaError, setMediaError] = React.useState<string | null>(null);
+  const [busyAction, setBusyAction] = React.useState<string | null>(null);
+  const [priorityBusyFileIndex, setPriorityBusyFileIndex] = React.useState<number | null>(null);
+  const [detailsError, setDetailsError] = React.useState<string | null>(null);
+  const refreshPending = React.useRef<Promise<void> | null>(null);
+  const detailRequestId = React.useRef(0);
+  const lastLogId = React.useRef<number | null>(null);
 
   const selected = selectedId ? rows.find((row) => row.id === selectedId) ?? null : null;
   const selectedBackendId = typeof selected?.raw.id === "number" ? selected.raw.id : null;
@@ -114,20 +130,42 @@ export function TorrentDashboard() {
   }, [fileSelections, selected]);
 
   React.useEffect(() => {
-    void refresh();
-    const interval = window.setInterval(refresh, 2200);
-    return () => window.clearInterval(interval);
+    let disposed = false;
+    let timer: number | undefined;
+    const poll = async () => {
+      await refresh();
+      if (!disposed) timer = window.setTimeout(poll, document.hidden ? 15_000 : 1_500);
+    };
+    const handleVisibility = () => {
+      if (timer) window.clearTimeout(timer);
+      if (!document.hidden) void poll();
+    };
+    void poll();
+    document.addEventListener("visibilitychange", handleVisibility);
+    return () => {
+      disposed = true;
+      if (timer) window.clearTimeout(timer);
+      document.removeEventListener("visibilitychange", handleVisibility);
+    };
   }, []);
 
   React.useEffect(() => {
+    if (inspectorTab !== "Logs") return;
     let disposed = false;
+    let initialLoad = true;
+    lastLogId.current = null;
 
     const loadLogs = async () => {
       try {
-        const nextLogs = await backendLogs(selectedBackendId);
-        if (!disposed) setLogs(nextLogs);
-      } catch {
-        undefined;
+        const nextLogs = await backendLogsAfter(selectedBackendId, lastLogId.current);
+        if (!disposed) {
+          setLogs((current) => initialLoad ? nextLogs.slice(-1_000) : [...current, ...nextLogs].slice(-1_000));
+          lastLogId.current = nextLogs.at(-1)?.id ?? lastLogId.current;
+          initialLoad = false;
+          setLogsError(null);
+        }
+      } catch (err) {
+        if (!disposed) setLogsError(err instanceof Error ? err.message : "Could not load backend logs.");
       }
     };
 
@@ -137,14 +175,25 @@ export function TorrentDashboard() {
       disposed = true;
       window.clearInterval(interval);
     };
-  }, [selectedBackendId]);
+  }, [inspectorTab, selectedBackendId]);
 
   React.useEffect(() => {
-    if (!selected) return;
-    if (!selected.files.length) {
-      void hydrateDetails(selected.id);
+    if (!selectedId) {
+      return;
     }
-  }, [selected]);
+    let disposed = false;
+    let timer: number | undefined;
+    const poll = async (initial = false) => {
+      await hydrateDetails(selectedId);
+      if (!disposed) timer = window.setTimeout(() => void poll(), document.hidden ? 15_000 : 2_000);
+    };
+    void poll(true);
+    return () => {
+      disposed = true;
+      detailRequestId.current += 1;
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [selectedId]);
 
   React.useEffect(() => {
     if (mediaTorrentId == null || mediaFileIndex == null) return;
@@ -163,7 +212,9 @@ export function TorrentDashboard() {
         undefined;
       }
     };
-    const interval = window.setInterval(loadAvailability, 2500);
+    // The dedicated player polls aggressively while seeking. This background summary
+    // only needs a low-frequency heartbeat, avoiding duplicate storage work.
+    const interval = window.setInterval(loadAvailability, 10000);
     return () => {
       disposed = true;
       window.clearInterval(interval);
@@ -185,50 +236,95 @@ export function TorrentDashboard() {
   }, []);
 
   React.useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let disposed = false;
+    import("@tauri-apps/api/event")
+      .then(async ({ listen }) => {
+        const stopListening = await listen<MediaPlayerClosedPayload>("media-player-closed", (event) => {
+          setMediaSession((current) =>
+            current &&
+            current.torrentId === event.payload.torrentId &&
+            current.fileIndex === event.payload.fileIndex
+              ? null
+              : current
+          );
+          setMediaBusy(false);
+          setMediaBusyTorrentId(null);
+        });
+        if (disposed) stopListening();
+        else unlisten = stopListening;
+      })
+      .catch(() => undefined);
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+
+  React.useEffect(() => {
     backendLogFilePath()
       .then(setLogFilePath)
       .catch(() => undefined);
   }, []);
 
-  const filteredRows = rows.filter((row) => {
-    const matchesFilter = filter === "All" || row.state === filter;
-    const text = `${row.name} ${row.hash} ${row.outputFolder}`.toLowerCase();
-    return matchesFilter && text.includes(query.toLowerCase());
-  });
+  const filteredRows = React.useMemo(() => {
+    const normalizedQuery = query.trim().toLowerCase();
+    return rows.filter((row) => {
+      const matchesFilter = matchesTorrentFilter(row.state, filter);
+      const text = `${row.name} ${row.hash} ${row.outputFolder}`.toLowerCase();
+      return matchesFilter && text.includes(normalizedQuery);
+    });
+  }, [filter, query, rows]);
 
-  const totals = rows.reduce(
-    (acc, row) => {
-      acc.down += row.downloadSpeed;
-      acc.up += row.uploadSpeed;
-      acc.active += row.state === "Downloading" || row.state === "Live" || row.state === "Seeding" ? 1 : 0;
-      acc.complete += completedStates.has(row.state) ? 1 : 0;
-      return acc;
-    },
-    { down: 0, up: 0, active: 0, complete: 0 }
+  const totals = React.useMemo(
+    () => rows.reduce(
+      (acc, row) => {
+        acc.down += row.downloadSpeed;
+        acc.up += row.uploadSpeed;
+        acc.active += downloadingStates.has(row.state) || row.state === "Seeding" ? 1 : 0;
+        acc.complete += completedStates.has(row.state) ? 1 : 0;
+        return acc;
+      },
+      { down: 0, up: 0, active: 0, complete: 0 }
+    ),
+    [rows]
   );
 
   async function refresh() {
+    if (refreshPending.current) return refreshPending.current;
+    const pending = (async () => {
+      try {
+        const response = await listTorrentSummaries();
+        const nextRows = response.torrents.map(normalizeTorrentSummary);
+        setRows((currentRows) => mergeRows(currentRows, nextRows));
+        setSelectedId((current) => (current && nextRows.some((row) => row.id === current) ? current : null));
+        setMediaSession((current) =>
+          current && nextRows.some((row) => row.id === current.torrentId) ? current : null
+        );
+        setError(null);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Could not list torrents.");
+      }
+    })();
+    refreshPending.current = pending;
     try {
-      const response = await listTorrents();
-      const nextRows = response.torrents.map(normalizeTorrent);
-      setRows((currentRows) => mergeRows(currentRows, nextRows));
-      setSelectedId((current) => (current && nextRows.some((row) => row.id === current) ? current : null));
-      setMediaSession((current) =>
-        current && nextRows.some((row) => row.id === current.torrentId) ? current : null
-      );
-      setError(null);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not list torrents.");
+      await pending;
+    } finally {
+      refreshPending.current = null;
     }
   }
 
   async function hydrateDetails(id: string) {
+    const requestId = ++detailRequestId.current;
     try {
       const details = await torrentDetails(id);
+      if (requestId !== detailRequestId.current) return;
       const hydrated = normalizeTorrent(details);
       setRows((currentRows) => currentRows.map((row) => (row.id === id ? { ...row, ...hydrated } : row)));
-    } catch {
-      undefined;
+      setDetailsError(null);
+    } catch (err) {
+      if (requestId !== detailRequestId.current) return;
+      setDetailsError(err instanceof Error ? err.message : "Could not refresh torrent details.");
     }
   }
 
@@ -237,8 +333,10 @@ export function TorrentDashboard() {
     if (!opened) setAddOpen(true);
   }
 
-  async function runAction(action: "pause" | "resume" | "announce" | "dht" | "resolve" | "webseed" | "peers" | "metadata" | "recheck" | "delete" | "deleteFiles", row = selected) {
-    if (!row) return;
+  async function runAction(action: TorrentAction, row = selected) {
+    if (!row || busyAction) return;
+    const actionKey = `${row.id}:${action}`;
+    setBusyAction(actionKey);
     try {
       if (action === "pause") await pauseTorrent(row.id);
       if (action === "resume") await resumeTorrent(row.id);
@@ -254,11 +352,14 @@ export function TorrentDashboard() {
       await refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Torrent action failed.");
+    } finally {
+      setBusyAction(null);
     }
   }
 
   async function handleFileSelection(next: Set<number>) {
     if (!selected) return;
+    const torrentId = selected.id;
     setFileSelections((current) => ({ ...current, [selected.id]: next }));
     setRows((currentRows) =>
       currentRows.map((row) =>
@@ -271,9 +372,40 @@ export function TorrentDashboard() {
       )
     );
     try {
-      await updateTorrentFiles(selected.id, Array.from(next).sort((a, b) => a - b));
+      await updateTorrentFiles(torrentId, Array.from(next).sort((a, b) => a - b));
+      setError(null);
     } catch (err) {
+      setFileSelections((current) => {
+        const restored = { ...current };
+        delete restored[torrentId];
+        return restored;
+      });
+      await hydrateDetails(torrentId);
       setError(err instanceof Error ? err.message : "Could not update file selection.");
+    }
+  }
+
+  async function handleFilePriority(fileIndex: number, priority: number) {
+    if (!selected || priorityBusyFileIndex != null) return;
+    const torrentId = selected.id;
+    const previousPriority = selected.files[fileIndex]?.priority ?? 1;
+    setPriorityBusyFileIndex(fileIndex);
+    setRows((currentRows) => currentRows.map((row) => row.id === torrentId ? {
+      ...row,
+      files: row.files.map((file, index) => index === fileIndex ? { ...file, priority } : file)
+    } : row));
+    try {
+      await updateTorrentFilePriority(torrentId, fileIndex, priority);
+      await hydrateDetails(torrentId);
+      setError(null);
+    } catch (err) {
+      setRows((currentRows) => currentRows.map((row) => row.id === torrentId ? {
+        ...row,
+        files: row.files.map((file, index) => index === fileIndex ? { ...file, priority: previousPriority } : file)
+      } : row));
+      setError(err instanceof Error ? err.message : "Could not update file priority.");
+    } finally {
+      setPriorityBusyFileIndex(null);
     }
   }
 
@@ -291,6 +423,7 @@ export function TorrentDashboard() {
 
   async function handlePlayFile(row: TorrentRow, fileIndex: number, playheadOffset = 0) {
     setMediaBusy(true);
+    setMediaBusyTorrentId(row.id);
     setMediaError(null);
     try {
       const priority = await setStreamPriority(row.id, {
@@ -303,7 +436,6 @@ export function TorrentDashboard() {
       const availability = await streamFileAvailability(row.id, fileIndex);
       setMediaSession({ torrentId: row.id, fileIndex, priority, availability });
       setSelectedId(row.id);
-      setInspectorTab("Files");
       setError(null);
     } catch (err) {
       const message = err instanceof Error ? err.message : "Could not prepare this file for streaming.";
@@ -311,40 +443,53 @@ export function TorrentDashboard() {
       setError(message);
     } finally {
       setMediaBusy(false);
+      setMediaBusyTorrentId(null);
     }
+  }
+
+  function handlePlayTorrent(row: TorrentRow) {
+    if (row.firstPlayableFileIndex == null) return;
+    void handlePlayFile(row, row.firstPlayableFileIndex);
   }
 
   async function handleClearStream() {
     if (!mediaSession) return;
     const torrentId = mediaSession.torrentId;
+    const fileIndex = mediaSession.fileIndex;
     setMediaBusy(true);
     setMediaError(null);
     try {
-      await clearStreamPriority(torrentId);
+      await closeMediaWindow(torrentId, fileIndex);
       setMediaSession(null);
     } catch (err) {
-      setMediaError(err instanceof Error ? err.message : "Could not stop stream priority.");
+      setMediaError(err instanceof Error ? err.message : "Could not close the media player.");
     } finally {
       setMediaBusy(false);
     }
   }
 
   return (
-    <main className="surface-grid min-h-screen p-3 text-foreground">
+    <main className="min-h-screen bg-background p-3 text-foreground">
       <div className="mx-auto flex min-h-[calc(100vh-1.5rem)] flex-col gap-3">
-        <header className="panel flex flex-col gap-3 px-4 py-3 lg:flex-row lg:items-center lg:justify-between">
-          <div className="flex items-center gap-3">
-            <div className="flex h-10 w-10 items-center justify-center rounded-md bg-primary text-primary-foreground">
-              <Activity className="h-5 w-5" />
-            </div>
+        <header className="panel grid grid-cols-[auto_auto] items-center justify-center gap-x-3 gap-y-2 px-4 py-3 lg:grid-cols-[auto_1fr_auto] lg:justify-stretch">
+          <div className="order-1 flex items-center gap-3">
+            <Image
+              src="/novatorrent-logo.png"
+              alt="NovaTorrent"
+              width={40}
+              height={40}
+              className="h-10 w-10 object-contain"
+            />
             <div>
               <h1 className="text-lg font-semibold">NovaTorrent</h1>
               <p className="text-xs text-muted-foreground">{rows.length} torrents</p>
             </div>
           </div>
-          <div className="flex flex-wrap items-center gap-2">
+          <div className="order-3 col-span-2 flex flex-wrap items-center justify-center gap-2 lg:order-2 lg:col-span-1 lg:justify-end">
             <StatPill icon={<Download />} label={formatRate(totals.down)} />
             <StatPill icon={<Upload />} label={formatRate(totals.up)} />
+          </div>
+          <div className="order-2 flex items-center gap-2 lg:order-3">
             <Button
               variant="outline"
               size="icon"
@@ -356,7 +501,7 @@ export function TorrentDashboard() {
             </Button>
             <Button onClick={openAdd}>
               <Plus />
-              Add Torrent
+              <span className="hidden sm:inline">Add Torrent</span>
             </Button>
           </div>
         </header>
@@ -367,37 +512,40 @@ export function TorrentDashboard() {
 
         <div className="flex min-h-0 flex-1 flex-col">
           <section className="panel flex min-h-0 flex-1 flex-col overflow-hidden">
-            <div className="flex flex-col gap-3 border-b p-3 lg:flex-row lg:items-center lg:justify-between">
-              <div className="flex flex-wrap gap-1">
-                {filters.map((item) => (
-                  <button
-                    key={item}
-                    type="button"
-                    className={cn(
-                      "h-8 rounded-md px-3 text-sm font-medium text-muted-foreground hover:bg-secondary hover:text-foreground",
-                      filter === item && "bg-secondary text-foreground"
-                    )}
-                    onClick={() => setFilter(item)}
+            <div className="flex flex-col gap-2 border-b p-3 sm:flex-row sm:items-center sm:justify-between">
+              <div className="flex items-center gap-2">
+                <Label htmlFor="torrent-status-filter" className="sr-only">Filter torrents by status</Label>
+                <div className="relative">
+                  <select
+                    id="torrent-status-filter"
+                    className="h-9 appearance-none rounded-md border bg-background py-1 pl-2.5 pr-9 text-sm font-medium outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
+                    value={filter}
+                    onChange={(event) => setFilter(event.target.value as (typeof filters)[number])}
                   >
-                    {item}
-                  </button>
-                ))}
+                    {filters.map((item) => <option key={item} value={item}>{item === "All" ? "All torrents" : item}</option>)}
+                  </select>
+                  <ChevronDown className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                </div>
+                <span className="text-xs tabular-nums text-muted-foreground">{filteredRows.length} shown</span>
               </div>
-              <div className="relative w-full lg:w-72">
+              <div className="relative w-full sm:w-72">
                 <Search className="pointer-events-none absolute left-2 top-2.5 h-4 w-4 text-muted-foreground" />
                 <Input value={query} onChange={(event) => setQuery(event.target.value)} className="pl-8" placeholder="Search torrents" />
               </div>
             </div>
 
             <div className="min-h-0 flex-1 overflow-auto">
-              <div className="min-w-[920px]">
-                <div className="grid h-9 grid-cols-[minmax(280px,1.4fr)_110px_96px_96px_96px_86px_90px] items-center border-b px-3 text-xs font-medium uppercase text-muted-foreground">
+              <div className="min-w-[1160px]">
+                <div className="grid h-8 grid-cols-[76px_minmax(250px,1.6fr)_104px_164px_88px_88px_72px_64px_64px_82px] items-center border-b px-3 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+                  <span>Media</span>
                   <span>Name</span>
                   <span>Status</span>
                   <span>Progress</span>
                   <span>Down</span>
                   <span>Up</span>
                   <span>ETA</span>
+                  <span>Peers</span>
+                  <span>Ratio</span>
                   <span className="text-right">Size</span>
                 </div>
                 {filteredRows.length ? (
@@ -406,43 +554,79 @@ export function TorrentDashboard() {
                       key={row.id}
                       row={row}
                       onAction={runAction}
+                      busy={Boolean(busyAction)}
                       onOptions={() => {
                         setSelectedId(row.id);
                         setInspectorTab("Options");
                       }}
                     >
-                      <button
-                        type="button"
+                      <div
+                        role="button"
+                        tabIndex={0}
                         className={cn(
-                          "grid min-h-16 w-full grid-cols-[minmax(280px,1.4fr)_110px_96px_96px_96px_86px_90px] items-center gap-0 border-b px-3 text-left text-sm transition-colors hover:bg-secondary/60",
+                          "grid min-h-14 w-full grid-cols-[76px_minmax(250px,1.6fr)_104px_164px_88px_88px_72px_64px_64px_82px] items-center gap-0 border-b px-3 text-left text-xs outline-none transition-colors hover:bg-secondary/60 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
                           selected?.id === row.id && "bg-primary/8"
                         )}
                         onClick={() => setSelectedId(row.id)}
                         onDoubleClick={() => void hydrateDetails(row.id)}
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter" || event.key === " ") {
+                            event.preventDefault();
+                            setSelectedId(row.id);
+                          }
+                        }}
                       >
-                        <div className="min-w-0 pr-4">
+                        <div className="pr-2">
+                          {row.firstPlayableFileIndex != null ? (
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              className="h-8 border-primary/35 px-2 text-primary hover:bg-primary/10 hover:text-primary"
+                              disabled={mediaBusy}
+                              title={row.playableFileCount > 1 ? `Play media (${row.playableFileCount} files)` : "Play media"}
+                              aria-label={row.playableFileCount > 1 ? `Play media from ${row.name}; ${row.playableFileCount} files available` : `Play media from ${row.name}`}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                handlePlayTorrent(row);
+                              }}
+                              onDoubleClick={(event) => event.stopPropagation()}
+                            >
+                              {mediaBusyTorrentId === row.id ? <Loader2 className="animate-spin" /> : <Play />}
+                              Play
+                            </Button>
+                          ) : <span className="text-[11px] text-muted-foreground">—</span>}
+                        </div>
+                        <div className="min-w-0 pr-3">
                           <div className="flex items-center gap-2">
-                            <span className="truncate font-medium">{row.name}</span>
+                            <span className="truncate text-sm font-medium">{row.name}</span>
                             {completedStates.has(row.state) ? <CheckCircle2 className="h-4 w-4 shrink-0 text-primary" /> : null}
                           </div>
-                          <div className="truncate-path mt-1 text-xs text-muted-foreground">{row.outputFolder}</div>
+                          <div className="truncate-path mt-0.5 text-[11px] text-muted-foreground">{row.outputFolder}</div>
                         </div>
                         <Badge variant={statusVariant(row.state)} className="w-fit">
                           {row.state}
                         </Badge>
-                        <div className="pr-4">
-                          <Progress value={percent(row.progress)} />
-                          <span className="mt-1 block text-xs tabular-nums text-muted-foreground">{percent(row.progress).toFixed(1)}%</span>
+                        <div className="pr-3">
+                          <Progress value={percent(row.progress)} className="h-1.5" />
+                          <span className="mt-1 block whitespace-nowrap text-[11px] tabular-nums text-muted-foreground">
+                            {percent(row.progress).toFixed(1)}% · {formatBytes(row.downloaded)}
+                          </span>
                         </div>
                         <span className="tabular-nums">{formatRate(row.downloadSpeed)}</span>
                         <span className="tabular-nums">{formatRate(row.uploadSpeed)}</span>
                         <span className="tabular-nums text-muted-foreground">{formatEta(row.eta)}</span>
+                        <span className="tabular-nums">{row.peerCount ?? row.peers.length}</span>
+                        <span className="tabular-nums">{formatRatio(torrentRatio(row))}</span>
                         <span className="text-right tabular-nums">{formatBytes(row.total)}</span>
-                      </button>
+                      </div>
                     </TorrentContextMenu>
                   ))
                 ) : (
-                  <div className="flex h-72 items-center justify-center text-sm text-muted-foreground">No torrents match this view.</div>
+                  <div className="flex h-72 flex-col items-center justify-center gap-2 px-6 text-center text-sm text-muted-foreground">
+                    <p>{rows.length ? "No torrents match this filter." : "No torrents yet."}</p>
+                    {!rows.length ? <Button size="sm" onClick={openAdd}><Plus />Add your first torrent</Button> : null}
+                  </div>
                 )}
               </div>
             </div>
@@ -456,15 +640,21 @@ export function TorrentDashboard() {
                 tab={inspectorTab}
                 onTabChange={setInspectorTab}
                 logs={logs}
+                logsError={logsError}
                 logFilePath={logFilePath}
                 onFileSelectionChange={handleFileSelection}
+                onFilePriorityChange={handleFilePriority}
+                priorityBusyFileIndex={priorityBusyFileIndex}
                 mediaSession={mediaSession?.torrentId === selected.id ? mediaSession : null}
                 mediaBusy={mediaBusy}
                 mediaError={mediaSession?.torrentId === selected.id ? mediaError : null}
                 onPlayFile={(fileIndex) => void handlePlayFile(selected, fileIndex)}
                 onClearStream={() => void handleClearStream()}
                 onOptionsChange={handleOptionsChange}
-                onRefresh={() => void hydrateDetails(selected.id)}
+                detailsError={detailsError}
+                actionBusy={Boolean(busyAction?.startsWith(`${selected.id}:`))}
+                onTogglePause={() => void runAction(selected.state === "Paused" ? "resume" : "pause", selected)}
+                onRecheck={() => void runAction("recheck", selected)}
               />
             ) : null}
           </section>
@@ -474,7 +664,7 @@ export function TorrentDashboard() {
       <Dialog.Root open={addOpen} onOpenChange={setAddOpen}>
         <Dialog.Portal>
           <Dialog.Overlay className="fixed inset-0 z-40 bg-background/70 backdrop-blur-sm" />
-          <Dialog.Content className="fixed left-1/2 top-1/2 z-50 h-[88vh] w-[min(1120px,calc(100vw-2rem))] -translate-x-1/2 -translate-y-1/2 outline-none">
+          <Dialog.Content className="fixed left-1/2 top-1/2 z-50 h-[min(88vh,760px)] max-h-[calc(100vh-1rem)] w-[min(1120px,calc(100vw-1rem))] -translate-x-1/2 -translate-y-1/2 outline-none">
             <AddTorrentPanel
               onAdded={() => {
                 setAddOpen(false);
@@ -493,18 +683,20 @@ function TorrentContextMenu({
   row,
   children,
   onAction,
-  onOptions
+  onOptions,
+  busy
 }: {
   row: TorrentRow;
   children: React.ReactNode;
-  onAction: (action: "pause" | "resume" | "announce" | "dht" | "resolve" | "webseed" | "peers" | "metadata" | "recheck" | "delete" | "deleteFiles", row: TorrentRow) => void;
+  onAction: (action: TorrentAction, row: TorrentRow) => void;
   onOptions: () => void;
+  busy: boolean;
 }) {
   return (
     <ContextMenu.Root>
       <ContextMenu.Trigger asChild>{children}</ContextMenu.Trigger>
       <ContextMenu.Portal>
-        <ContextMenu.Content className="z-50 min-w-48 overflow-hidden rounded-md border bg-popover p-1 text-popover-foreground shadow-md">
+        <ContextMenu.Content className={cn("z-50 min-w-48 overflow-hidden rounded-md border bg-popover p-1 text-popover-foreground shadow-md", busy && "pointer-events-none opacity-60")}>
           <MenuItem icon={<Pause />} onSelect={() => onAction("pause", row)}>
             Pause
           </MenuItem>
@@ -581,15 +773,21 @@ function TorrentInspector({
   tab,
   onTabChange,
   logs,
+  logsError,
   logFilePath,
   onFileSelectionChange,
+  onFilePriorityChange,
+  priorityBusyFileIndex,
   mediaSession,
   mediaBusy,
   mediaError,
   onPlayFile,
   onClearStream,
   onOptionsChange,
-  onRefresh
+  detailsError,
+  actionBusy,
+  onTogglePause,
+  onRecheck,
 }: {
   height: number;
   onResize: (height: number) => void;
@@ -598,15 +796,21 @@ function TorrentInspector({
   tab: (typeof inspectorTabs)[number];
   onTabChange: (tab: (typeof inspectorTabs)[number]) => void;
   logs: LogEntry[];
+  logsError: string | null;
   logFilePath: string | null;
   onFileSelectionChange: (selected: Set<number>) => void;
+  onFilePriorityChange: (fileIndex: number, priority: number) => void;
+  priorityBusyFileIndex: number | null;
   mediaSession: MediaSession | null;
   mediaBusy: boolean;
   mediaError: string | null;
   onPlayFile: (fileIndex: number) => void;
   onClearStream: () => void;
   onOptionsChange: (request: UpdateTorrentOptionsRequest) => Promise<void>;
-  onRefresh: () => void;
+  detailsError: string | null;
+  actionBusy: boolean;
+  onTogglePause: () => void;
+  onRecheck: () => void;
 }) {
   const startResize = (event: React.PointerEvent<HTMLDivElement>) => {
     event.preventDefault();
@@ -634,14 +838,26 @@ function TorrentInspector({
       >
         <div className="h-1 w-10 rounded-full bg-border" />
       </div>
-      <div className="flex flex-wrap items-center justify-between gap-2 border-b px-3 py-2">
-        <div className="flex min-w-0 items-center gap-3">
+      <div className="border-b">
+        <div className="flex items-center justify-between gap-3 px-3 py-2">
+          <div className="flex min-w-0 items-center gap-3">
           <div className="min-w-0">
             <h2 className="truncate text-sm font-semibold">{selected.name}</h2>
             <p className="truncate-path text-xs text-muted-foreground">{selected.hash}</p>
           </div>
+          </div>
+          <div className="flex shrink-0 items-center gap-2">
+            <Button type="button" variant="outline" size="sm" className="h-8" disabled={actionBusy} onClick={onTogglePause}>
+              {actionBusy ? <Loader2 className="animate-spin" /> : selected.state === "Paused" ? <Play /> : <Pause />}
+              <span className="hidden sm:inline">{selected.state === "Paused" ? "Continue" : "Pause"}</span>
+            </Button>
+            <Button type="button" variant="outline" size="sm" className="h-8" disabled={actionBusy} onClick={onRecheck}>
+              <CheckCircle2 />
+              <span className="hidden md:inline">Recheck</span>
+            </Button>
+          </div>
         </div>
-        <div className="flex flex-wrap gap-1">
+        <div className="flex gap-1 overflow-x-auto border-t px-3 py-1.5">
           {inspectorTabs.map((item) => (
             <button
               key={item}
@@ -651,6 +867,7 @@ function TorrentInspector({
                 tab === item && "bg-secondary text-foreground"
               )}
               onClick={() => onTabChange(item)}
+              aria-current={tab === item ? "page" : undefined}
             >
               {item}
             </button>
@@ -658,20 +875,27 @@ function TorrentInspector({
         </div>
       </div>
       <div className="min-h-0 flex-1 overflow-auto p-3">
+        {detailsError ? (
+          <div className="mb-3 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+            {detailsError}
+          </div>
+        ) : null}
         <InspectorTab
           tab={tab}
           selected={selected}
           selectedFileIds={selectedFileIds}
           logs={logs}
+          logsError={logsError}
           logFilePath={logFilePath}
           onFileSelectionChange={onFileSelectionChange}
+          onFilePriorityChange={onFilePriorityChange}
+          priorityBusyFileIndex={priorityBusyFileIndex}
           mediaSession={mediaSession}
           mediaBusy={mediaBusy}
           mediaError={mediaError}
           onPlayFile={onPlayFile}
           onClearStream={onClearStream}
           onOptionsChange={onOptionsChange}
-          onRefresh={onRefresh}
         />
       </div>
     </section>
@@ -683,139 +907,141 @@ function InspectorTab({
   selected,
   selectedFileIds,
   logs,
+  logsError,
   logFilePath,
   onFileSelectionChange,
+  onFilePriorityChange,
+  priorityBusyFileIndex,
   mediaSession,
   mediaBusy,
   mediaError,
   onPlayFile,
   onClearStream,
-  onOptionsChange,
-  onRefresh
+  onOptionsChange
 }: {
   tab: (typeof inspectorTabs)[number];
   selected: TorrentRow;
   selectedFileIds: Set<number>;
   logs: LogEntry[];
+  logsError: string | null;
   logFilePath: string | null;
   onFileSelectionChange: (selected: Set<number>) => void;
+  onFilePriorityChange: (fileIndex: number, priority: number) => void;
+  priorityBusyFileIndex: number | null;
   mediaSession: MediaSession | null;
   mediaBusy: boolean;
   mediaError: string | null;
   onPlayFile: (fileIndex: number) => void;
   onClearStream: () => void;
   onOptionsChange: (request: UpdateTorrentOptionsRequest) => Promise<void>;
-  onRefresh: () => void;
 }) {
-  if (tab === "Status") {
+  if (tab === "Details") {
     return (
-      <div className="grid gap-3 lg:grid-cols-[360px_1fr]">
-        <div className="space-y-3">
-          <div className="grid grid-cols-3 gap-2">
-            <Metric icon={<BarChart3 />} label="Progress" value={`${percent(selected.progress).toFixed(1)}%`} />
-            <Metric icon={<Download />} label="Down" value={formatRate(selected.downloadSpeed)} />
-            <Metric icon={<Upload />} label="Up" value={formatRate(selected.uploadSpeed)} />
+      <div className="space-y-3">
+        {selected.raw.stats?.error ? (
+          <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+            {selected.raw.stats.error}
           </div>
-          <Progress value={percent(selected.progress)} className="h-2.5" />
-          <div className="flex justify-between text-xs text-muted-foreground">
-            <span>{formatBytes(selected.downloaded)}</span>
-            <span>{formatBytes(selected.total)}</span>
+        ) : null}
+        <div className="grid gap-3 lg:grid-cols-[360px_1fr]">
+          <div className="space-y-3">
+            <div className="grid grid-cols-3 gap-2">
+              <Metric icon={<BarChart3 />} label="Progress" value={`${percent(selected.progress).toFixed(1)}%`} />
+              <Metric icon={<Download />} label="Down" value={formatRate(selected.downloadSpeed)} />
+              <Metric icon={<Upload />} label="Up" value={formatRate(selected.uploadSpeed)} />
+            </div>
+            <PieceMap states={selected.raw.piece_states ?? []} progress={selected.progress} />
+            <div className="flex justify-between text-xs text-muted-foreground">
+              <span>{formatBytes(selected.downloaded)}</span>
+              <span>{formatBytes(selected.total)}</span>
+            </div>
+          </div>
+          <div className="grid grid-cols-2 gap-3 text-sm md:grid-cols-4">
+            <InfoLine label="Status" value={selected.state} />
+            <InfoLine label="ETA" value={formatEta(selected.eta)} />
+            <InfoLine label="Uploaded" value={formatBytes(selected.uploaded)} />
+            <InfoLine label="Ratio" value={formatRatio(selected.general?.ratio)} />
+            <InfoLine label="Elapsed" value={formatDuration(selected.general?.active_time_seconds)} />
+            <InfoLine label="Since complete" value={formatDuration(selected.general?.seeding_time_seconds)} />
+            <InfoLine label="Trackers" value={String(selected.trackers.length)} />
+            <InfoLine label="Known peers" value={String(Math.max(selected.peers.length, selected.peerCount || 0))} />
           </div>
         </div>
-        <div className="grid grid-cols-2 gap-3 text-sm md:grid-cols-4">
-          <InfoLine label="Status" value={selected.state} />
-          <InfoLine label="ETA" value={formatEta(selected.eta)} />
-          <InfoLine label="Uploaded" value={formatBytes(selected.uploaded)} />
-          <InfoLine label="Ratio" value={formatRatio(selected.general?.ratio)} />
-          <InfoLine label="Active" value={formatDuration(selected.general?.active_time_seconds)} />
-          <InfoLine label="Seeding" value={formatDuration(selected.general?.seeding_time_seconds)} />
-          <InfoLine label="Trackers" value={String(selected.trackers.length)} />
-          <InfoLine label="Connected Peers" value={String(selected.peers.length || selected.peerCount || 0)} />
-        </div>
+        <section className="border-t pt-3" aria-labelledby="torrent-metadata-heading">
+          <h3 id="torrent-metadata-heading" className="mb-3 text-xs font-semibold text-muted-foreground">Torrent metadata</h3>
+          <div className="grid gap-3 pb-1 text-sm md:grid-cols-3">
+            <InfoLine label="Name" value={selected.name} />
+            <InfoLine label="Hash" value={selected.hash} wrap />
+            <InfoLine label="Save Path" value={selected.general?.save_path || selected.outputFolder} wrap />
+            <InfoLine label="Total Size" value={formatBytes(selected.general?.total_size ?? selected.total)} />
+            <InfoLine label="Files" value={String(selected.general?.file_count ?? selected.files.length)} />
+            <InfoLine label="Pieces" value={formatPieceLayout(selected.general?.piece_count, selected.general?.piece_size)} />
+            <InfoLine label="Private" value={selected.general?.private ? "Yes" : "No"} />
+            <InfoLine label="Created By" value={selected.general?.created_by || "-"} />
+            <InfoLine label="Created" value={formatUnixDate(selected.general?.creation_date)} />
+            <InfoLine label="Comment" value={selected.general?.comment || "-"} wide wrap />
+          </div>
+        </section>
       </div>
     );
   }
 
-  if (tab === "General") {
+  if (tab === "Connections") {
     return (
-      <div className="grid gap-3 text-sm md:grid-cols-3">
-        <InfoLine label="Name" value={selected.name} />
-        <InfoLine label="Hash" value={selected.hash} />
-        <InfoLine label="Save Path" value={selected.general?.save_path || selected.outputFolder} />
-        <InfoLine label="Total Size" value={formatBytes(selected.general?.total_size ?? selected.total)} />
-        <InfoLine label="Files" value={String(selected.general?.file_count ?? selected.files.length)} />
-        <InfoLine label="Pieces" value={`${selected.general?.piece_count ?? "-"} x ${formatBytes(selected.general?.piece_size ?? 0)}`} />
-        <InfoLine label="Private" value={selected.general?.private ? "Yes" : "No"} />
-        <InfoLine label="Created By" value={selected.general?.created_by || "-"} />
-        <InfoLine label="Created" value={formatUnixDate(selected.general?.creation_date)} />
-        <InfoLine label="Comment" value={selected.general?.comment || "-"} wide />
+      <div className="space-y-2">
+        <ConnectionGroup title="Peers" count={selected.peers.length} icon={<Network />} defaultOpen>
+          {selected.peers.length ? (
+            <DataTable
+              columns={["Address", "Client", "Progress", "Down", "Up", "Activity"]}
+              rows={selected.peers.map((peer) => [
+                `${peer.address}:${peer.port}`,
+                peer.client || "-",
+                `${percent(peer.progress * 100).toFixed(1)}%`,
+                formatRate(peer.download_speed),
+                formatRate(peer.upload_speed),
+                peer.connection
+              ])}
+            />
+          ) : <EmptyTab icon={<Network />} text="No peers have been discovered yet." />}
+        </ConnectionGroup>
+        <ConnectionGroup title="Trackers" count={selected.trackers.length} icon={<RadioTower />}>
+          {selected.trackers.length ? (
+            <DataTable
+              columns={["Tracker", "Status", "Seeders", "Leechers", "Announce Interval", "Message"]}
+              rows={selected.trackers.map((tracker) => [
+                tracker.url,
+                tracker.state,
+                tracker.seeders == null ? "-" : String(tracker.seeders),
+                tracker.leechers == null ? "-" : String(tracker.leechers),
+                tracker.next_announce_seconds == null ? "-" : formatDuration(tracker.next_announce_seconds),
+                tracker.message || "-"
+              ])}
+            />
+          ) : <EmptyTab icon={<RadioTower />} text="No trackers are configured for this torrent." />}
+        </ConnectionGroup>
+        <ConnectionGroup title="Web seeds" count={selected.webSeeds.length} icon={<Download />}>
+          {selected.webSeeds.length ? (
+            <DataTable
+              columns={["Web Seed", "Status", "Downloaded", "Message"]}
+              rows={selected.webSeeds.map((seed) => [
+                seed.url,
+                seed.state,
+                formatBytes(seed.bytes_downloaded),
+                seed.message || "-"
+              ])}
+            />
+          ) : <EmptyTab icon={<Download />} text="No web seeds are configured for this torrent." />}
+        </ConnectionGroup>
       </div>
-    );
-  }
-
-  if (tab === "Peers") {
-    return selected.peers.length ? (
-      <DataTable
-        columns={["Address", "Client", "Progress", "Down", "Up", "Connection"]}
-        rows={selected.peers.map((peer) => [
-          `${peer.address}:${peer.port}`,
-          peer.client || "-",
-          `${percent(peer.progress * 100).toFixed(1)}%`,
-          formatRate(peer.download_speed),
-          formatRate(peer.upload_speed),
-          peer.connection
-        ])}
-      />
-    ) : (
-      <EmptyTab icon={<Network />} text="No connected peers yet." />
-    );
-  }
-
-  if (tab === "Trackers") {
-    return selected.trackers.length ? (
-      <DataTable
-        columns={["Tracker", "Status", "Seeders", "Leechers", "Next Announce", "Message"]}
-        rows={selected.trackers.map((tracker) => [
-          tracker.url,
-          tracker.state,
-          tracker.seeders == null ? "-" : String(tracker.seeders),
-          tracker.leechers == null ? "-" : String(tracker.leechers),
-          tracker.next_announce_seconds == null ? "-" : formatDuration(tracker.next_announce_seconds),
-          tracker.message || "-"
-        ])}
-      />
-    ) : (
-      <EmptyTab icon={<RadioTower />} text="No trackers are configured for this torrent." />
-    );
-  }
-
-  if (tab === "Web Seeds") {
-    return selected.webSeeds.length ? (
-      <DataTable
-        columns={["Web Seed", "Status", "Downloaded", "Message"]}
-        rows={selected.webSeeds.map((seed) => [
-          seed.url,
-          seed.state,
-          formatBytes(seed.bytes_downloaded),
-          seed.message || "-"
-        ])}
-      />
-    ) : (
-      <EmptyTab icon={<Download />} text="No web seeds are configured for this torrent." />
     );
   }
 
   if (tab === "Files") {
     return (
       <div className="space-y-2">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-2 text-sm font-semibold">
-            <FileCog className="h-4 w-4" />
-            Content
-          </div>
-          <Button type="button" variant="outline" size="sm" onClick={onRefresh}>
-            Refresh
-          </Button>
+        <div className="flex items-center gap-2 text-sm font-semibold">
+          <FileCog className="h-4 w-4" />
+          Content
         </div>
         <TorrentMediaPanel
           selected={selected}
@@ -828,6 +1054,8 @@ function InspectorTab({
           files={selected.files}
           selectedFileIds={selectedFileIds}
           onSelectionChange={onFileSelectionChange}
+          onPriorityChange={onFilePriorityChange}
+          priorityBusyFileIndex={priorityBusyFileIndex}
           onPlayFile={onPlayFile}
           activeMediaFileIndex={mediaSession?.fileIndex ?? null}
           compact
@@ -836,33 +1064,152 @@ function InspectorTab({
     );
   }
 
-  if (tab === "Security") {
-    return <TorrentSecurityPanel key={selected.id} selected={selected} />;
-  }
-
   if (tab === "Options") {
     return <TorrentOptionsEditor key={selected.id} selected={selected} onSave={onOptionsChange} />;
   }
 
+  return <TorrentLogViewer logs={logs} logsError={logsError} logFilePath={logFilePath} />;
+}
+
+function PieceMap({ states, progress }: { states: number[]; progress: number }) {
+  const buckets = React.useMemo(() => compressPieceStates(states, 240), [states]);
+  const safeProgress = percent(progress);
+  if (!buckets.length) {
+    return <Progress value={safeProgress} className="h-3" />;
+  }
+  return (
+    <div className="space-y-1.5">
+      <div
+        className="grid h-3 overflow-hidden rounded-sm bg-secondary"
+        style={{ gridTemplateColumns: `repeat(${buckets.length}, minmax(0, 1fr))` }}
+        role="img"
+        aria-label={`Piece availability map: ${safeProgress.toFixed(1)} percent verified. Teal is verified, amber is downloading, muted sections are missing.`}
+      >
+        {buckets.map((state, index) => (
+          <span
+            key={index}
+            className={cn(
+              state === 2 && "bg-primary",
+              state === 1 && "bg-accent",
+              state === 3 && "bg-primary/45"
+            )}
+          />
+        ))}
+      </div>
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
+        <PieceLegend className="bg-primary" label="Verified" />
+        <PieceLegend className="bg-accent" label="Downloading" />
+        <PieceLegend className="bg-secondary" label="Missing" />
+        <span className="ml-auto tabular-nums text-foreground">{safeProgress.toFixed(1)}%</span>
+      </div>
+    </div>
+  );
+}
+
+function PieceLegend({ className, label }: { className: string; label: string }) {
+  return <span className="inline-flex items-center gap-1"><span className={cn("h-2 w-2 rounded-[2px]", className)} />{label}</span>;
+}
+
+function compressPieceStates(states: number[], maxBuckets: number) {
+  if (states.length <= maxBuckets) return states;
+  return Array.from({ length: maxBuckets }, (_, bucket) => {
+    const start = Math.floor((bucket * states.length) / maxBuckets);
+    const end = Math.max(start + 1, Math.floor(((bucket + 1) * states.length) / maxBuckets));
+    const slice = states.slice(start, end);
+    if (slice.some((state) => state === 1)) return 1;
+    if (slice.every((state) => state === 2)) return 2;
+    if (slice.some((state) => state === 2)) return 3;
+    return 0;
+  });
+}
+
+function TorrentLogViewer({
+  logs,
+  logsError,
+  logFilePath
+}: {
+  logs: LogEntry[];
+  logsError: string | null;
+  logFilePath: string | null;
+}) {
+  const [level, setLevel] = React.useState<LogEntry["level"] | "All">("All");
+  const [scope, setScope] = React.useState("All");
+  const [logQuery, setLogQuery] = React.useState("");
+  const scopes = React.useMemo(
+    () => Array.from(new Set(logs.map((entry) => entry.scope))).sort((left, right) => left.localeCompare(right)),
+    [logs]
+  );
+  const visibleLogs = React.useMemo(() => {
+    const normalizedQuery = logQuery.trim().toLowerCase();
+    return logs
+      .filter((entry) => level === "All" || entry.level === level)
+      .filter((entry) => scope === "All" || entry.scope === scope)
+      .filter((entry) => !normalizedQuery || `${entry.scope} ${entry.message}`.toLowerCase().includes(normalizedQuery))
+      .sort((left, right) => right.id - left.id);
+  }, [level, logQuery, logs, scope]);
+
   return (
     <div className="space-y-2">
+      {logsError ? (
+        <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">{logsError}</div>
+      ) : null}
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="relative min-w-56 flex-1">
+          <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+          <Input
+            aria-label="Filter log messages"
+            className="h-8 pl-8 text-xs"
+            value={logQuery}
+            onChange={(event) => setLogQuery(event.currentTarget.value)}
+            placeholder="Filter log messages"
+          />
+        </div>
+        <div className="relative">
+          <select
+            aria-label="Filter logs by level"
+            className="h-8 appearance-none rounded-md border bg-background py-1 pl-2.5 pr-8 text-xs text-foreground"
+            value={level}
+            onChange={(event) => setLevel(event.currentTarget.value as LogEntry["level"] | "All")}
+          >
+            {(["All", "Debug", "Info", "Warn", "Error"] as const).map((item) => (
+              <option key={item} value={item}>{item === "All" ? "All levels" : item}</option>
+            ))}
+          </select>
+          <ChevronDown className="pointer-events-none absolute right-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+        </div>
+        <div className="relative max-w-48">
+          <select
+            aria-label="Filter logs by source"
+            className="h-8 w-full appearance-none rounded-md border bg-background py-1 pl-2.5 pr-8 text-xs text-foreground"
+            value={scope}
+            onChange={(event) => setScope(event.currentTarget.value)}
+          >
+            <option value="All">All sources</option>
+            {scopes.map((item) => <option key={item} value={item}>{item}</option>)}
+          </select>
+          <ChevronDown className="pointer-events-none absolute right-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+        </div>
+        <span className="text-xs tabular-nums text-muted-foreground">{visibleLogs.length} of {logs.length}</span>
+      </div>
       {logFilePath ? (
-        <div className="flex items-center gap-2 rounded-md border bg-background px-2 py-1.5 text-xs text-muted-foreground">
+        <div className="flex items-center gap-2 rounded-md border bg-background px-2 py-1.5 text-xs text-muted-foreground" title={logFilePath}>
           <ScrollText className="h-4 w-4 shrink-0" />
-          <span className="truncate">{logFilePath}</span>
+          <span className="truncate">Newest first · {logFilePath}</span>
         </div>
       ) : null}
-      {logs.length ? (
+      {visibleLogs.length ? (
         <div className="space-y-1 font-mono text-xs">
-          {logs.map((entry) => (
-            <div key={entry.id} className="grid grid-cols-[86px_64px_120px_1fr] gap-2 rounded px-2 py-1 hover:bg-secondary/70">
+          {visibleLogs.map((entry) => (
+            <div key={entry.id} className="grid gap-x-2 gap-y-1 rounded px-2 py-1.5 hover:bg-secondary/70 sm:grid-cols-[86px_64px_120px_1fr]">
               <span className="text-muted-foreground">{formatLogTime(entry.timestamp_ms)}</span>
               <span className={cn("font-semibold", logTone(entry.level))}>{entry.level}</span>
-              <span className="truncate text-muted-foreground">{entry.scope}</span>
-              <span>{entry.message}</span>
+              <span className="truncate text-muted-foreground" title={entry.scope}>{entry.scope}</span>
+              <span className="break-words">{entry.message}</span>
             </div>
           ))}
         </div>
+      ) : logs.length ? (
+        <EmptyTab icon={<Search />} text="No logs match these filters." />
       ) : (
         <EmptyTab icon={<ScrollText />} text="No backend logs yet." />
       )}
@@ -908,7 +1255,7 @@ function TorrentMediaPanel({
         {mediaSession ? (
           <Button type="button" variant="outline" size="sm" disabled={mediaBusy} onClick={onClearStream}>
             <X />
-            Stop
+            Close player
           </Button>
         ) : null}
       </div>
@@ -923,82 +1270,6 @@ function TorrentMediaPanel({
         </div>
       ) : null}
       {mediaError ? <div className="border-t px-3 py-2 text-sm text-destructive">{mediaError}</div> : null}
-    </div>
-  );
-}
-
-function TorrentSecurityPanel({ selected }: { selected: TorrentRow }) {
-  const [reports, setReports] = React.useState<Record<number, TorrentFileHash>>({});
-  const [hashing, setHashing] = React.useState<number | null>(null);
-  const [securityError, setSecurityError] = React.useState<string | null>(null);
-
-  async function checkFile(fileIndex: number) {
-    setHashing(fileIndex);
-    setSecurityError(null);
-    try {
-      const report = await hashTorrentFile(selected.id, fileIndex);
-      setReports((current) => ({ ...current, [fileIndex]: report }));
-    } catch (err) {
-      setSecurityError(err instanceof Error ? err.message : "Could not hash torrent file.");
-    } finally {
-      setHashing(null);
-    }
-  }
-
-  async function openReport(report: TorrentFileHash) {
-    setSecurityError(null);
-    try {
-      await openVirusTotalReport(report.sha256);
-    } catch (err) {
-      setSecurityError(err instanceof Error ? err.message : "Could not open VirusTotal report.");
-    }
-  }
-
-  const includedFiles = selected.files
-    .map((file, fileIndex) => ({ file, fileIndex }))
-    .filter(({ file }) => file.included);
-
-  return (
-    <div className="space-y-3">
-      <div className="flex items-start gap-2 border-b pb-3 text-sm text-muted-foreground">
-        <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
-        <p>SHA-256 is computed locally. Opening a report shares only the hash with VirusTotal; NovaTorrent never uploads the file.</p>
-      </div>
-      {securityError ? <p className="text-sm text-destructive">{securityError}</p> : null}
-      {includedFiles.length ? (
-        <div className="divide-y rounded-md border bg-background">
-          {includedFiles.map(({ file, fileIndex }) => {
-            const report = reports[fileIndex];
-            return (
-              <div key={fileIndex} className="flex flex-wrap items-center gap-3 p-3">
-                <div className="min-w-48 flex-1">
-                  <div className="truncate text-sm font-medium">{file.name}</div>
-                  <div className="text-xs text-muted-foreground">{formatBytes(file.length)}</div>
-                  {report ? <div className="mt-1 break-all font-mono text-[11px] text-muted-foreground">{report.sha256}</div> : null}
-                </div>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  disabled={hashing !== null || !selected.raw.stats?.finished}
-                  onClick={() => void checkFile(fileIndex)}
-                >
-                  <ShieldCheck />
-                  {hashing === fileIndex ? "Hashing..." : report ? "Hash again" : "Check hash"}
-                </Button>
-                {report ? (
-                  <Button type="button" size="sm" onClick={() => void openReport(report)}>
-                    <ExternalLink />
-                    Open report
-                  </Button>
-                ) : null}
-              </div>
-            );
-          })}
-        </div>
-      ) : (
-        <EmptyTab icon={<ShieldCheck />} text="No selected files are available for reputation checks." />
-      )}
     </div>
   );
 }
@@ -1210,6 +1481,36 @@ function EmptyTab({ icon, text }: { icon: React.ReactNode; text: string }) {
   );
 }
 
+function ConnectionGroup({
+  title,
+  count,
+  icon,
+  defaultOpen,
+  children
+}: {
+  title: string;
+  count: number;
+  icon: React.ReactNode;
+  defaultOpen?: boolean;
+  children: React.ReactNode;
+}) {
+  const [open, setOpen] = React.useState(Boolean(defaultOpen));
+  return (
+    <details
+      className="overflow-hidden rounded-md border bg-background"
+      open={open}
+      onToggle={(event) => setOpen(event.currentTarget.open)}
+    >
+      <summary className="flex cursor-pointer list-none items-center gap-2 px-3 py-2 text-sm font-medium hover:bg-secondary/50">
+        <span className="text-primary [&_svg]:h-4 [&_svg]:w-4">{icon}</span>
+        <span>{title}</span>
+        <span className="ml-auto text-xs tabular-nums text-muted-foreground">{count}</span>
+      </summary>
+      <div className="border-t">{children}</div>
+    </details>
+  );
+}
+
 function StatPill({ icon, label }: { icon: React.ReactNode; label: string }) {
   return (
     <div className="flex h-9 items-center gap-2 rounded-md border bg-background px-3 text-sm">
@@ -1231,13 +1532,18 @@ function Metric({ icon, label, value }: { icon: React.ReactNode; label: string; 
   );
 }
 
-function InfoLine({ label, value, wide }: { label: string; value: string; wide?: boolean }) {
+function InfoLine({ label, value, wide, wrap }: { label: string; value: string; wide?: boolean; wrap?: boolean }) {
   return (
     <div className={cn(wide && "col-span-2")}>
       <div className="text-xs text-muted-foreground">{label}</div>
-      <div className="truncate text-sm font-medium">{value}</div>
+      <div className={cn("text-sm font-medium", wrap ? "break-words" : "truncate")} title={value}>{value}</div>
     </div>
   );
+}
+
+function formatPieceLayout(count?: number, size?: number) {
+  if (!count || !size) return "Metadata pending";
+  return `${count} × ${formatBytes(size)}`;
 }
 
 function formatRatio(value?: number | null) {
@@ -1245,8 +1551,14 @@ function formatRatio(value?: number | null) {
   return value.toFixed(2);
 }
 
+function torrentRatio(row: TorrentRow) {
+  if (row.general?.ratio != null && Number.isFinite(row.general.ratio)) return row.general.ratio;
+  return row.downloaded > 0 ? row.uploaded / row.downloaded : 0;
+}
+
 function formatDuration(seconds?: number | null) {
   if (!seconds || seconds <= 0) return "-";
+  if (seconds < 60) return "<1m";
   const hours = Math.floor(seconds / 3600);
   const minutes = Math.floor((seconds % 3600) / 60);
   if (hours >= 24) return `${Math.floor(hours / 24)}d ${hours % 24}h`;
@@ -1272,8 +1584,7 @@ function logTone(level: LogEntry["level"]) {
 
 function isPlayableMedia(file: { name: string; components?: string[] }) {
   const candidate = file.components?.at(-1) ?? file.name;
-  const extension = candidate.split(".").pop()?.toLowerCase();
-  return Boolean(extension && playableExtensions.has(extension));
+  return isPlayableMediaName(candidate);
 }
 
 function statusVariant(state: string): React.ComponentProps<typeof Badge>["variant"] {
@@ -1289,9 +1600,31 @@ function mergeRows(currentRows: TorrentRow[], nextRows: TorrentRow[]) {
   const currentById = new Map(currentRows.map((row) => [row.id, row]));
   return nextRows.map((row) => {
     const current = currentById.get(row.id);
-    if (!current?.files.length || row.files.length) return row;
-    return { ...row, files: current.files };
+    if (!current) return row;
+    return {
+      ...row,
+      files: current.files,
+      general: { ...current.general, ...row.general },
+      trackers: current.trackers,
+      webSeeds: current.webSeeds,
+      peers: current.peers,
+      options: current.options,
+      raw: {
+        ...current.raw,
+        ...row.raw,
+        stats: row.raw.stats,
+        general: { ...current.raw.general, ...row.raw.general }
+      }
+    };
   });
+}
+
+function matchesTorrentFilter(state: string, filter: (typeof filters)[number]) {
+  if (filter === "All") return true;
+  if (filter === "Complete") return completedStates.has(state);
+  if (filter === "Downloading") return downloadingStates.has(state);
+  if (filter === "Error") return state === "Error" || state.endsWith(" Error") || state === "Missing Files";
+  return state === filter;
 }
 
 function includedFileIds(files: TorrentRow["files"]) {

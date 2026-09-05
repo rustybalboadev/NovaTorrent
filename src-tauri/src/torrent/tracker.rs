@@ -4,12 +4,12 @@ use std::{
     time::Duration,
 };
 
-use native_tls::TlsConnector;
 use crate::torrent::{
     bencode::{self, BencodeNode, BencodeValue},
     peer::{self, PeerInfo},
     sha1,
 };
+use native_tls::TlsConnector;
 use serde::{Deserialize, Serialize};
 
 const HTTP_TRACKER_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
@@ -122,15 +122,7 @@ pub fn announce_http(
     event: Option<&str>,
 ) -> Result<TrackerAnnounceResponse, String> {
     let announce_url = build_announce_url(
-        announce,
-        info_hash,
-        peer_id,
-        port,
-        uploaded,
-        downloaded,
-        left,
-        num_want,
-        event,
+        announce, info_hash, peer_id, port, uploaded, downloaded, left, num_want, event,
     );
     let mut endpoint = parse_http_tracker_url(&announce_url)?;
     for redirect_count in 0..=MAX_HTTP_TRACKER_REDIRECTS {
@@ -163,12 +155,11 @@ pub fn announce_http(
 }
 
 fn read_http_tracker_response(endpoint: &HttpTrackerEndpoint) -> Result<Vec<u8>, String> {
-    let address = (endpoint.host.as_str(), endpoint.port)
+    let addresses = (endpoint.host.as_str(), endpoint.port)
         .to_socket_addrs()
         .map_err(|err| format!("could not resolve tracker host: {err}"))?
-        .next()
-        .ok_or_else(|| "tracker host did not resolve to an address".to_string())?;
-    let mut stream = connect_http_tracker_stream(&endpoint, address)?;
+        .collect::<Vec<_>>();
+    let mut stream = connect_http_tracker_addresses(endpoint, &addresses)?;
     let request = build_http_tracker_request(&endpoint);
     stream
         .write_all(request.as_bytes())
@@ -188,7 +179,10 @@ fn read_http_tracker_response(endpoint: &HttpTrackerEndpoint) -> Result<Vec<u8>,
 
 pub fn parse_http_announce_response(input: &[u8]) -> Result<TrackerAnnounceResponse, String> {
     let root = bencode::parse(input)?;
-    if let Some(reason) = root.dict_get(b"failure reason").and_then(BencodeNode::as_str_lossy) {
+    if let Some(reason) = root
+        .dict_get(b"failure reason")
+        .and_then(BencodeNode::as_str_lossy)
+    {
         return Err(format!("tracker failure: {reason}"));
     }
 
@@ -271,7 +265,10 @@ pub fn build_udp_connect_request(transaction_id: u32) -> [u8; 16] {
     out
 }
 
-pub fn parse_udp_connect_response(input: &[u8], expected_transaction_id: u32) -> Result<UdpConnectResponse, String> {
+pub fn parse_udp_connect_response(
+    input: &[u8],
+    expected_transaction_id: u32,
+) -> Result<UdpConnectResponse, String> {
     if input.len() < 8 {
         return Err("UDP tracker response is too short".to_string());
     }
@@ -281,7 +278,10 @@ pub fn parse_udp_connect_response(input: &[u8], expected_transaction_id: u32) ->
         return Err("UDP tracker transaction ID mismatch".to_string());
     }
     if action == UDP_ACTION_ERROR {
-        return Err(format!("UDP tracker error: {}", String::from_utf8_lossy(&input[8..])));
+        return Err(format!(
+            "UDP tracker error: {}",
+            String::from_utf8_lossy(&input[8..])
+        ));
     }
     if action != UDP_ACTION_CONNECT {
         return Err(format!("unexpected UDP tracker action: {action}"));
@@ -313,7 +313,10 @@ pub fn build_udp_announce_request(request: UdpAnnounceRequest) -> [u8; 98] {
     out
 }
 
-pub fn parse_udp_announce_response(input: &[u8], expected_transaction_id: u32) -> Result<TrackerAnnounceResponse, String> {
+pub fn parse_udp_announce_response(
+    input: &[u8],
+    expected_transaction_id: u32,
+) -> Result<TrackerAnnounceResponse, String> {
     if input.len() < 8 {
         return Err("UDP tracker response is too short".to_string());
     }
@@ -323,7 +326,10 @@ pub fn parse_udp_announce_response(input: &[u8], expected_transaction_id: u32) -
         return Err("UDP tracker transaction ID mismatch".to_string());
     }
     if action == UDP_ACTION_ERROR {
-        return Err(format!("UDP tracker error: {}", String::from_utf8_lossy(&input[8..])));
+        return Err(format!(
+            "UDP tracker error: {}",
+            String::from_utf8_lossy(&input[8..])
+        ));
     }
     if action != UDP_ACTION_ANNOUNCE {
         return Err(format!("unexpected UDP tracker action: {action}"));
@@ -343,15 +349,42 @@ pub fn parse_udp_announce_response(input: &[u8], expected_transaction_id: u32) -
 
 pub fn announce_udp(
     announce: &str,
-    mut request: UdpAnnounceRequest,
+    request: UdpAnnounceRequest,
 ) -> Result<TrackerAnnounceResponse, String> {
     let endpoint = parse_udp_tracker_url(announce)?;
-    let address = (endpoint.host.as_str(), endpoint.port)
+    let addresses = (endpoint.host.as_str(), endpoint.port)
         .to_socket_addrs()
         .map_err(|err| format!("could not resolve UDP tracker host: {err}"))?
-        .next()
-        .ok_or_else(|| "UDP tracker host did not resolve to an address".to_string())?;
-    let bind_address = if address.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        return Err("UDP tracker host did not resolve to an address".to_string());
+    }
+
+    let mut failures = Vec::new();
+    for (index, address) in addresses.iter().copied().enumerate() {
+        if addresses[..index].contains(&address) {
+            continue;
+        }
+        match announce_udp_address(address, request.clone()) {
+            Ok(response) => return Ok(response),
+            Err(err) => failures.push(format!("{address}: {err}")),
+        }
+    }
+    Err(format!(
+        "UDP tracker failed on every resolved address: {}",
+        failures.join("; ")
+    ))
+}
+
+fn announce_udp_address(
+    address: std::net::SocketAddr,
+    mut request: UdpAnnounceRequest,
+) -> Result<TrackerAnnounceResponse, String> {
+    let bind_address = if address.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
     let socket = UdpSocket::bind(bind_address)
         .map_err(|err| format!("could not bind UDP tracker socket: {err}"))?;
     socket
@@ -418,7 +451,10 @@ pub fn parse_udp_tracker_url(url: &str) -> Result<UdpTrackerEndpoint, String> {
     let rest = url
         .strip_prefix("udp://")
         .ok_or_else(|| "UDP tracker URL must start with udp://".to_string())?;
-    let authority = rest.split_once('/').map(|(authority, _)| authority).unwrap_or(rest);
+    let authority = rest
+        .split_once('/')
+        .map(|(authority, _)| authority)
+        .unwrap_or(rest);
     if authority.is_empty() {
         return Err("UDP tracker URL is missing host".to_string());
     }
@@ -474,7 +510,8 @@ fn parse_http_tracker_response_parts(response: &[u8]) -> Result<(u16, &str, &[u8
 pub fn percent_encode_bytes(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 3);
     for byte in bytes {
-        let is_unreserved = matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'-' | b'_' | b'~');
+        let is_unreserved =
+            matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'-' | b'_' | b'~');
         if is_unreserved {
             out.push(*byte as char);
         } else {
@@ -488,6 +525,30 @@ pub fn percent_encode_bytes(bytes: &[u8]) -> String {
 trait TrackerHttpStream: Read + Write {}
 
 impl<T: Read + Write> TrackerHttpStream for T {}
+
+fn connect_http_tracker_addresses(
+    endpoint: &HttpTrackerEndpoint,
+    addresses: &[std::net::SocketAddr],
+) -> Result<Box<dyn TrackerHttpStream>, String> {
+    if addresses.is_empty() {
+        return Err("tracker host did not resolve to an address".to_string());
+    }
+
+    let mut failures = Vec::new();
+    for (index, address) in addresses.iter().copied().enumerate() {
+        if addresses[..index].contains(&address) {
+            continue;
+        }
+        match connect_http_tracker_stream(endpoint, address) {
+            Ok(stream) => return Ok(stream),
+            Err(err) => failures.push(format!("{address}: {err}")),
+        }
+    }
+    Err(format!(
+        "could not connect to tracker using any resolved address: {}",
+        failures.join("; ")
+    ))
+}
 
 fn connect_http_tracker_stream(
     endpoint: &HttpTrackerEndpoint,
@@ -609,7 +670,8 @@ fn decode_chunked_body(body: &[u8]) -> Result<Vec<u8>, String> {
     let mut cursor = 0usize;
     let mut decoded = Vec::new();
     loop {
-        let line_end = find_crlf(body, cursor).ok_or_else(|| "chunked body is missing chunk size".to_string())?;
+        let line_end = find_crlf(body, cursor)
+            .ok_or_else(|| "chunked body is missing chunk size".to_string())?;
         let size_line = std::str::from_utf8(&body[cursor..line_end])
             .map_err(|_| "chunk size line is not valid UTF-8".to_string())?;
         let size_hex = size_line.split(';').next().unwrap_or("").trim();
@@ -695,7 +757,9 @@ fn optional_u32(node: Option<&BencodeNode>, label: &str) -> Result<Option<u32>, 
     node.map(|node| {
         node.as_i64()
             .ok_or_else(|| format!("tracker {label} field is not an integer"))
-            .and_then(|value| u32::try_from(value).map_err(|_| format!("tracker {label} field is out of range")))
+            .and_then(|value| {
+                u32::try_from(value).map_err(|_| format!("tracker {label} field is out of range"))
+            })
     })
     .transpose()
 }
@@ -714,7 +778,9 @@ fn read_u32(input: &[u8], offset: usize) -> Result<u32, String> {
     let bytes = input
         .get(offset..end)
         .ok_or_else(|| "UDP tracker packet ended early".to_string())?;
-    Ok(u32::from_be_bytes(bytes.try_into().expect("four-byte slice")))
+    Ok(u32::from_be_bytes(
+        bytes.try_into().expect("four-byte slice"),
+    ))
 }
 
 fn read_u64(input: &[u8], offset: usize) -> Result<u64, String> {
@@ -722,7 +788,9 @@ fn read_u64(input: &[u8], offset: usize) -> Result<u64, String> {
     let bytes = input
         .get(offset..end)
         .ok_or_else(|| "UDP tracker packet ended early".to_string())?;
-    Ok(u64::from_be_bytes(bytes.try_into().expect("eight-byte slice")))
+    Ok(u64::from_be_bytes(
+        bytes.try_into().expect("eight-byte slice"),
+    ))
 }
 
 #[cfg(test)]
@@ -746,7 +814,8 @@ mod tests {
 
     #[test]
     fn parses_http_tracker_compact_response() {
-        let response = b"d8:completei12e10:incompletei3e8:intervali1800e5:peers6:\x7f\x00\x00\x01\x1a\xe1e";
+        let response =
+            b"d8:completei12e10:incompletei3e8:intervali1800e5:peers6:\x7f\x00\x00\x01\x1a\xe1e";
         let parsed = parse_http_announce_response(response).expect("tracker response parses");
         assert_eq!(parsed.interval_seconds, 1800);
         assert_eq!(parsed.seeders, Some(12));
@@ -785,7 +854,8 @@ mod tests {
 
     #[test]
     fn parses_http_tracker_url() {
-        let endpoint = parse_http_tracker_url("http://tracker.example:8080/announce?x=1").expect("URL parses");
+        let endpoint =
+            parse_http_tracker_url("http://tracker.example:8080/announce?x=1").expect("URL parses");
         assert_eq!(
             endpoint,
             HttpTrackerEndpoint {
@@ -799,7 +869,8 @@ mod tests {
 
     #[test]
     fn parses_https_tracker_url_with_default_port() {
-        let endpoint = parse_http_tracker_url("https://tracker.example/announce").expect("URL parses");
+        let endpoint =
+            parse_http_tracker_url("https://tracker.example/announce").expect("URL parses");
         assert_eq!(
             endpoint,
             HttpTrackerEndpoint {
@@ -814,7 +885,8 @@ mod tests {
 
     #[test]
     fn parses_udp_tracker_url() {
-        let endpoint = parse_udp_tracker_url("udp://tracker.example:6969/announce").expect("UDP URL parses");
+        let endpoint =
+            parse_udp_tracker_url("udp://tracker.example:6969/announce").expect("UDP URL parses");
         assert_eq!(
             endpoint,
             UdpTrackerEndpoint {
@@ -837,7 +909,8 @@ mod tests {
     #[test]
     fn decodes_chunked_http_tracker_response() {
         let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n36\r\nd8:completei1e10:incompletei2e8:intervali30e5:peers0:e\r\n0\r\n\r\n";
-        let parsed = parse_http_tracker_response(response).expect("chunked tracker response parses");
+        let parsed =
+            parse_http_tracker_response(response).expect("chunked tracker response parses");
         assert_eq!(parsed.interval_seconds, 30);
     }
 
@@ -852,9 +925,7 @@ mod tests {
             let (mut stream, _) = target.accept().expect("target accepts");
             let mut request = [0u8; 1024];
             let length = stream.read(&mut request).expect("target request reads");
-            assert!(
-                String::from_utf8_lossy(&request[..length]).starts_with("GET /new-announce ")
-            );
+            assert!(String::from_utf8_lossy(&request[..length]).starts_with("GET /new-announce "));
             stream
                 .write_all(
                     b"HTTP/1.1 200 OK\r\nContent-Length: 54\r\n\r\nd8:completei1e10:incompletei2e8:intervali30e5:peers0:e",
@@ -869,7 +940,9 @@ mod tests {
             let response = format!(
                 "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{target_port}/new-announce\r\nContent-Length: 0\r\n\r\n"
             );
-            stream.write_all(response.as_bytes()).expect("redirect response writes");
+            stream
+                .write_all(response.as_bytes())
+                .expect("redirect response writes");
         });
 
         let parsed = announce_http(
@@ -942,7 +1015,8 @@ mod tests {
         response.extend_from_slice(&12u32.to_be_bytes());
         response.extend_from_slice(&[127, 0, 0, 1, 0x1a, 0xe1]);
 
-        let parsed = parse_udp_announce_response(&response, 9).expect("UDP announce response parses");
+        let parsed =
+            parse_udp_announce_response(&response, 9).expect("UDP announce response parses");
         assert_eq!(parsed.interval_seconds, 1800);
         assert_eq!(parsed.seeders, Some(12));
         assert_eq!(parsed.leechers, Some(3));

@@ -44,14 +44,36 @@ pub enum PeerMessage {
     Unchoke,
     Interested,
     NotInterested,
-    Have { index: u32 },
+    Have {
+        index: u32,
+    },
     Bitfield(Vec<u8>),
-    Request { index: u32, begin: u32, length: u32 },
-    Piece { index: u32, begin: u32, block: Vec<u8> },
-    Cancel { index: u32, begin: u32, length: u32 },
-    Port { port: u16 },
-    Extended { extension_id: u8, payload: Vec<u8> },
-    Unknown { id: u8, payload: Vec<u8> },
+    Request {
+        index: u32,
+        begin: u32,
+        length: u32,
+    },
+    Piece {
+        index: u32,
+        begin: u32,
+        block: Vec<u8>,
+    },
+    Cancel {
+        index: u32,
+        begin: u32,
+        length: u32,
+    },
+    Port {
+        port: u16,
+    },
+    Extended {
+        extension_id: u8,
+        payload: Vec<u8>,
+    },
+    Unknown {
+        id: u8,
+        payload: Vec<u8>,
+    },
 }
 
 pub fn build_handshake(info_hash: [u8; 20], peer_id: [u8; 20]) -> [u8; HANDSHAKE_LEN] {
@@ -153,7 +175,10 @@ pub fn decode_peer_client(peer_id: &[u8]) -> Option<String> {
         });
     }
 
-    if peer_id.iter().all(|byte| byte.is_ascii_graphic() || *byte == b' ') {
+    if peer_id
+        .iter()
+        .all(|byte| byte.is_ascii_graphic() || *byte == b' ')
+    {
         let display = String::from_utf8_lossy(peer_id).trim().to_string();
         if !display.is_empty() {
             return Some(format!("Unknown ({display})"));
@@ -439,7 +464,9 @@ fn read_u32(input: &[u8], offset: usize) -> Result<u32, String> {
     let bytes = input
         .get(offset..end)
         .ok_or_else(|| "peer message ended early".to_string())?;
-    Ok(u32::from_be_bytes(bytes.try_into().expect("four-byte slice")))
+    Ok(u32::from_be_bytes(
+        bytes.try_into().expect("four-byte slice"),
+    ))
 }
 
 #[cfg(test)]
@@ -471,8 +498,7 @@ mod tests {
 
     #[test]
     fn feature_handshake_can_advertise_extensions_and_dht_together() {
-        let handshake =
-            build_feature_handshake([7u8; 20], *b"-NV0001-123456789012", true, true);
+        let handshake = build_feature_handshake([7u8; 20], *b"-NV0001-123456789012", true, true);
         let parsed = parse_handshake_full(&handshake).expect("handshake parses");
         assert!(supports_extension_protocol(&parsed));
         assert!(supports_dht(&parsed));

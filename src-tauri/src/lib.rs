@@ -4,9 +4,8 @@ use std::{
     io::{ErrorKind, Read, Write},
     net::{IpAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket},
     path::{Path, PathBuf},
-    process::Command,
     sync::{
-        atomic::{AtomicU16, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering},
         Arc, Mutex,
     },
     thread,
@@ -14,12 +13,15 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::{
+    webview::PageLoadEvent, window::Color, AppHandle, Emitter, Manager, WebviewUrl,
+    WebviewWindowBuilder,
+};
 
 use crate::torrent::session::{
-    AddTorrentRequest, AddTorrentResponse, EmptyJsonResponse, LogEntry, LogLevel, TorrentDetails,
-    StreamPriorityRequest, StreamPriorityStatus, TorrentFileAvailability, TorrentFileHash,
-    TorrentListResponse, TorrentSession, UpdateTorrentOptionsRequest,
+    AddTorrentRequest, AddTorrentResponse, EmptyJsonResponse, LogEntry, LogLevel,
+    StreamPriorityRequest, StreamPriorityStatus, TorrentDetails, TorrentFileAvailability,
+    TorrentListResponse, TorrentSession, TorrentSummaryListResponse, UpdateTorrentOptionsRequest,
 };
 
 mod torrent;
@@ -31,6 +33,7 @@ struct AppState {
     media_stream_port: AtomicU16,
     media_stream_tokens: Arc<Mutex<HashMap<String, MediaStreamRoute>>>,
     next_media_stream_token: AtomicU64,
+    shutdown_started: AtomicBool,
 }
 
 #[derive(Debug, Clone)]
@@ -60,24 +63,38 @@ struct MediaPlayerLogRequest {
     message: Option<String>,
 }
 
-const MEDIA_STREAM_CHUNK_LIMIT: u64 = 2 * 1024 * 1024;
+#[derive(Debug, Clone, Serialize)]
+struct SubtitleFileText {
+    file_index: usize,
+    name: String,
+    text: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MediaPlayerClosedPayload {
+    torrent_id: String,
+    file_index: usize,
+}
+
+const MEDIA_STREAM_CHUNK_LIMIT: u64 = 4 * 1024 * 1024;
 const MEDIA_STREAM_WAIT_TIMEOUT: Duration = Duration::from_secs(45);
 const MEDIA_STREAM_WAIT_INTERVAL: Duration = Duration::from_millis(150);
 const MEDIA_STREAM_URGENT_PRIORITY_BYTES: u64 = 16 * 1024 * 1024;
 const MEDIA_STREAM_LOOKAHEAD_PRIORITY_BYTES: u64 = 192 * 1024 * 1024;
 
-#[derive(Debug, Clone, Serialize)]
-struct SafeTestTorrent {
-    label: String,
-    path: String,
-    source_url: String,
-    sha256: String,
-    payload_size: u64,
-}
-
 impl AppState {
-    fn new(default_output_dir: PathBuf, pending_sources: Vec<String>) -> Self {
-        let session = Arc::new(TorrentSession::new(default_output_dir));
+    fn new(
+        default_output_dir: PathBuf,
+        state_dir: PathBuf,
+        log_file_path: PathBuf,
+        pending_sources: Vec<String>,
+    ) -> Self {
+        let session = Arc::new(TorrentSession::new_with_state_and_log_file(
+            default_output_dir,
+            state_dir,
+            log_file_path,
+        ));
         session.log(
             LogLevel::Info,
             "app",
@@ -100,6 +117,7 @@ impl AppState {
             media_stream_port: AtomicU16::new(0),
             media_stream_tokens: Arc::new(Mutex::new(HashMap::new())),
             next_media_stream_token: AtomicU64::new(1),
+            shutdown_started: AtomicBool::new(false),
         };
         if let Err(err) = state.start_media_stream_server() {
             state.session.log(LogLevel::Error, "stream", err, None);
@@ -121,18 +139,14 @@ impl AppState {
             state.session.log(LogLevel::Error, "dht", err, None);
         }
         if let Err(err) = state.start_tracker_scheduler() {
-            state
-                .session
-                .log(LogLevel::Error, "tracker", err, None);
+            state.session.log(LogLevel::Error, "tracker", err, None);
         }
         if let Err(err) = state.start_lsd_service() {
             state.session.log(LogLevel::Warn, "lsd", err, None);
         }
         for id in state.session.runnable_ids() {
             if let Err(err) = state.start_torrent_worker(id.to_string()) {
-                state
-                    .session
-                    .log(LogLevel::Error, "runtime", err, Some(id));
+                state.session.log(LogLevel::Error, "runtime", err, Some(id));
             }
         }
         state
@@ -451,8 +465,9 @@ impl AppState {
     fn start_lsd_service(&self) -> Result<(), String> {
         let listen_port = self.session.listen_port();
         if listen_port == 0 {
-            return Err("LSD disabled because no inbound BitTorrent TCP listener is active"
-                .to_string());
+            return Err(
+                "LSD disabled because no inbound BitTorrent TCP listener is active".to_string(),
+            );
         }
 
         let mut receive_enabled = true;
@@ -469,8 +484,9 @@ impl AppState {
                     ),
                     None,
                 );
-                UdpSocket::bind(("0.0.0.0", 0))
-                    .map_err(|err| format!("could not bind a UDP socket for LSD announces: {err}"))?
+                UdpSocket::bind(("0.0.0.0", 0)).map_err(|err| {
+                    format!("could not bind a UDP socket for LSD announces: {err}")
+                })?
             }
         };
         socket
@@ -623,6 +639,22 @@ impl AppState {
                 let _ = session.announce_stopped(&id);
             });
     }
+
+    fn shutdown_gracefully(&self, timeout: Duration) {
+        self.session.prepare_shutdown();
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if self
+                .active_workers
+                .lock()
+                .map(|workers| workers.is_empty())
+                .unwrap_or(true)
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
 }
 
 struct MediaHttpRequest {
@@ -678,7 +710,11 @@ fn handle_media_stream_connection(
             return;
         }
     };
-    let route = match routes.lock().ok().and_then(|routes| routes.get(token).cloned()) {
+    let route = match routes
+        .lock()
+        .ok()
+        .and_then(|routes| routes.get(token).cloned())
+    {
         Some(route) => route,
         None => {
             let _ = write_media_response(
@@ -740,7 +776,8 @@ fn handle_media_stream_connection(
         return;
     }
 
-    let Some((start, end)) = parse_media_range(request.range.as_deref(), availability.length) else {
+    let Some((start, end)) = parse_media_range(request.range.as_deref(), availability.length)
+    else {
         let content_range = format!("bytes */{}", availability.length);
         let _ = write_media_response(
             &mut stream,
@@ -782,6 +819,7 @@ fn handle_media_stream_connection(
             playhead_offset: start,
             urgent_bytes: Some(urgent_bytes),
             lookahead_bytes: Some(lookahead_bytes),
+            supplemental_file_indices: None,
         },
     );
     match read_media_stream_range_with_wait(&session, &route, start, end) {
@@ -1029,6 +1067,8 @@ fn media_content_type(name: &str) -> &'static str {
         Some("mov") => "video/quicktime",
         Some("mkv") => "video/x-matroska",
         Some("avi") => "video/x-msvideo",
+        Some("srt") => "application/x-subrip; charset=utf-8",
+        Some("vtt") => "text/vtt; charset=utf-8",
         _ => "application/octet-stream",
     }
 }
@@ -1059,54 +1099,16 @@ fn write_media_response(
 
 #[tauri::command]
 fn default_download_dir(state: tauri::State<'_, AppState>) -> String {
-    state.session.default_output_dir().to_string_lossy().into_owned()
+    state
+        .session
+        .default_output_dir()
+        .to_string_lossy()
+        .into_owned()
 }
 
 #[tauri::command]
 fn backend_log_file_path(state: tauri::State<'_, AppState>) -> String {
     state.session.log_file_path().to_string_lossy().into_owned()
-}
-
-#[tauri::command]
-fn safe_test_torrents() -> Vec<SafeTestTorrent> {
-    let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .map(PathBuf::from);
-    let Some(project_root) = project_root else {
-        return Vec::new();
-    };
-
-    let fixtures = [
-        SafeTestTorrent {
-            label: "Alpine minirootfs 3.6 MiB".to_string(),
-            path: project_root
-                .join("fixtures")
-                .join("safe")
-                .join("alpine-minirootfs-3.23.3-x86_64.tar.gz.torrent")
-                .to_string_lossy()
-                .into_owned(),
-            source_url: "https://fosstorrents.com/files/download.php?file=alpine-minirootfs-3.23.3-x86_64.tar.gz.torrent".to_string(),
-            sha256: "8DABC8875DE14A68C587F32F07AF4B667ABC56327B35F1A7748E08A690B855A8".to_string(),
-            payload_size: 3_713_234,
-        },
-        SafeTestTorrent {
-            label: "Debian 13.6 netinst 755 MiB".to_string(),
-            path: project_root
-                .join("fixtures")
-                .join("safe")
-                .join("debian-13.6.0-amd64-netinst.iso.torrent")
-                .to_string_lossy()
-                .into_owned(),
-            source_url: "https://cdimage.debian.org/debian-cd/current/amd64/bt-cd/debian-13.6.0-amd64-netinst.iso.torrent".to_string(),
-            sha256: "763E5F84C8AFF61DA94F20604E078900825AB8C4D44DC66D6B9DE73C5BE29976".to_string(),
-            payload_size: 791_674_880,
-        },
-    ];
-
-    fixtures
-        .into_iter()
-        .filter(|fixture| PathBuf::from(&fixture.path).exists())
-        .collect()
 }
 
 #[tauri::command]
@@ -1117,6 +1119,11 @@ fn take_pending_open_sources(state: tauri::State<'_, AppState>) -> Vec<String> {
 #[tauri::command]
 fn list_torrents(state: tauri::State<'_, AppState>) -> TorrentListResponse {
     state.session.list()
+}
+
+#[tauri::command]
+fn list_torrent_summaries(state: tauri::State<'_, AppState>) -> TorrentSummaryListResponse {
+    state.session.list_summaries()
 }
 
 #[tauri::command]
@@ -1145,9 +1152,7 @@ fn add_torrent(
     if start_now {
         if let Some(id) = response.id {
             if let Err(err) = state.start_torrent_worker(id.to_string()) {
-                state
-                    .session
-                    .log(LogLevel::Error, "runtime", err, Some(id));
+                state.session.log(LogLevel::Error, "runtime", err, Some(id));
             }
         }
     }
@@ -1259,6 +1264,18 @@ fn update_torrent_files(
 }
 
 #[tauri::command]
+fn update_torrent_file_priority(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    file_index: usize,
+    priority: u8,
+) -> Result<EmptyJsonResponse, String> {
+    state
+        .session
+        .update_file_priority(&id, file_index, priority)
+}
+
+#[tauri::command]
 fn update_torrent_options(
     state: tauri::State<'_, AppState>,
     id: String,
@@ -1268,29 +1285,15 @@ fn update_torrent_options(
 }
 
 #[tauri::command]
-async fn hash_torrent_file(
-    state: tauri::State<'_, AppState>,
-    id: String,
-    file_index: usize,
-) -> Result<TorrentFileHash, String> {
-    let session = Arc::clone(&state.session);
-    tauri::async_runtime::spawn_blocking(move || session.hash_torrent_file(&id, file_index))
-        .await
-        .map_err(|err| format!("file hash worker failed: {err}"))?
-}
-
-#[tauri::command]
 async fn stream_file_availability(
     state: tauri::State<'_, AppState>,
     id: String,
     file_index: usize,
 ) -> Result<TorrentFileAvailability, String> {
     let session = Arc::clone(&state.session);
-    tauri::async_runtime::spawn_blocking(move || {
-        session.stream_file_availability(&id, file_index)
-    })
-    .await
-    .map_err(|err| format!("file availability worker failed: {err}"))?
+    tauri::async_runtime::spawn_blocking(move || session.stream_file_availability(&id, file_index))
+        .await
+        .map_err(|err| format!("file availability worker failed: {err}"))?
 }
 
 #[tauri::command]
@@ -1301,12 +1304,11 @@ async fn stream_file_url(
 ) -> Result<String, String> {
     let session = Arc::clone(&state.session);
     let validation_id = id.clone();
-    let availability =
-        tauri::async_runtime::spawn_blocking(move || {
-            session.stream_file_availability(&validation_id, file_index)
-        })
-        .await
-        .map_err(|err| format!("file stream URL worker failed: {err}"))??;
+    let availability = tauri::async_runtime::spawn_blocking(move || {
+        session.stream_file_availability(&validation_id, file_index)
+    })
+    .await
+    .map_err(|err| format!("file stream URL worker failed: {err}"))??;
 
     let port = state.media_stream_port.load(Ordering::Acquire);
     if port == 0 {
@@ -1341,6 +1343,59 @@ async fn stream_file_url(
 }
 
 #[tauri::command]
+async fn subtitle_file_text(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    file_index: usize,
+) -> Result<SubtitleFileText, String> {
+    let session = Arc::clone(&state.session);
+    tauri::async_runtime::spawn_blocking(move || {
+        let availability = session.stream_file_availability(&id, file_index)?;
+        let extension = Path::new(&availability.name)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase);
+        if !matches!(extension.as_deref(), Some("srt") | Some("vtt")) {
+            return Err("only SRT and WebVTT subtitle files can be loaded".to_string());
+        }
+        if availability.length > MEDIA_STREAM_CHUNK_LIMIT {
+            return Err(format!(
+                "subtitle file exceeds the {MEDIA_STREAM_CHUNK_LIMIT} byte limit"
+            ));
+        }
+        if !availability.complete {
+            return Err("subtitle file is still downloading".to_string());
+        }
+        let read = session.read_stream_file_range(&id, file_index, 0, availability.length)?;
+        Ok(SubtitleFileText {
+            file_index,
+            name: availability.name,
+            text: decode_subtitle_text(&read.bytes),
+        })
+    })
+    .await
+    .map_err(|err| format!("subtitle worker failed: {err}"))?
+}
+
+fn decode_subtitle_text(bytes: &[u8]) -> String {
+    if bytes.starts_with(&[0xff, 0xfe]) {
+        let utf16 = bytes[2..]
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect::<Vec<_>>();
+        return String::from_utf16_lossy(&utf16);
+    }
+    if bytes.starts_with(&[0xfe, 0xff]) {
+        let utf16 = bytes[2..]
+            .chunks_exact(2)
+            .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
+            .collect::<Vec<_>>();
+        return String::from_utf16_lossy(&utf16);
+    }
+    String::from_utf8_lossy(bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes)).into_owned()
+}
+
+#[tauri::command]
 async fn open_media_window(
     app: AppHandle,
     state: tauri::State<'_, AppState>,
@@ -1368,15 +1423,30 @@ async fn open_media_window(
     route.push_str("&fileIndex=");
     route.push_str(&file_index.to_string());
 
-    WebviewWindowBuilder::new(&app, label, WebviewUrl::App(route.into()))
+    let window = WebviewWindowBuilder::new(&app, label, WebviewUrl::App(route.into()))
         .title(format!("NovaTorrent - {}", availability.name))
         .inner_size(1040.0, 720.0)
         .min_inner_size(700.0, 460.0)
         .resizable(true)
         .build()
-        .map_err(error_to_string)?
-        .set_focus()
-        .map_err(error_to_string)
+        .map_err(error_to_string)?;
+    let closed_app = app.clone();
+    let closed_torrent_id = id.clone();
+    window.on_window_event(move |event| {
+        if matches!(event, tauri::WindowEvent::Destroyed) {
+            if let Some(state) = closed_app.try_state::<AppState>() {
+                let _ = state.session.clear_stream_priority(&closed_torrent_id);
+            }
+            let _ = closed_app.emit(
+                "media-player-closed",
+                MediaPlayerClosedPayload {
+                    torrent_id: closed_torrent_id.clone(),
+                    file_index,
+                },
+            );
+        }
+    });
+    window.set_focus().map_err(error_to_string)
 }
 
 #[tauri::command]
@@ -1470,41 +1540,17 @@ fn clear_stream_priority(
 }
 
 #[tauri::command]
-fn open_virustotal_report(sha256: String) -> Result<(), String> {
-    if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err("VirusTotal report requires a 64-character SHA-256 hash".to_string());
-    }
-    let url = format!(
-        "https://www.virustotal.com/gui/file/{}",
-        sha256.to_ascii_lowercase()
-    );
-    #[cfg(target_os = "windows")]
-    let mut command = {
-        let mut command = Command::new("rundll32.exe");
-        command.args(["url.dll,FileProtocolHandler", &url]);
-        command
-    };
-    #[cfg(target_os = "macos")]
-    let mut command = {
-        let mut command = Command::new("open");
-        command.arg(&url);
-        command
-    };
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let mut command = {
-        let mut command = Command::new("xdg-open");
-        command.arg(&url);
-        command
-    };
-    command
-        .spawn()
-        .map(|_| ())
-        .map_err(|err| format!("could not open VirusTotal report: {err}"))
+fn backend_logs(state: tauri::State<'_, AppState>, torrent_id: Option<u64>) -> Vec<LogEntry> {
+    state.session.logs(torrent_id)
 }
 
 #[tauri::command]
-fn backend_logs(state: tauri::State<'_, AppState>, torrent_id: Option<u64>) -> Vec<LogEntry> {
-    state.session.logs(torrent_id)
+fn backend_logs_after(
+    state: tauri::State<'_, AppState>,
+    torrent_id: Option<u64>,
+    after_id: Option<u64>,
+) -> Vec<LogEntry> {
+    state.session.logs_after(torrent_id, after_id)
 }
 
 #[tauri::command]
@@ -1544,10 +1590,18 @@ fn open_add_window(app: &AppHandle, source: Option<String>) -> Result<(), String
         .inner_size(780.0, 720.0)
         .min_inner_size(620.0, 560.0)
         .resizable(true)
+        .visible(false)
+        .background_color(Color(16, 20, 25, 255))
+        .on_page_load(|window, payload| {
+            if payload.event() == PageLoadEvent::Finished {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        })
         .build()
-        .map_err(error_to_string)?
-        .set_focus()
-        .map_err(error_to_string)
+        .map_err(error_to_string)?;
+
+    Ok(())
 }
 
 fn add_torrent_route() -> &'static str {
@@ -1646,7 +1700,10 @@ fn normalize_open_source(
     {
         return None;
     }
-    std::fs::canonicalize(path).ok()?.to_str().map(str::to_owned)
+    std::fs::canonicalize(path)
+        .ok()?
+        .to_str()
+        .map(str::to_owned)
 }
 
 fn strip_ascii_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
@@ -1742,25 +1799,34 @@ pub fn run() {
         }));
     }
 
-    builder
+    let app = builder
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            let default_output_dir = app.path().download_dir()?.join("NovaTorrent");
-            std::fs::create_dir_all(&default_output_dir)?;
+            let default_output_dir = app.path().download_dir()?;
+            let state_dir = default_output_dir.join("NovaTorrent");
+            std::fs::create_dir_all(&state_dir)?;
+            let log_dir = app.path().app_log_dir()?;
+            std::fs::create_dir_all(&log_dir)?;
+            let log_file_path = log_dir.join("novatorrent.log");
             let working_directory = env::current_dir().ok();
             let pending_sources = supported_open_sources(
                 env::args().skip(1).collect::<Vec<_>>(),
                 working_directory.as_deref(),
             );
-            app.manage(AppState::new(default_output_dir, pending_sources));
+            app.manage(AppState::new(
+                default_output_dir,
+                state_dir,
+                log_file_path,
+                pending_sources,
+            ));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             default_download_dir,
             backend_log_file_path,
-            safe_test_torrents,
             take_pending_open_sources,
             list_torrents,
+            list_torrent_summaries,
             torrent_details,
             preview_torrent,
             add_torrent,
@@ -1776,21 +1842,34 @@ pub fn run() {
             fetch_metadata_torrent,
             delete_torrent,
             update_torrent_files,
+            update_torrent_file_priority,
             update_torrent_options,
-            hash_torrent_file,
             stream_file_availability,
             stream_file_url,
+            subtitle_file_text,
             open_media_window,
             close_media_window,
             media_player_log,
             set_stream_priority,
             clear_stream_priority,
-            open_virustotal_report,
             backend_logs,
+            backend_logs_after,
             open_add_torrent_window
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running NovaTorrent");
+        .build(tauri::generate_context!())
+        .expect("error while building NovaTorrent");
+
+    app.run(|app_handle, event| {
+        if let tauri::RunEvent::ExitRequested { api, .. } = event {
+            if let Some(state) = app_handle.try_state::<AppState>() {
+                if !state.shutdown_started.swap(true, Ordering::AcqRel) {
+                    api.prevent_exit();
+                    state.shutdown_gracefully(Duration::from_secs(5));
+                    app_handle.exit(0);
+                }
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -1827,7 +1906,10 @@ mod open_source_tests {
 
         assert_eq!(sources.len(), 2);
         assert_eq!(sources[0], MAGNET);
-        assert_eq!(sources[1], std::fs::canonicalize(&torrent).unwrap().to_str().unwrap());
+        assert_eq!(
+            sources[1],
+            std::fs::canonicalize(&torrent).unwrap().to_str().unwrap()
+        );
         std::fs::remove_dir_all(directory).expect("test directory should be removed");
     }
 
@@ -1835,12 +1917,8 @@ mod open_source_tests {
     fn unwraps_only_valid_novatorrent_routes_and_payloads() {
         let encoded = percent_encode_uri_component(MAGNET);
         assert_eq!(
-            normalize_open_source(
-                &format!("novatorrent://open?magnet={encoded}"),
-                None,
-                0
-            )
-            .as_deref(),
+            normalize_open_source(&format!("novatorrent://open?magnet={encoded}"), None, 0)
+                .as_deref(),
             Some(MAGNET)
         );
         assert!(normalize_open_source("novatorrent://settings?magnet=x", None, 0).is_none());
@@ -1850,7 +1928,10 @@ mod open_source_tests {
 
     #[test]
     fn media_stream_ranges_are_capped_and_retryable_errors_are_identified() {
-        assert_eq!(parse_media_range(None, 10 * 1024 * 1024), Some((0, MEDIA_STREAM_CHUNK_LIMIT - 1)));
+        assert_eq!(
+            parse_media_range(None, 10 * 1024 * 1024),
+            Some((0, MEDIA_STREAM_CHUNK_LIMIT - 1))
+        );
         assert_eq!(parse_media_range(Some("bytes=4-9"), 20), Some((4, 9)));
         assert_eq!(parse_media_range(Some("bytes=18-99"), 20), Some((18, 19)));
         assert_eq!(parse_media_range(Some("bytes=50-99"), 20), None);
@@ -1887,8 +1968,29 @@ mod open_source_tests {
             ),
             None
         );
-        assert!(is_waitable_media_stream_error("stream byte range is not verified yet"));
-        assert!(is_waitable_media_stream_error("stream data is not buffered yet"));
-        assert!(!is_waitable_media_stream_error("torrent metadata is not available yet"));
+        assert!(is_waitable_media_stream_error(
+            "stream byte range is not verified yet"
+        ));
+        assert!(is_waitable_media_stream_error(
+            "stream data is not buffered yet"
+        ));
+        assert!(!is_waitable_media_stream_error(
+            "torrent metadata is not available yet"
+        ));
+    }
+
+    #[test]
+    fn subtitle_text_decoding_handles_common_boms_and_caption_mime_types() {
+        assert_eq!(decode_subtitle_text(b"\xef\xbb\xbfHello"), "Hello");
+        assert_eq!(decode_subtitle_text(&[0xff, 0xfe, b'H', 0, b'i', 0]), "Hi");
+        assert_eq!(decode_subtitle_text(&[0xfe, 0xff, 0, b'H', 0, b'i']), "Hi");
+        assert_eq!(
+            media_content_type("captions.SRT"),
+            "application/x-subrip; charset=utf-8"
+        );
+        assert_eq!(
+            media_content_type("captions.vtt"),
+            "text/vtt; charset=utf-8"
+        );
     }
 }

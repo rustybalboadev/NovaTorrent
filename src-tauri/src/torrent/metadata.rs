@@ -4,12 +4,14 @@ use crate::torrent::{
 };
 
 pub const UT_METADATA_BLOCK_SIZE: usize = 16 * 1024;
+pub const DEFAULT_REQUEST_QUEUE_LIMIT: usize = 500;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtensionHandshake {
     pub ut_metadata: Option<u8>,
     pub ut_pex: Option<u8>,
     pub metadata_size: Option<u64>,
+    pub request_queue_limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +49,7 @@ pub fn build_extension_handshake_with_pex(
     if let Some(metadata_size) = metadata_size {
         payload.extend_from_slice(format!("13:metadata_sizei{metadata_size}e").as_bytes());
     }
+    payload.extend_from_slice(format!("4:reqqi{DEFAULT_REQUEST_QUEUE_LIMIT}e").as_bytes());
     payload.push(b'e');
     payload
 }
@@ -73,11 +76,19 @@ pub fn parse_extension_handshake(payload: &[u8]) -> Result<ExtensionHandshake, S
         .map(u64::try_from)
         .transpose()
         .map_err(|_| "metadata_size cannot be negative".to_string())?;
+    let request_queue_limit = root
+        .dict_get(b"reqq")
+        .and_then(BencodeNode::as_i64)
+        .map(usize::try_from)
+        .transpose()
+        .map_err(|_| "reqq request queue limit cannot be negative".to_string())?
+        .filter(|limit| *limit > 0);
 
     Ok(ExtensionHandshake {
         ut_metadata,
         ut_pex,
         metadata_size,
+        request_queue_limit,
     })
 }
 
@@ -90,7 +101,8 @@ pub fn build_metadata_request(piece: u32) -> Vec<u8> {
 }
 
 pub fn build_metadata_data(piece: u32, total_size: u64, data: &[u8]) -> Vec<u8> {
-    let mut payload = format!("d8:msg_typei1e5:piecei{piece}e10:total_sizei{total_size}ee").into_bytes();
+    let mut payload =
+        format!("d8:msg_typei1e5:piecei{piece}e10:total_sizei{total_size}ee").into_bytes();
     payload.extend_from_slice(data);
     payload
 }
@@ -115,7 +127,9 @@ pub fn parse_metadata_message(payload: &[u8]) -> Result<MetadataMessage, String>
         .dict_get(b"piece")
         .and_then(BencodeNode::as_i64)
         .ok_or_else(|| "metadata message is missing piece".to_string())
-        .and_then(|piece| u32::try_from(piece).map_err(|_| "metadata piece is out of range".to_string()))?;
+        .and_then(|piece| {
+            u32::try_from(piece).map_err(|_| "metadata piece is out of range".to_string())
+        })?;
     let total_size = header
         .dict_get(b"total_size")
         .and_then(BencodeNode::as_i64)
@@ -155,6 +169,7 @@ mod tests {
                 ut_metadata: Some(3),
                 ut_pex: None,
                 metadata_size: Some(65_000),
+                request_queue_limit: Some(DEFAULT_REQUEST_QUEUE_LIMIT),
             }
         );
     }
@@ -170,8 +185,17 @@ mod tests {
                 ut_metadata: None,
                 ut_pex: Some(4),
                 metadata_size: None,
+                request_queue_limit: Some(DEFAULT_REQUEST_QUEUE_LIMIT),
             }
         );
+    }
+
+    #[test]
+    fn parses_remote_request_queue_limit() {
+        let parsed = parse_extension_handshake(b"d1:mde4:reqqi24ee")
+            .expect("request queue extension parses");
+
+        assert_eq!(parsed.request_queue_limit, Some(24));
     }
 
     #[test]

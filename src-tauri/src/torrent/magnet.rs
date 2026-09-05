@@ -196,7 +196,10 @@ mod tests {
         assert_eq!(magnet.web_seeds, vec!["https://mirror.test/file.bin"]);
         assert_eq!(magnet.peers[0].address, "127.0.0.1");
         assert_eq!(magnet.peers[0].port, 6881);
-        assert_eq!(sha1::hex(&magnet.info_hash), "0123456789abcdef0123456789abcdef01234567");
+        assert_eq!(
+            sha1::hex(&magnet.info_hash),
+            "0123456789abcdef0123456789abcdef01234567"
+        );
     }
 
     #[test]

@@ -36,11 +36,19 @@ impl Metainfo {
             .dict_get(b"info")
             .ok_or_else(|| "metainfo is missing info dictionary".to_string())?;
         let info_hash = sha1::digest(&input[info.span.clone()]);
-        let announce = root.dict_get(b"announce").and_then(|node| node.as_str_lossy());
+        let announce = root
+            .dict_get(b"announce")
+            .and_then(|node| node.as_str_lossy());
         let announce_list = parse_announce_list(root.dict_get(b"announce-list"));
-        let comment = root.dict_get(b"comment").and_then(|node| node.as_str_lossy());
-        let created_by = root.dict_get(b"created by").and_then(|node| node.as_str_lossy());
-        let creation_date = root.dict_get(b"creation date").and_then(|node| node.as_i64());
+        let comment = root
+            .dict_get(b"comment")
+            .and_then(|node| node.as_str_lossy());
+        let created_by = root
+            .dict_get(b"created by")
+            .and_then(|node| node.as_str_lossy());
+        let creation_date = root
+            .dict_get(b"creation date")
+            .and_then(|node| node.as_i64());
         let web_seeds = parse_url_list(root.dict_get(b"url-list"));
         Self::from_info_node(
             info,
@@ -264,64 +272,89 @@ fn split_url_list_string(value: &str) -> Vec<String> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn parses_serum_fixture_without_downloading() {
-        let bytes = include_bytes!("../../../test serum torrent.torrent");
-        let meta = Metainfo::from_bytes(bytes).expect("fixture parses");
+    fn push_bytes(output: &mut Vec<u8>, value: &[u8]) {
+        output.extend_from_slice(value.len().to_string().as_bytes());
+        output.push(b':');
+        output.extend_from_slice(value);
+    }
 
-        assert_eq!(meta.name, "Test Press - Serum 2 Ultimate Reese (2025)");
-        assert_eq!(meta.piece_length, 131_072);
-        assert_eq!(meta.pieces.len(), 531);
-        assert!(meta.total_length > 60_000_000);
-        assert!(meta.files.len() > 100);
-        assert_eq!(meta.files[0].components[0], "Bass_Loops");
-        assert_eq!(
-            meta.announce.as_deref(),
-            Some("http://bt2.t-ru.org/ann")
-        );
+    fn push_integer(output: &mut Vec<u8>, value: i64) {
+        output.push(b'i');
+        output.extend_from_slice(value.to_string().as_bytes());
+        output.push(b'e');
+    }
+
+    fn synthetic_multi_file_metainfo() -> Vec<u8> {
+        let mut output = vec![b'd'];
+
+        push_bytes(&mut output, b"announce");
+        push_bytes(&mut output, b"udp://tracker.example:6969/announce");
+        push_bytes(&mut output, b"announce-list");
+        output.extend_from_slice(b"ll");
+        push_bytes(&mut output, b"udp://backup.example:6969/announce");
+        output.extend_from_slice(b"ee");
+        push_bytes(&mut output, b"comment");
+        push_bytes(&mut output, b"synthetic test metadata");
+        push_bytes(&mut output, b"created by");
+        push_bytes(&mut output, b"NovaTorrent tests");
+        push_bytes(&mut output, b"creation date");
+        push_integer(&mut output, 1_700_000_000);
+        push_bytes(&mut output, b"info");
+        output.push(b'd');
+        push_bytes(&mut output, b"files");
+        output.push(b'l');
+        for (length, path) in [(3, ["dir", "one.bin"]), (5, ["dir", "two.bin"])] {
+            output.push(b'd');
+            push_bytes(&mut output, b"length");
+            push_integer(&mut output, length);
+            push_bytes(&mut output, b"path");
+            output.push(b'l');
+            for component in path {
+                push_bytes(&mut output, component.as_bytes());
+            }
+            output.extend_from_slice(b"ee");
+        }
+        output.push(b'e');
+        push_bytes(&mut output, b"name");
+        push_bytes(&mut output, b"example");
+        push_bytes(&mut output, b"piece length");
+        push_integer(&mut output, 4);
+        push_bytes(&mut output, b"pieces");
+        push_bytes(&mut output, &[0x11; 40]);
+        push_bytes(&mut output, b"private");
+        push_integer(&mut output, 1);
+        output.push(b'e');
+        push_bytes(&mut output, b"url-list");
+        output.push(b'l');
+        push_bytes(&mut output, b"https://seed.example/files/");
+        output.extend_from_slice(b"ee");
+        output
     }
 
     #[test]
-    fn parses_debian_safe_fixture_without_downloading() {
-        let bytes = include_bytes!("../../../fixtures/safe/debian-13.6.0-amd64-netinst.iso.torrent");
-        let meta = Metainfo::from_bytes(bytes).expect("safe fixture parses");
+    fn parses_synthetic_multi_file_metainfo() {
+        let bytes = synthetic_multi_file_metainfo();
+        let meta = Metainfo::from_bytes(&bytes).expect("synthetic metainfo parses");
 
-        assert_eq!(meta.name, "debian-13.6.0-amd64-netinst.iso");
-        assert_eq!(meta.piece_length, 262_144);
-        assert_eq!(meta.pieces.len(), 3_020);
-        assert_eq!(meta.total_length, 791_674_880);
-        assert_eq!(meta.files.len(), 1);
-        assert_eq!(meta.files[0].name, "debian-13.6.0-amd64-netinst.iso");
+        assert_eq!(meta.name, "example");
+        assert_eq!(meta.piece_length, 4);
+        assert_eq!(meta.pieces, vec![[0x11; 20], [0x11; 20]]);
+        assert_eq!(meta.total_length, 8);
+        assert_eq!(meta.files.len(), 2);
+        assert_eq!(meta.files[0].components, ["dir", "one.bin"]);
+        assert_eq!(meta.files[1].name, "dir/two.bin");
+        assert!(meta.private);
+        assert_eq!(meta.comment.as_deref(), Some("synthetic test metadata"));
+        assert_eq!(meta.created_by.as_deref(), Some("NovaTorrent tests"));
+        assert_eq!(meta.creation_date, Some(1_700_000_000));
+        assert_eq!(meta.web_seeds, ["https://seed.example/files/"]);
         assert_eq!(
-            meta.announce.as_deref(),
-            Some("http://bttracker.debian.org:6969/announce")
+            meta.tracker_urls(),
+            [
+                "udp://tracker.example:6969/announce",
+                "udp://backup.example:6969/announce"
+            ]
         );
-    }
-
-    #[test]
-    fn parses_alpine_small_safe_fixture_without_downloading() {
-        let bytes = include_bytes!("../../../fixtures/safe/alpine-minirootfs-3.23.3-x86_64.tar.gz.torrent");
-        let meta = Metainfo::from_bytes(bytes).expect("small safe fixture parses");
-
-        assert_eq!(meta.name, "alpine-minirootfs-3.23.3-x86_64.tar.gz");
-        assert_eq!(meta.piece_length, 32_768);
-        assert_eq!(meta.pieces.len(), 114);
-        assert_eq!(meta.total_length, 3_713_234);
-        assert_eq!(meta.files.len(), 1);
-        assert_eq!(meta.files[0].name, "alpine-minirootfs-3.23.3-x86_64.tar.gz");
-        assert_eq!(
-            meta.announce.as_deref(),
-            Some("udp://fosstorrents.com:6969/announce")
-        );
-        assert!(meta
-            .web_seeds
-            .iter()
-            .any(|seed| seed.starts_with("http://dl-cdn.alpinelinux.org/alpine/")));
-        assert!(meta.web_seeds.len() > 10);
-        assert!(meta
-            .tracker_urls()
-            .iter()
-            .any(|tracker| tracker == "http://fosstorrents.com:6969/announce"));
     }
 
     #[test]
@@ -339,7 +372,10 @@ mod tests {
         assert_eq!(meta.total_length, 11);
         assert_eq!(meta.piece_length, 4);
         assert_eq!(meta.pieces.len(), 3);
-        assert_eq!(meta.announce.as_deref(), Some("udp://tracker.example:6969/announce"));
+        assert_eq!(
+            meta.announce.as_deref(),
+            Some("udp://tracker.example:6969/announce")
+        );
         assert_eq!(meta.info_hash, sha1::digest(info));
     }
 

@@ -128,9 +128,7 @@ pub fn parse_lsd_announce(packet: &[u8]) -> Result<LsdAnnounce, String> {
 pub fn contactable_lsd_source(address: IpAddr) -> bool {
     match address {
         IpAddr::V4(address) => {
-            !address.is_unspecified()
-                && !address.is_multicast()
-                && !address.is_broadcast()
+            !address.is_unspecified() && !address.is_multicast() && !address.is_broadcast()
         }
         IpAddr::V6(_) => false,
     }
@@ -190,15 +188,16 @@ mod tests {
 
     #[test]
     fn round_robins_active_info_hashes() {
-        let hashes = (0u8..7)
-            .map(|value| [value; 20])
-            .collect::<Vec<[u8; 20]>>();
+        let hashes = (0u8..7).map(|value| [value; 20]).collect::<Vec<[u8; 20]>>();
         let (first, cursor) = round_robin_info_hash_batch(&hashes, 0);
         let (second, next_cursor) = round_robin_info_hash_batch(&hashes, cursor);
 
         assert_eq!(first, hashes[..5]);
         assert_eq!(cursor, 5);
-        assert_eq!(second, vec![hashes[5], hashes[6], hashes[0], hashes[1], hashes[2]]);
+        assert_eq!(
+            second,
+            vec![hashes[5], hashes[6], hashes[0], hashes[1], hashes[2]]
+        );
         assert_eq!(next_cursor, 3);
     }
 }

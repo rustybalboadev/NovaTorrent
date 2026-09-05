@@ -7,6 +7,8 @@ use crate::torrent::{
     tracker,
 };
 
+pub const MAX_PEX_PEERS_PER_MESSAGE: usize = 50;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PexPeer {
     pub address: String,
@@ -57,9 +59,9 @@ pub fn parse_pex_message(payload: &[u8]) -> Result<PexMessage, String> {
         None,
         "dropped",
     )?;
-    if added.is_empty() && dropped.is_empty() {
-        return Err("PEX message did not include added or dropped peers".to_string());
-    }
+    // BEP 11 updates are advisory. Some widely used clients emit an empty
+    // dictionary as a heartbeat/no-change update; it must not tear down the
+    // underlying peer-wire connection.
     Ok(PexMessage { added, dropped })
 }
 
@@ -88,7 +90,10 @@ fn parse_peer_group(
     let mut peers = Vec::new();
     if let Some(compact) = ipv4.and_then(BencodeNode::as_bytes) {
         let flags = flags_for(ipv4_flags, compact.len() / 6, label)?;
-        for (index, peer) in tracker::parse_compact_peers(compact)?.into_iter().enumerate() {
+        for (index, peer) in tracker::parse_compact_peers(compact)?
+            .into_iter()
+            .enumerate()
+        {
             peers.push(PexPeer {
                 address: peer.address,
                 port: peer.port,
@@ -157,6 +162,9 @@ fn sanitized_peers(peers: Vec<PexPeer>) -> Vec<PexPeer> {
             continue;
         }
         out.push(peer);
+        if out.len() == MAX_PEX_PEERS_PER_MESSAGE {
+            break;
+        }
     }
     out
 }
@@ -224,6 +232,13 @@ mod tests {
     }
 
     #[test]
+    fn accepts_empty_pex_heartbeat() {
+        let parsed = parse_pex_message(b"de").expect("empty PEX heartbeat parses");
+        assert!(parsed.added.is_empty());
+        assert!(parsed.dropped.is_empty());
+    }
+
+    #[test]
     fn rejects_zero_port_pex_build_peer() {
         let err = build_pex_message(
             &[PexPeer {
@@ -249,6 +264,29 @@ mod tests {
                 port: 6881,
                 flags: 0,
             }]
+        );
+    }
+
+    #[test]
+    fn bounds_pex_candidates_from_one_peer() {
+        let peers = (1..=75)
+            .map(|suffix| PexPeer {
+                address: format!("203.0.113.{suffix}"),
+                port: 6881,
+                flags: 0,
+            })
+            .collect::<Vec<_>>();
+        let payload = build_pex_message(&peers, &[]).expect("large PEX message builds");
+        let parsed = parse_pex_message(&payload).expect("large PEX message parses");
+
+        assert_eq!(parsed.added.len(), MAX_PEX_PEERS_PER_MESSAGE);
+        assert_eq!(
+            parsed.added.first().expect("first peer").address,
+            "203.0.113.1"
+        );
+        assert_eq!(
+            parsed.added.last().expect("last peer").address,
+            "203.0.113.50"
         );
     }
 }

@@ -1,10 +1,9 @@
 [package]
 name = "novatorrent"
-version = "0.1.0"
+version = "1.0.0"
 description = "A modern BitTorrent client built with Rust, Tauri, Next.js, React, and TypeScript."
 authors = ["NovaTorrent contributors"]
 license = "MIT"
-repository = ""
 edition = "2021"
 rust-version = "1.77.2"
 
