@@ -5,11 +5,11 @@ use std::{
     net::{IpAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize};
@@ -32,7 +32,6 @@ struct AppState {
     active_workers: Arc<Mutex<HashSet<String>>>,
     media_stream_port: AtomicU16,
     media_stream_tokens: Arc<Mutex<HashMap<String, MediaStreamRoute>>>,
-    next_media_stream_token: AtomicU64,
     shutdown_started: AtomicBool,
 }
 
@@ -40,6 +39,17 @@ struct AppState {
 struct MediaStreamRoute {
     id: String,
     file_index: usize,
+    expires_at: Instant,
+}
+
+struct MediaStreamConnectionGuard {
+    active: Arc<AtomicUsize>,
+}
+
+impl Drop for MediaStreamConnectionGuard {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::Release);
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -82,6 +92,9 @@ const MEDIA_STREAM_WAIT_TIMEOUT: Duration = Duration::from_secs(45);
 const MEDIA_STREAM_WAIT_INTERVAL: Duration = Duration::from_millis(150);
 const MEDIA_STREAM_URGENT_PRIORITY_BYTES: u64 = 16 * 1024 * 1024;
 const MEDIA_STREAM_LOOKAHEAD_PRIORITY_BYTES: u64 = 192 * 1024 * 1024;
+const MEDIA_STREAM_ROUTE_TTL: Duration = Duration::from_secs(12 * 60 * 60);
+const MEDIA_STREAM_MAX_ROUTES: usize = 128;
+const MEDIA_STREAM_MAX_CONNECTIONS: usize = 32;
 
 impl AppState {
     fn new(
@@ -116,7 +129,6 @@ impl AppState {
             active_workers: Arc::new(Mutex::new(HashSet::new())),
             media_stream_port: AtomicU16::new(0),
             media_stream_tokens: Arc::new(Mutex::new(HashMap::new())),
-            next_media_stream_token: AtomicU64::new(1),
             shutdown_started: AtomicBool::new(false),
         };
         if let Err(err) = state.start_media_stream_server() {
@@ -170,17 +182,34 @@ impl AppState {
 
         let session = Arc::clone(&self.session);
         let routes = Arc::clone(&self.media_stream_tokens);
+        let active_connections = Arc::new(AtomicUsize::new(0));
         thread::Builder::new()
             .name("novatorrent-media-stream".to_string())
             .spawn(move || {
                 for connection in listener.incoming() {
                     match connection {
                         Ok(stream) => {
+                            let Some(connection_guard) =
+                                try_acquire_media_connection(Arc::clone(&active_connections))
+                            else {
+                                let mut stream = stream;
+                                let _ = write_media_response(
+                                    &mut stream,
+                                    "503 Service Unavailable",
+                                    &[
+                                        ("Retry-After", "1"),
+                                        ("Content-Type", "text/plain; charset=utf-8"),
+                                    ],
+                                    b"media stream server is busy",
+                                );
+                                continue;
+                            };
                             let session = Arc::clone(&session);
                             let routes = Arc::clone(&routes);
                             let _ = thread::Builder::new()
                                 .name("novatorrent-media-range".to_string())
                                 .spawn(move || {
+                                    let _connection_guard = connection_guard;
                                     handle_media_stream_connection(stream, session, routes);
                                 });
                         }
@@ -640,6 +669,10 @@ impl AppState {
             });
     }
 
+    fn revoke_media_stream_routes(&self, id: &str, file_index: Option<usize>) {
+        revoke_media_stream_routes(&self.media_stream_tokens, id, file_index);
+    }
+
     fn shutdown_gracefully(&self, timeout: Duration) {
         self.session.prepare_shutdown();
         let deadline = Instant::now() + timeout;
@@ -654,6 +687,7 @@ impl AppState {
             }
             thread::sleep(Duration::from_millis(25));
         }
+        self.session.finalize_shutdown();
     }
 }
 
@@ -661,6 +695,84 @@ struct MediaHttpRequest {
     method: String,
     path: String,
     range: Option<String>,
+}
+
+fn try_acquire_media_connection(active: Arc<AtomicUsize>) -> Option<MediaStreamConnectionGuard> {
+    active
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            (current < MEDIA_STREAM_MAX_CONNECTIONS).then_some(current + 1)
+        })
+        .ok()
+        .map(|_| MediaStreamConnectionGuard { active })
+}
+
+fn issue_media_stream_route(
+    routes: &Mutex<HashMap<String, MediaStreamRoute>>,
+    id: String,
+    file_index: usize,
+) -> Result<String, String> {
+    let now = Instant::now();
+    let mut routes = routes
+        .lock()
+        .map_err(|_| "media stream route lock poisoned".to_string())?;
+    routes.retain(|_, route| route.expires_at > now);
+    while routes.len() >= MEDIA_STREAM_MAX_ROUTES {
+        let Some(oldest) = routes
+            .iter()
+            .min_by_key(|(_, route)| route.expires_at)
+            .map(|(token, _)| token.clone())
+        else {
+            break;
+        };
+        routes.remove(&oldest);
+    }
+
+    for _ in 0..4 {
+        let mut random = [0u8; 32];
+        getrandom::fill(&mut random)
+            .map_err(|err| format!("could not generate media stream token: {err}"))?;
+        let token = crate::torrent::sha1::hex(&random);
+        if routes.contains_key(&token) {
+            continue;
+        }
+        routes.insert(
+            token.clone(),
+            MediaStreamRoute {
+                id: id.clone(),
+                file_index,
+                expires_at: now + MEDIA_STREAM_ROUTE_TTL,
+            },
+        );
+        return Ok(token);
+    }
+    Err("could not allocate a unique media stream token".to_string())
+}
+
+fn lookup_media_stream_route(
+    routes: &Mutex<HashMap<String, MediaStreamRoute>>,
+    token: &str,
+) -> Option<MediaStreamRoute> {
+    let now = Instant::now();
+    let mut routes = routes.lock().ok()?;
+    routes.retain(|_, route| route.expires_at > now);
+    let route = routes.get_mut(token)?;
+    route.expires_at = now + MEDIA_STREAM_ROUTE_TTL;
+    Some(route.clone())
+}
+
+fn revoke_media_stream_routes(
+    routes: &Mutex<HashMap<String, MediaStreamRoute>>,
+    id: &str,
+    file_index: Option<usize>,
+) -> usize {
+    let Ok(mut routes) = routes.lock() else {
+        return 0;
+    };
+    let before = routes.len();
+    routes.retain(|_, route| {
+        route.id != id || file_index.is_some_and(|index| route.file_index != index)
+    });
+    before - routes.len()
 }
 
 fn handle_media_stream_connection(
@@ -695,7 +807,7 @@ fn handle_media_stream_connection(
     let token = match request.path.strip_prefix("/stream/") {
         Some(token)
             if !token.is_empty()
-                && token.len() <= 128
+                && token.len() == 64
                 && token.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
         {
             token
@@ -710,11 +822,7 @@ fn handle_media_stream_connection(
             return;
         }
     };
-    let route = match routes
-        .lock()
-        .ok()
-        .and_then(|routes| routes.get(token).cloned())
-    {
+    let route = match lookup_media_stream_route(&routes, token) {
         Some(route) => route,
         None => {
             let _ = write_media_response(
@@ -831,7 +939,6 @@ fn handle_media_stream_connection(
                 "206 Partial Content",
                 &[
                     ("Accept-Ranges", "bytes"),
-                    ("Access-Control-Allow-Origin", "*"),
                     ("Cache-Control", "no-store"),
                     ("Content-Type", media_content_type(&availability.name)),
                     ("Content-Range", &content_range),
@@ -849,7 +956,6 @@ fn handle_media_stream_connection(
             let content_range = format!("bytes */{}", availability.length);
             let mut headers = vec![
                 ("Accept-Ranges", "bytes"),
-                ("Access-Control-Allow-Origin", "*"),
                 ("Cache-Control", "no-store"),
                 ("Content-Range", content_range.as_str()),
                 ("Content-Type", "text/plain; charset=utf-8"),
@@ -1243,6 +1349,7 @@ fn delete_torrent(
 ) -> Result<EmptyJsonResponse, String> {
     state.stop_tracker_background(id.clone());
     let cleanup = state.session.remove_for_delete(&id, delete_files)?;
+    state.revoke_media_stream_routes(&id, None);
     if cleanup.delete_files {
         let session = Arc::clone(&state.session);
         let _ = thread::Builder::new()
@@ -1314,25 +1421,7 @@ async fn stream_file_url(
     if port == 0 {
         return Err("local media stream server is not running".to_string());
     }
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos() as u64)
-        .unwrap_or_default();
-    let sequence = state
-        .next_media_stream_token
-        .fetch_add(1, Ordering::Relaxed);
-    let token = format!("{timestamp:016x}{sequence:016x}");
-    state
-        .media_stream_tokens
-        .lock()
-        .map_err(|_| "media stream route lock poisoned".to_string())?
-        .insert(
-            token.clone(),
-            MediaStreamRoute {
-                id: id.clone(),
-                file_index,
-            },
-        );
+    let token = issue_media_stream_route(&state.media_stream_tokens, id.clone(), file_index)?;
     state.session.log(
         LogLevel::Info,
         "stream",
@@ -1436,6 +1525,7 @@ async fn open_media_window(
         if matches!(event, tauri::WindowEvent::Destroyed) {
             if let Some(state) = closed_app.try_state::<AppState>() {
                 let _ = state.session.clear_stream_priority(&closed_torrent_id);
+                state.revoke_media_stream_routes(&closed_torrent_id, Some(file_index));
             }
             let _ = closed_app.emit(
                 "media-player-closed",
@@ -1457,6 +1547,7 @@ fn close_media_window(
     file_index: usize,
 ) -> Result<(), String> {
     let _ = state.session.clear_stream_priority(&id);
+    state.revoke_media_stream_routes(&id, Some(file_index));
     if let Some(window) = app.get_webview_window(&media_window_label(&id, file_index)) {
         window.close().map_err(error_to_string)?;
     }
@@ -1766,6 +1857,43 @@ fn error_to_string(err: impl std::fmt::Display) -> String {
     err.to_string()
 }
 
+fn migrate_legacy_state_dir(legacy: &Path, destination: &Path) -> std::io::Result<()> {
+    if legacy == destination || !legacy.is_dir() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(destination)?;
+    for name in [
+        "novatorrent-session.json",
+        "novatorrent-session.json.bak",
+        "novatorrent-dht.json",
+        "novatorrent-dht.json.bak",
+    ] {
+        let source = legacy.join(name);
+        let target = destination.join(name);
+        if source.is_file() && !target.exists() {
+            std::fs::copy(source, target)?;
+        }
+    }
+
+    let legacy_metainfo = legacy.join("metainfo");
+    if legacy_metainfo.is_dir() {
+        let destination_metainfo = destination.join("metainfo");
+        std::fs::create_dir_all(&destination_metainfo)?;
+        for entry in std::fs::read_dir(legacy_metainfo)? {
+            let entry = entry?;
+            let source = entry.path();
+            if !source.is_file() {
+                continue;
+            }
+            let target = destination_metainfo.join(entry.file_name());
+            if !target.exists() {
+                std::fs::copy(source, target)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let mut builder = tauri::Builder::default();
@@ -1803,7 +1931,8 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let default_output_dir = app.path().download_dir()?;
-            let state_dir = default_output_dir.join("NovaTorrent");
+            let state_dir = app.path().app_local_data_dir()?;
+            migrate_legacy_state_dir(&default_output_dir.join("NovaTorrent"), &state_dir)?;
             std::fs::create_dir_all(&state_dir)?;
             let log_dir = app.path().app_log_dir()?;
             std::fs::create_dir_all(&log_dir)?;
@@ -1924,6 +2053,90 @@ mod open_source_tests {
         assert!(normalize_open_source("novatorrent://settings?magnet=x", None, 0).is_none());
         assert!(normalize_open_source("novatorrent://open?magnet=%ZZ", None, 0).is_none());
         assert!(normalize_open_source("magnet:?xt=urn:btih:not-a-hash", None, 0).is_none());
+    }
+
+    #[test]
+    fn media_stream_tokens_are_random_bounded_and_revocable() {
+        let routes = Mutex::new(HashMap::new());
+        let first = issue_media_stream_route(&routes, "7".to_string(), 2).unwrap();
+        let second = issue_media_stream_route(&routes, "7".to_string(), 3).unwrap();
+        assert_eq!(first.len(), 64);
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_ne!(first, second);
+        assert_eq!(
+            lookup_media_stream_route(&routes, &first)
+                .unwrap()
+                .file_index,
+            2
+        );
+        assert_eq!(revoke_media_stream_routes(&routes, "7", Some(2)), 1);
+        assert!(lookup_media_stream_route(&routes, &first).is_none());
+        assert!(lookup_media_stream_route(&routes, &second).is_some());
+
+        routes.lock().unwrap().insert(
+            "expired".to_string(),
+            MediaStreamRoute {
+                id: "8".to_string(),
+                file_index: 0,
+                expires_at: Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
+            },
+        );
+        assert!(lookup_media_stream_route(&routes, "expired").is_none());
+
+        for index in 0..=MEDIA_STREAM_MAX_ROUTES {
+            issue_media_stream_route(&routes, "9".to_string(), index).unwrap();
+        }
+        assert_eq!(routes.lock().unwrap().len(), MEDIA_STREAM_MAX_ROUTES);
+        assert_eq!(
+            revoke_media_stream_routes(&routes, "9", None),
+            MEDIA_STREAM_MAX_ROUTES
+        );
+    }
+
+    #[test]
+    fn media_stream_connection_limit_is_enforced_and_released() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let guards = (0..MEDIA_STREAM_MAX_CONNECTIONS)
+            .map(|_| try_acquire_media_connection(Arc::clone(&active)).unwrap())
+            .collect::<Vec<_>>();
+        assert!(try_acquire_media_connection(Arc::clone(&active)).is_none());
+        drop(guards);
+        assert_eq!(active.load(Ordering::Acquire), 0);
+        assert!(try_acquire_media_connection(active).is_some());
+    }
+
+    #[test]
+    fn legacy_state_migration_copies_only_known_state_without_overwriting() {
+        let root = std::env::temp_dir().join(format!(
+            "novatorrent-state-migration-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let legacy = root.join("Downloads").join("NovaTorrent");
+        let destination = root.join("LocalAppData");
+        std::fs::create_dir_all(legacy.join("metainfo")).unwrap();
+        std::fs::write(legacy.join("novatorrent-session.json"), b"legacy").unwrap();
+        std::fs::write(legacy.join("unrelated-download.bin"), b"keep out").unwrap();
+        std::fs::write(legacy.join("metainfo").join("one.torrent"), b"torrent").unwrap();
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(destination.join("novatorrent-session.json"), b"current").unwrap();
+
+        migrate_legacy_state_dir(&legacy, &destination).unwrap();
+
+        assert_eq!(
+            std::fs::read(destination.join("novatorrent-session.json")).unwrap(),
+            b"current"
+        );
+        assert_eq!(
+            std::fs::read(destination.join("metainfo").join("one.torrent")).unwrap(),
+            b"torrent"
+        );
+        assert!(!destination.join("unrelated-download.bin").exists());
+        assert!(legacy.join("novatorrent-session.json").exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

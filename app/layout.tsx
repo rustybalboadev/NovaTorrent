@@ -1,23 +1,7 @@
 import type { Metadata } from "next";
+import Script from "next/script";
 import "./globals.css";
 import { ThemeProvider } from "@/components/theme-provider";
-
-const themeBootstrapScript = `
-(function () {
-  var root = document.documentElement;
-  var resolved = "light";
-  try {
-    var stored = window.localStorage.getItem("theme");
-    resolved = stored === "light" || stored === "dark"
-      ? stored
-      : (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
-  } catch (_) {
-    resolved = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
-  }
-  root.classList.remove("light", "dark");
-  root.classList.add(resolved);
-  root.style.colorScheme = resolved;
-})();`;
 
 export const metadata: Metadata = {
   title: "NovaTorrent",
@@ -37,7 +21,7 @@ export default function RootLayout({
   return (
     <html lang="en" suppressHydrationWarning>
       <head>
-        <script dangerouslySetInnerHTML={{ __html: themeBootstrapScript }} />
+        <Script src="/theme-bootstrap.js" strategy="beforeInteractive" />
       </head>
       <body>
         <ThemeProvider attribute="class" defaultTheme="system" enableSystem disableTransitionOnChange>

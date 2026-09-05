@@ -55,6 +55,9 @@ const MAX_STREAM_LOOKAHEAD_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_MEDIA_STREAM_READ_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_SUPPLEMENTAL_STREAM_FILES: usize = 32;
 const MAX_SUPPLEMENTAL_STREAM_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_TORRENT_FILE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_LOG_FILE_BYTES: u64 = 10 * 1024 * 1024;
+const MAX_LOG_FIELD_CHARS: usize = 8 * 1024;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -613,6 +616,7 @@ pub struct TorrentSession {
     listen_port: AtomicU16,
     torrents: Arc<Mutex<Vec<TorrentTask>>>,
     logs: Mutex<Vec<LogEntry>>,
+    log_file_lock: Mutex<()>,
     active_runs: Mutex<HashSet<u64>>,
     active_announces: Arc<Mutex<HashSet<u64>>>,
     active_incoming_peers: Arc<AtomicUsize>,
@@ -720,6 +724,7 @@ impl TorrentSession {
             listen_port: AtomicU16::new(0),
             torrents: Arc::new(Mutex::new(Vec::new())),
             logs: Mutex::new(Vec::new()),
+            log_file_lock: Mutex::new(()),
             active_runs: Mutex::new(HashSet::new()),
             active_announces: Arc::new(Mutex::new(HashSet::new())),
             active_incoming_peers: Arc::new(AtomicUsize::new(0)),
@@ -826,7 +831,18 @@ impl TorrentSession {
         self.log(
             LogLevel::Info,
             "session",
-            "shutdown checkpoint saved; active transfers are stopping cleanly",
+            "shutdown requested; active transfers are stopping cleanly",
+            None,
+        );
+    }
+
+    pub fn finalize_shutdown(&self) {
+        self.persist_session_or_log(None);
+        self.persist_dht_state_or_log();
+        self.log(
+            LogLevel::Info,
+            "session",
+            "final shutdown checkpoint saved",
             None,
         );
     }
@@ -2584,19 +2600,30 @@ impl TorrentSession {
         let mut results = Vec::new();
         let (tracker_sender, tracker_receiver) = std::sync::mpsc::channel();
         let mut tracker_workers = Vec::new();
-        for (index, url) in snapshot.trackers.iter().cloned().enumerate() {
+        for url in snapshot.trackers.iter().cloned() {
             let sender = tracker_sender.clone();
             let http_event = tracker_http_event(snapshot.event).map(str::to_string);
+            let mut tracker_random = [0u8; 8];
+            getrandom::fill(&mut tracker_random)
+                .map_err(|err| format!("could not create tracker request nonce: {err}"))?;
             let request = UdpAnnounceRequest {
                 connection_id: 0,
-                transaction_id: tracker_transaction_id(snapshot.id, index),
+                transaction_id: u32::from_be_bytes(
+                    tracker_random[..4]
+                        .try_into()
+                        .expect("four-byte transaction ID"),
+                ),
                 info_hash: snapshot.info_hash,
                 peer_id,
                 downloaded: snapshot.downloaded,
                 left: snapshot.left,
                 uploaded: snapshot.uploaded,
                 event: snapshot.event,
-                key: tracker_transaction_id(snapshot.id, index + 10_000),
+                key: u32::from_be_bytes(
+                    tracker_random[4..]
+                        .try_into()
+                        .expect("four-byte tracker key"),
+                ),
                 num_want: 50,
                 port: snapshot.port,
             };
@@ -5179,9 +5206,13 @@ impl TorrentSession {
     }
 
     fn write_log_entry(&self, entry: &LogEntry) {
+        let Ok(_log_guard) = self.log_file_lock.lock() else {
+            return;
+        };
         if let Some(parent) = self.log_file_path.parent() {
             let _ = fs::create_dir_all(parent);
         }
+        rotate_log_file_if_needed(&self.log_file_path);
         let Ok(mut file) = OpenOptions::new()
             .create(true)
             .append(true)
@@ -5450,6 +5481,15 @@ impl TorrentSession {
         only_files: Option<&[usize]>,
         source: TorrentSource,
     ) -> Result<TorrentTask, String> {
+        let torrent_file_length = fs::metadata(path)
+            .map_err(|err| format!("could not inspect torrent file: {err}"))?
+            .len();
+        if torrent_file_length > MAX_TORRENT_FILE_BYTES {
+            return Err(format!(
+                "torrent file exceeds the {} MiB limit",
+                MAX_TORRENT_FILE_BYTES / (1024 * 1024)
+            ));
+        }
         let bytes = fs::read(path).map_err(|err| format!("could not read torrent file: {err}"))?;
         let meta = Metainfo::from_bytes(&bytes)?;
         let mut files = meta.files.clone();
@@ -7133,7 +7173,34 @@ fn log_level_label(level: &LogLevel) -> &'static str {
 }
 
 fn single_line(value: &str) -> String {
-    value.replace(['\r', '\n'], " ")
+    let normalized = value.replace(['\r', '\n'], " ");
+    if normalized.chars().count() <= MAX_LOG_FIELD_CHARS {
+        return normalized;
+    }
+    let mut truncated = normalized
+        .chars()
+        .take(MAX_LOG_FIELD_CHARS)
+        .collect::<String>();
+    truncated.push_str("… [truncated]");
+    truncated
+}
+
+fn rotate_log_file_if_needed(path: &Path) {
+    let needs_rotation = fs::metadata(path)
+        .map(|metadata| metadata.len() >= MAX_LOG_FILE_BYTES)
+        .unwrap_or(false);
+    if !needs_rotation {
+        return;
+    }
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("log");
+    let backup = path.with_extension(format!("{extension}.1"));
+    if backup.is_file() {
+        let _ = fs::remove_file(&backup);
+    }
+    let _ = fs::rename(path, backup);
 }
 
 fn tracker_http_event(event: UdpAnnounceEvent) -> Option<&'static str> {
@@ -7587,13 +7654,6 @@ fn peer_id_for(id: u64) -> [u8; 20] {
     let suffix = format!("{:012x}", id & 0x0000_ffff_ffff_ffff);
     peer_id[8..20].copy_from_slice(suffix.as_bytes());
     peer_id
-}
-
-fn tracker_transaction_id(id: u64, index: usize) -> u32 {
-    let mixed = id
-        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
-        .wrapping_add(index as u64);
-    (mixed ^ (mixed >> 32)) as u32
 }
 
 fn dht_announce_transaction_id(id: u64, index: usize) -> [u8; 4] {
@@ -11107,8 +11167,7 @@ mod tests {
         let root = temp_dir("session-dht-private");
         let torrent_path = root.join("private.torrent");
         let output_dir = root.join("out");
-        fs::write(&torrent_path, build_multi_file_torrent(b"private payload"))
-            .expect("fixture writes");
+        fs::write(&torrent_path, build_multi_file_torrent(b"abcdefghi")).expect("fixture writes");
         let session = TorrentSession::new(output_dir.clone());
         let added = session
             .add(AddTorrentRequest {

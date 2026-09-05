@@ -1,5 +1,8 @@
 use std::ops::Range;
 
+const MAX_BENCODE_DEPTH: usize = 64;
+const MAX_BENCODE_NODES: usize = 100_000;
+
 #[derive(Debug, Clone)]
 pub struct BencodeNode {
     pub value: BencodeValue,
@@ -52,7 +55,11 @@ impl BencodeNode {
 }
 
 pub fn parse(input: &[u8]) -> Result<BencodeNode, String> {
-    let mut parser = Parser { input, cursor: 0 };
+    let mut parser = Parser {
+        input,
+        cursor: 0,
+        nodes: 0,
+    };
     let node = parser.parse_node()?;
     if parser.cursor != input.len() {
         return Err("trailing data after bencode value".to_string());
@@ -61,17 +68,36 @@ pub fn parse(input: &[u8]) -> Result<BencodeNode, String> {
 }
 
 pub fn parse_prefix(input: &[u8]) -> Result<BencodeNode, String> {
-    let mut parser = Parser { input, cursor: 0 };
+    let mut parser = Parser {
+        input,
+        cursor: 0,
+        nodes: 0,
+    };
     parser.parse_node()
 }
 
 struct Parser<'a> {
     input: &'a [u8],
     cursor: usize,
+    nodes: usize,
 }
 
 impl<'a> Parser<'a> {
     fn parse_node(&mut self) -> Result<BencodeNode, String> {
+        self.parse_node_at_depth(0)
+    }
+
+    fn parse_node_at_depth(&mut self, depth: usize) -> Result<BencodeNode, String> {
+        if depth > MAX_BENCODE_DEPTH {
+            return Err("bencode nesting is too deep".to_string());
+        }
+        self.nodes = self
+            .nodes
+            .checked_add(1)
+            .ok_or_else(|| "bencode node count overflow".to_string())?;
+        if self.nodes > MAX_BENCODE_NODES {
+            return Err("bencode contains too many values".to_string());
+        }
         let start = self.cursor;
         let Some(byte) = self.peek() else {
             return Err("unexpected end of input".to_string());
@@ -79,8 +105,8 @@ impl<'a> Parser<'a> {
 
         let value = match byte {
             b'i' => self.parse_int()?,
-            b'l' => self.parse_list()?,
-            b'd' => self.parse_dict()?,
+            b'l' => self.parse_list(depth)?,
+            b'd' => self.parse_dict(depth)?,
             b'0'..=b'9' => self.parse_bytes()?,
             _ => return Err(format!("unexpected bencode byte: {byte}")),
         };
@@ -109,22 +135,22 @@ impl<'a> Parser<'a> {
         Ok(BencodeValue::Int(value))
     }
 
-    fn parse_list(&mut self) -> Result<BencodeValue, String> {
+    fn parse_list(&mut self, depth: usize) -> Result<BencodeValue, String> {
         self.expect(b'l')?;
         let mut items = Vec::new();
         while self.peek() != Some(b'e') {
-            items.push(self.parse_node()?);
+            items.push(self.parse_node_at_depth(depth + 1)?);
         }
         self.expect(b'e')?;
         Ok(BencodeValue::List(items))
     }
 
-    fn parse_dict(&mut self) -> Result<BencodeValue, String> {
+    fn parse_dict(&mut self, depth: usize) -> Result<BencodeValue, String> {
         self.expect(b'd')?;
         let mut entries = Vec::new();
         let mut previous_key: Option<Vec<u8>> = None;
         while self.peek() != Some(b'e') {
-            let key_node = self.parse_node()?;
+            let key_node = self.parse_node_at_depth(depth + 1)?;
             let BencodeValue::Bytes(key) = key_node.value else {
                 return Err("dictionary key is not a byte string".to_string());
             };
@@ -135,7 +161,7 @@ impl<'a> Parser<'a> {
                 return Err("dictionary keys are not sorted".to_string());
             }
             previous_key = Some(key.clone());
-            let value = self.parse_node()?;
+            let value = self.parse_node_at_depth(depth + 1)?;
             entries.push((key, value));
         }
         self.expect(b'e')?;
@@ -222,5 +248,13 @@ mod tests {
 
         assert_eq!(node.span, 0..8);
         assert_eq!(node.dict_get(b"a").and_then(BencodeNode::as_i64), Some(1));
+    }
+
+    #[test]
+    fn rejects_excessive_nesting() {
+        let mut input = vec![b'l'; MAX_BENCODE_DEPTH + 2];
+        input.extend(std::iter::repeat_n(b'e', MAX_BENCODE_DEPTH + 2));
+
+        assert_eq!(parse(&input).unwrap_err(), "bencode nesting is too deep");
     }
 }

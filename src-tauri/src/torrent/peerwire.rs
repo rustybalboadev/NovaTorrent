@@ -26,6 +26,7 @@ const REQUEST_PIPELINE_TIME_TARGET: Duration = Duration::from_secs(3);
 const PEER_READ_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const PEER_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(8);
+const INBOUND_FRAME_DEADLINE: Duration = Duration::from_secs(20);
 const UPLOAD_SLOT_WAIT_TIMEOUT: Duration = Duration::from_secs(25);
 const UPLOAD_SLOT_LEASE_DURATION: Duration = Duration::from_secs(10);
 
@@ -750,9 +751,12 @@ pub fn read_incoming_handshake(stream: &mut TcpStream) -> Result<peer::PeerHands
         .set_write_timeout(Some(Duration::from_secs(10)))
         .map_err(|err| format!("could not set incoming peer write timeout: {err}"))?;
     let mut handshake = [0u8; HANDSHAKE_LEN];
-    stream
-        .read_exact(&mut handshake)
-        .map_err(|err| format!("could not read incoming peer handshake: {err}"))?;
+    read_exact_until(
+        stream,
+        &mut handshake,
+        Instant::now() + INBOUND_FRAME_DEADLINE,
+    )
+    .map_err(|err| format!("could not read incoming peer handshake: {err}"))?;
     peer::parse_handshake_full(&handshake)
 }
 
@@ -1633,9 +1637,9 @@ fn read_exact_cancellable(
 }
 
 pub(crate) fn read_peer_message(stream: &mut TcpStream) -> Result<PeerMessage, String> {
+    let deadline = Instant::now() + INBOUND_FRAME_DEADLINE;
     let mut length_buf = [0u8; 4];
-    stream
-        .read_exact(&mut length_buf)
+    read_exact_until(stream, &mut length_buf, deadline)
         .map_err(|err| format!("could not read peer frame length: {err}"))?;
     let length = u32::from_be_bytes(length_buf) as usize;
     if length > MAX_PEER_FRAME_LENGTH {
@@ -1644,14 +1648,44 @@ pub(crate) fn read_peer_message(stream: &mut TcpStream) -> Result<PeerMessage, S
     let mut frame = Vec::with_capacity(4 + length);
     frame.extend_from_slice(&length_buf);
     let mut payload = vec![0u8; length];
-    stream
-        .read_exact(&mut payload)
+    read_exact_until(stream, &mut payload, deadline)
         .map_err(|err| format!("could not read peer frame payload: {err}"))?;
     frame.extend_from_slice(&payload);
     let Some((message, _)) = peer::parse_message_frame(&frame)? else {
         return Err("complete peer frame did not parse".to_string());
     };
     Ok(message)
+}
+
+fn read_exact_until(
+    stream: &mut TcpStream,
+    buffer: &mut [u8],
+    deadline: Instant,
+) -> Result<(), String> {
+    let mut filled = 0usize;
+    while filled < buffer.len() {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| "peer frame deadline expired".to_string())?;
+        stream
+            .set_read_timeout(Some(remaining))
+            .map_err(|err| format!("could not set peer frame deadline: {err}"))?;
+        match stream.read(&mut buffer[filled..]) {
+            Ok(0) => return Err("peer closed the connection".to_string()),
+            Ok(read) => filled += read,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err("peer frame deadline expired".to_string());
+            }
+            Err(err) => return Err(err.to_string()),
+        }
+    }
+    Ok(())
 }
 
 fn wait_for_interested(
