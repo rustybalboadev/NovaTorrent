@@ -23,13 +23,19 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: 24
-          package-manager-cache: false
+          cache: npm
 
       - name: Select stable Rust
         run: rustup default stable
 
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+          shared-key: "ci"
+
       - name: Install frontend dependencies
-        run: npm ci
+        run: npm ci --prefer-offline --no-audit
 
       - name: Build and publish NovaTorrent
         uses: tauri-apps/tauri-action@v1

@@ -12,31 +12,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  frontend:
-    name: Frontend
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Check out source
-        uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v7
-        with:
-          node-version: 24
-          cache: npm
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Lint
-        run: npm run lint
-
-      - name: Build frontend
-        run: npm run build
-
   rust:
     name: Rust
     runs-on: windows-latest
@@ -67,8 +42,7 @@ jobs:
         run: cargo test --locked
 
   tauri:
-    name: Tauri Windows Build
-    needs: [frontend, rust]
+    name: Tauri Windows Compile
     runs-on: windows-latest
 
     steps:
@@ -93,7 +67,10 @@ jobs:
           shared-key: "ci"
 
       - name: Install dependencies
-        run: npm ci
+        run: npm ci --prefer-offline --no-audit
+
+      - name: Lint
+        run: npm run lint
 
       - name: Build Tauri app
-        uses: tauri-apps/tauri-action@v1
+        run: npm run tauri -- build --no-bundle
