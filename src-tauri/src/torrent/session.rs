@@ -1562,7 +1562,7 @@ impl TorrentSession {
         );
         Ok(AddTorrentResponse {
             id: None,
-            output_folder: task.output_folder.to_string_lossy().into_owned(),
+            output_folder: task.download_location_string(),
             seen_peers: Some(Vec::new()),
             details: task.details(),
         })
@@ -1590,7 +1590,7 @@ impl TorrentSession {
                 ));
             }
         }
-        let output_folder = task.output_folder.to_string_lossy().into_owned();
+        let output_folder = task.download_location_string();
         let details = task.details();
         let name = task.name.clone();
         let tracker_count = task.trackers.len();
@@ -4145,15 +4145,7 @@ impl TorrentSession {
         id: &str,
         file_index: usize,
     ) -> Result<TorrentFileAvailability, String> {
-        let (
-            files,
-            file,
-            info_hash,
-            piece_length,
-            piece_hashes,
-            finished,
-            live_verified,
-        ) = {
+        let (files, file, info_hash, piece_length, piece_hashes, finished, live_verified) = {
             let torrents = self.torrents.lock().map_err(|_| "torrent lock poisoned")?;
             let torrent = torrents
                 .iter()
@@ -6146,6 +6138,25 @@ impl TorrentSession {
 }
 
 impl TorrentTask {
+    fn download_location(&self) -> PathBuf {
+        if storage::requires_torrent_name_folder(&self.files) {
+            return self.output_folder.join(&self.name);
+        }
+        self.files
+            .first()
+            .and_then(|file| {
+                (file.components.len() > 1)
+                    .then(|| file.components.first())
+                    .flatten()
+            })
+            .map(|root| self.output_folder.join(root))
+            .unwrap_or_else(|| self.output_folder.join(&self.name))
+    }
+
+    fn download_location_string(&self) -> String {
+        self.download_location().to_string_lossy().into_owned()
+    }
+
     fn summary(&self) -> TorrentSummary {
         let live = self.stats.live.clone().unwrap_or(LiveStats {
             download_speed: 0,
@@ -6164,7 +6175,7 @@ impl TorrentTask {
             id: Some(self.id).filter(|id| *id != 0),
             info_hash: sha1::hex(&self.info_hash),
             name: Some(self.name.clone()),
-            output_folder: self.output_folder.to_string_lossy().into_owned(),
+            output_folder: self.download_location_string(),
             stats: TorrentSummaryStats {
                 state: self.stats.state,
                 error: self.stats.error.clone(),
@@ -6189,6 +6200,7 @@ impl TorrentTask {
             time_remaining: None,
         }));
         let mut general = self.general.clone();
+        general.save_path = self.download_location_string();
         let now = timestamp_ms();
         general.active_time_seconds = ((now.saturating_sub(self.added_at_ms)) / 1_000) as u64;
         general.seeding_time_seconds = self
@@ -6222,7 +6234,7 @@ impl TorrentTask {
             id: Some(self.id).filter(|id| *id != 0),
             info_hash: sha1::hex(&self.info_hash),
             name: Some(self.name.clone()),
-            output_folder: self.output_folder.to_string_lossy().into_owned(),
+            output_folder: self.download_location_string(),
             files: Some(self.files.clone()),
             stats: Some(stats),
             general,
@@ -9454,8 +9466,9 @@ mod tests {
         assert_eq!(restored[0].id, Some(first_id));
         assert_eq!(
             restored[0].output_folder,
-            output_dir.join("chosen").to_string_lossy()
+            output_dir.join("chosen").join("Example").to_string_lossy()
         );
+        assert_eq!(restored[0].general.save_path, restored[0].output_folder);
         assert!(restored[0].options.paused);
         assert!(restored[0].options.overwrite);
         assert!(restored[0].options.disable_trackers);
@@ -9686,13 +9699,11 @@ mod tests {
                 .expect("legacy store migrates")
         );
         assert_eq!(
-            fs::read(partial_store_dir.join(format!("{key}.part")))
-                .expect("migrated data reads"),
+            fs::read(partial_store_dir.join(format!("{key}.part"))).expect("migrated data reads"),
             b"pieces"
         );
         assert_eq!(
-            fs::read(partial_store_dir.join(format!("{key}.json")))
-                .expect("migrated state reads"),
+            fs::read(partial_store_dir.join(format!("{key}.json"))).expect("migrated state reads"),
             b"state"
         );
         assert!(!legacy_store_dir.exists());
@@ -11540,6 +11551,15 @@ mod tests {
         assert_eq!(summaries[0].first_playable_file_index, None);
         assert_eq!(summaries[0].stats.total_bytes, 9);
         assert_eq!(summaries[0].stats.state, TorrentState::Paused);
+        assert_eq!(
+            summaries[0].output_folder,
+            root.join("out").join("Example").to_string_lossy()
+        );
+        let details = session
+            .details(&summaries[0].id.expect("summary has id").to_string())
+            .expect("details load");
+        assert_eq!(details.output_folder, summaries[0].output_folder);
+        assert_eq!(details.general.save_path, summaries[0].output_folder);
         fs::remove_dir_all(root).expect("temp dir removes");
     }
 
