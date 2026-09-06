@@ -5,6 +5,11 @@
 <h1 align="center">NovaTorrent</h1>
 
 <p align="center">
+  <img src="public/novatorrent-dash.png" alt="NovaTorrent" width="1000">
+</p>
+
+
+<p align="center">
   A fast, modern BitTorrent client for Windows with built-in media streaming.
 </p>
 
