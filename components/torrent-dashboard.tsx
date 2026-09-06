@@ -471,8 +471,8 @@ export function TorrentDashboard() {
   return (
     <main className="h-full min-h-0 bg-background p-3 text-foreground">
       <div className="mx-auto flex min-h-full flex-col gap-3">
-        <header className="panel grid grid-cols-[auto_auto] items-center justify-center gap-x-3 gap-y-2 px-4 py-3 lg:grid-cols-[auto_1fr_auto] lg:justify-stretch">
-          <div className="order-1 flex items-center gap-3">
+        <header className="panel flex min-w-0 items-center gap-3 px-4 py-3">
+          <div className="flex shrink-0 items-center gap-3">
             <Image
               src="/novatorrent-logo.png"
               alt="NovaTorrent"
@@ -485,11 +485,11 @@ export function TorrentDashboard() {
               <p className="text-xs text-muted-foreground">{rows.length} torrents</p>
             </div>
           </div>
-          <div className="order-3 col-span-2 flex flex-wrap items-center justify-center gap-2 lg:order-2 lg:col-span-1 lg:justify-end">
+          <div className="ml-auto flex shrink-0 items-center gap-2">
             <StatPill icon={<Download />} label={formatRate(totals.down)} />
             <StatPill icon={<Upload />} label={formatRate(totals.up)} />
           </div>
-          <div className="order-2 flex items-center gap-2 lg:order-3">
+          <div className="flex shrink-0 items-center gap-2">
             <Button
               variant="outline"
               size="icon"
