@@ -11,14 +11,13 @@ import {
   Clapperboard,
   Download,
   FileCog,
+  FolderOpen,
   Loader2,
-  Magnet,
   Moon,
   Network,
   Pause,
   Play,
   Plus,
-  Radar,
   RadioTower,
   Save,
   Search,
@@ -39,20 +38,15 @@ import { Label } from "@/components/ui/label";
 import { Progress } from "@/components/ui/progress";
 import { Switch } from "@/components/ui/switch";
 import {
-  announceTorrent,
   backendLogFilePath,
   backendLogsAfter,
   deleteTorrent,
-  downloadPeerTorrent,
-  downloadWebSeedTorrent,
-  fetchMetadataTorrent,
   listTorrentSummaries,
   openAddTorrentWindow,
+  openTorrentFolder,
   openMediaWindow,
   pauseTorrent,
-  queryDhtTorrent,
   recheckTorrent,
-  resolveMagnetTorrent,
   resumeTorrent,
   closeMediaWindow,
   setStreamPriority,
@@ -91,7 +85,7 @@ type MediaPlayerClosedPayload = {
   fileIndex: number;
 };
 
-type TorrentAction = "pause" | "resume" | "announce" | "dht" | "resolve" | "webseed" | "peers" | "metadata" | "recheck" | "delete" | "deleteFiles";
+type TorrentAction = "pause" | "resume" | "recheck" | "delete" | "deleteFiles";
 
 const downloadingStates = new Set(["Queued", "Discovering", "Downloading", "Resuming", "Partial", "Metadata", "Fetching Metadata", "DHT"]);
 
@@ -340,18 +334,26 @@ export function TorrentDashboard() {
     try {
       if (action === "pause") await pauseTorrent(row.id);
       if (action === "resume") await resumeTorrent(row.id);
-      if (action === "announce") await announceTorrent(row.id);
-      if (action === "dht") await queryDhtTorrent(row.id);
-      if (action === "resolve") await resolveMagnetTorrent(row.id);
-      if (action === "webseed") await downloadWebSeedTorrent(row.id);
-      if (action === "peers") await downloadPeerTorrent(row.id);
-      if (action === "metadata") await fetchMetadataTorrent(row.id);
       if (action === "recheck") await recheckTorrent(row.id);
       if (action === "delete") await deleteTorrent(row.id, false);
       if (action === "deleteFiles") await deleteTorrent(row.id, true);
       await refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Torrent action failed.");
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  async function handleOpenFolder(row = selected) {
+    if (!row || busyAction) return;
+    const actionKey = row.id + ":folder";
+    setBusyAction(actionKey);
+    try {
+      await openTorrentFolder(row.id);
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not open the torrent download folder.");
     } finally {
       setBusyAction(null);
     }
@@ -554,11 +556,8 @@ export function TorrentDashboard() {
                       key={row.id}
                       row={row}
                       onAction={runAction}
+                      onOpenFolder={() => void handleOpenFolder(row)}
                       busy={Boolean(busyAction)}
-                      onOptions={() => {
-                        setSelectedId(row.id);
-                        setInspectorTab("Options");
-                      }}
                     >
                       <div
                         role="button"
@@ -655,6 +654,7 @@ export function TorrentDashboard() {
                 actionBusy={Boolean(busyAction?.startsWith(`${selected.id}:`))}
                 onTogglePause={() => void runAction(selected.state === "Paused" ? "resume" : "pause", selected)}
                 onRecheck={() => void runAction("recheck", selected)}
+                onOpenFolder={() => void handleOpenFolder(selected)}
               />
             ) : null}
           </section>
@@ -683,13 +683,13 @@ function TorrentContextMenu({
   row,
   children,
   onAction,
-  onOptions,
+  onOpenFolder,
   busy
 }: {
   row: TorrentRow;
   children: React.ReactNode;
   onAction: (action: TorrentAction, row: TorrentRow) => void;
-  onOptions: () => void;
+  onOpenFolder: () => void;
   busy: boolean;
 }) {
   return (
@@ -697,35 +697,15 @@ function TorrentContextMenu({
       <ContextMenu.Trigger asChild>{children}</ContextMenu.Trigger>
       <ContextMenu.Portal>
         <ContextMenu.Content className={cn("z-50 min-w-48 overflow-hidden rounded-md border bg-popover p-1 text-popover-foreground shadow-md", busy && "pointer-events-none opacity-60")}>
-          <MenuItem icon={<Pause />} onSelect={() => onAction("pause", row)}>
-            Pause
+          <MenuItem icon={row.state === "Paused" ? <Play /> : <Pause />} onSelect={() => onAction(row.state === "Paused" ? "resume" : "pause", row)}>
+            {row.state === "Paused" ? "Continue" : "Pause"}
           </MenuItem>
-          <MenuItem icon={<Play />} onSelect={() => onAction("resume", row)}>
-            Continue
+          <MenuItem icon={<FolderOpen />} onSelect={onOpenFolder}>
+            Open download folder
           </MenuItem>
-          <MenuItem icon={<RadioTower />} onSelect={() => onAction("announce", row)}>
-            Announce trackers
-          </MenuItem>
-          <MenuItem icon={<Radar />} onSelect={() => onAction("dht", row)}>
-            Query DHT
-          </MenuItem>
-          <MenuItem icon={<Magnet />} onSelect={() => onAction("resolve", row)}>
-            Resolve magnet
-          </MenuItem>
-          <MenuItem icon={<Download />} onSelect={() => onAction("webseed", row)}>
-            Download webseed
-          </MenuItem>
-          <MenuItem icon={<Network />} onSelect={() => onAction("peers", row)}>
-            Download from peers
-          </MenuItem>
-          <MenuItem icon={<FileCog />} onSelect={() => onAction("metadata", row)}>
-            Fetch metadata
-          </MenuItem>
+          <ContextMenu.Separator className="my-1 h-px bg-border" />
           <MenuItem icon={<CheckCircle2 />} onSelect={() => onAction("recheck", row)}>
             Recheck files
-          </MenuItem>
-          <MenuItem icon={<Settings2 />} onSelect={onOptions}>
-            Options
           </MenuItem>
           <ContextMenu.Separator className="my-1 h-px bg-border" />
           <MenuItem icon={<Trash2 />} tone="danger" onSelect={() => onAction("delete", row)}>
@@ -788,6 +768,7 @@ function TorrentInspector({
   actionBusy,
   onTogglePause,
   onRecheck,
+  onOpenFolder,
 }: {
   height: number;
   onResize: (height: number) => void;
@@ -811,6 +792,7 @@ function TorrentInspector({
   actionBusy: boolean;
   onTogglePause: () => void;
   onRecheck: () => void;
+  onOpenFolder: () => void;
 }) {
   const startResize = (event: React.PointerEvent<HTMLDivElement>) => {
     event.preventDefault();
@@ -847,6 +829,10 @@ function TorrentInspector({
           </div>
           </div>
           <div className="flex shrink-0 items-center gap-2">
+            <Button type="button" variant="outline" size="sm" className="h-8" disabled={actionBusy} onClick={onOpenFolder}>
+              <FolderOpen />
+              <span className="hidden md:inline">Open folder</span>
+            </Button>
             <Button type="button" variant="outline" size="sm" className="h-8" disabled={actionBusy} onClick={onTogglePause}>
               {actionBusy ? <Loader2 className="animate-spin" /> : selected.state === "Paused" ? <Play /> : <Pause />}
               <span className="hidden sm:inline">{selected.state === "Paused" ? "Continue" : "Pause"}</span>

@@ -17,6 +17,7 @@ use tauri::{
     webview::PageLoadEvent, window::Color, AppHandle, Emitter, Manager, WebviewUrl,
     WebviewWindowBuilder,
 };
+use tauri_plugin_opener::OpenerExt;
 
 use crate::torrent::session::{
     AddTorrentRequest, AddTorrentResponse, EmptyJsonResponse, LogEntry, LogLevel,
@@ -1241,6 +1242,20 @@ fn torrent_details(
 }
 
 #[tauri::command]
+fn open_torrent_folder(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
+    let path = state.session.download_location_for(&id)?;
+    std::fs::create_dir_all(&path)
+        .map_err(|err| format!("could not create torrent download folder: {err}"))?;
+    app.opener()
+        .open_path(path.to_string_lossy().into_owned(), None::<&str>)
+        .map_err(error_to_string)
+}
+
+#[tauri::command]
 fn preview_torrent(
     state: tauri::State<'_, AppState>,
     request: AddTorrentRequest,
@@ -1939,6 +1954,7 @@ pub fn run() {
 
     let app = builder
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
         .on_page_load(|window, payload| {
             if window.label() == "main" && payload.event() == PageLoadEvent::Finished {
                 let _ = window.show();
@@ -1973,6 +1989,7 @@ pub fn run() {
             list_torrents,
             list_torrent_summaries,
             torrent_details,
+            open_torrent_folder,
             preview_torrent,
             add_torrent,
             close_add_torrent_window,

@@ -1551,6 +1551,15 @@ impl TorrentSession {
             .ok_or_else(|| format!("torrent not found: {id}"))
     }
 
+    pub fn download_location_for(&self, id: &str) -> Result<PathBuf, String> {
+        let torrents = self.torrents.lock().map_err(|_| "torrent lock poisoned")?;
+        torrents
+            .iter()
+            .find(|torrent| torrent.matches_id(id))
+            .map(TorrentTask::download_location)
+            .ok_or_else(|| format!("torrent not found: {id}"))
+    }
+
     pub fn preview(&self, request: AddTorrentRequest) -> Result<AddTorrentResponse, String> {
         let mut task = self.build_task(request, None)?;
         task.stats.state = TorrentState::Preview;
