@@ -67,9 +67,19 @@ jobs:
         run: cargo test --locked
 
   tauri:
-    name: Tauri Windows Build
+    name: Tauri ${{ matrix.name }} Build
     needs: [frontend, rust]
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows
+            platform: windows-latest
+          - name: Linux
+            platform: ubuntu-22.04
+          - name: macOS
+            platform: macos-latest
+    runs-on: ${{ matrix.platform }}
 
     steps:
       - name: Check out source
@@ -83,14 +93,20 @@ jobs:
           node-version: 24
           cache: npm
 
-      - name: Select stable Rust
-        run: rustup default stable
+      - name: Install Linux build dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils libssl-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: "./src-tauri -> target"
-          shared-key: "ci"
+          shared-key: "ci-${{ matrix.name }}"
 
       - name: Install dependencies
         run: npm ci

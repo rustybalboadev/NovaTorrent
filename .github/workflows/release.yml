@@ -9,9 +9,26 @@ permissions:
   contents: write
 
 jobs:
-  windows-release:
-    name: Build Windows Installers
-    runs-on: windows-latest
+  desktop-release:
+    name: Build ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            platform: windows-latest
+            args: ""
+          - name: Linux x64
+            platform: ubuntu-22.04
+            args: ""
+          - name: macOS Apple Silicon
+            platform: macos-latest
+            args: "--target aarch64-apple-darwin"
+          - name: macOS Intel
+            platform: macos-latest
+            args: "--target x86_64-apple-darwin"
+
+    runs-on: ${{ matrix.platform }}
 
     steps:
       - name: Check out source
@@ -23,10 +40,24 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: 24
-          package-manager-cache: false
+          cache: npm
 
-      - name: Select stable Rust
-        run: rustup default stable
+      - name: Install Linux build dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils libssl-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ startsWith(matrix.platform, 'macos-') && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+          shared-key: "release-${{ matrix.name }}"
 
       - name: Install frontend dependencies
         run: npm ci
@@ -41,3 +72,4 @@ jobs:
           generateReleaseNotes: true
           releaseDraft: false
           prerelease: false
+          args: ${{ matrix.args }}

@@ -1,7 +1,7 @@
 {
   "name": "novatorrent",
   "version": "1.0.2",
-  "description": "A modern Windows BitTorrent client built with Rust, Tauri, Next.js, React, and TypeScript.",
+  "description": "A modern cross-platform BitTorrent client built with Rust, Tauri, Next.js, React, and TypeScript.",
   "private": true,
   "license": "MIT",
   "type": "module",

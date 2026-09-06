@@ -1,0 +1,17 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "targets": ["msi", "nsis"],
+    "icon": ["icons/icon.ico"],
+    "windows": {
+      "wix": {
+        "fragmentPaths": ["./windows/fragments/protocols.wxs"],
+        "componentRefs": ["NovaTorrentProtocolRegistration"]
+      },
+      "nsis": {
+        "installerHooks": "./windows/hooks.nsh",
+        "installMode": "currentUser"
+      }
+    }
+  }
+}

@@ -32,8 +32,6 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["msi", "nsis"],
-    "icon": ["icons/icon.ico"],
     "category": "Utility",
     "shortDescription": "Modern BitTorrent client",
     "longDescription": "NovaTorrent is a modern BitTorrent client with a Rust backend and a Next.js React frontend.",
@@ -43,16 +41,6 @@
         "mimeType": "application/x-bittorrent",
         "role": "Viewer"
       }
-    ],
-    "windows": {
-      "wix": {
-        "fragmentPaths": ["./windows/fragments/protocols.wxs"],
-        "componentRefs": ["NovaTorrentProtocolRegistration"]
-      },
-      "nsis": {
-        "installerHooks": "./windows/hooks.nsh",
-        "installMode": "currentUser"
-      }
-    }
+    ]
   }
 }
