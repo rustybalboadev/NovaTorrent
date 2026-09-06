@@ -1,7 +1,6 @@
 "use client";
 
-import Image from "next/image";
-import { Copy, Minus, Square, X } from "lucide-react";
+import { Maximize2, Minimize2, Minus, X } from "lucide-react";
 import { usePathname } from "next/navigation";
 import * as React from "react";
 import { isTauriRuntime } from "@/lib/tauri-api";
@@ -60,25 +59,24 @@ export function WindowTitlebar() {
       data-tauri-drag-region
       onDoubleClick={() => void toggleMaximize()}
     >
-      <div className="pointer-events-none flex min-w-0 items-center gap-2 px-3" data-tauri-drag-region>
-        <Image src="/novatorrent-logo.png" alt="" width={18} height={18} className="h-[18px] w-[18px] object-contain" priority />
+      <div className="window-titlebar-controls" onDoubleClick={(event) => event.stopPropagation()}>
+        <TitlebarButton control="close" label="Close" onClick={() => void windowRef.current?.close()}>
+          <X />
+        </TitlebarButton>
+        <TitlebarButton control="minimize" label="Minimize" onClick={() => void windowRef.current?.minimize()}>
+          <Minus />
+        </TitlebarButton>
+        <TitlebarButton control="maximize" label={maximized ? "Restore" : "Maximize"} onClick={() => void toggleMaximize()}>
+          {maximized ? <Minimize2 /> : <Maximize2 />}
+        </TitlebarButton>
+      </div>
+      <div className="window-titlebar-title" data-tauri-drag-region>
         <span
-          className={cn("truncate text-xs font-medium", pathname.startsWith("/media") ? "text-zinc-200" : "text-foreground/80")}
+          className={cn("truncate text-[11px] font-medium", pathname.startsWith("/media") ? "text-zinc-400" : "text-muted-foreground")}
           data-tauri-drag-region
         >
           {windowTitle(pathname)}
         </span>
-      </div>
-      <div className="ml-auto flex h-full" onDoubleClick={(event) => event.stopPropagation()}>
-        <TitlebarButton label="Minimize" onClick={() => void windowRef.current?.minimize()}>
-          <Minus className="h-4 w-4" strokeWidth={1.5} />
-        </TitlebarButton>
-        <TitlebarButton label={maximized ? "Restore" : "Maximize"} onClick={() => void toggleMaximize()}>
-          {maximized ? <Copy className="h-3.5 w-3.5" strokeWidth={1.5} /> : <Square className="h-3.5 w-3.5" strokeWidth={1.5} />}
-        </TitlebarButton>
-        <TitlebarButton label="Close" close onClick={() => void windowRef.current?.close()}>
-          <X className="h-4 w-4" strokeWidth={1.5} />
-        </TitlebarButton>
       </div>
     </div>
   );
@@ -86,24 +84,24 @@ export function WindowTitlebar() {
 
 function TitlebarButton({
   children,
-  close = false,
+  control,
   label,
   onClick
 }: {
   children: React.ReactNode;
-  close?: boolean;
+  control: "close" | "minimize" | "maximize";
   label: string;
   onClick: () => void;
 }) {
   return (
     <button
       type="button"
-      className={cn("window-titlebar-button", close && "window-titlebar-close")}
+      className={cn("window-titlebar-button", `window-titlebar-${control}`)}
       aria-label={label}
       title={label}
       onClick={onClick}
     >
-      {children}
+      <span className="window-titlebar-dot">{children}</span>
     </button>
   );
 }
