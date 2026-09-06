@@ -80,6 +80,13 @@ jobs:
         with:
           args: ${{ matrix.args }}
 
+      - name: Make AppImage compatible with host graphics libraries
+        if: matrix.platform == 'ubuntu-22.04'
+        shell: bash
+        run: |
+          appimage="$(find src-tauri/target/release/bundle/appimage -maxdepth 1 -name '*.AppImage' -print -quit)"
+          ./scripts/fix-appimage-compat.sh "$appimage"
+
       - name: Upload test build
         uses: actions/upload-artifact@v4
         with:
