@@ -117,7 +117,7 @@ export function AddTorrentPanel({ windowMode, initialSource, onAdded, onCancel }
   const hasSource = Boolean(sourceValue.trim());
   const selectionIsEmpty = files.length > 0 && selectedFileIds.size === 0;
 
-  const previewSelectedSource = React.useCallback(async (kind: "file" | "magnet", value: string) => {
+  const previewSelectedTorrentFile = React.useCallback(async (value: string) => {
     if (!value.trim()) return;
     const requestId = ++previewRequestId.current;
     setBusy("preview");
@@ -125,7 +125,7 @@ export function AddTorrentPanel({ windowMode, initialSource, onAdded, onCancel }
     setSuccess(null);
     try {
       const response = await previewTorrent({
-        source: { kind, value: value.trim() },
+        source: { kind: "file", value: value.trim() },
         destination: null,
         paused: false,
         overwrite: false,
@@ -150,12 +150,12 @@ export function AddTorrentPanel({ windowMode, initialSource, onAdded, onCancel }
 
   React.useEffect(() => {
     const value = sourceValue.trim();
-    if (!value) return;
+    if (!value || sourceType === "magnet") return;
     const timer = window.setTimeout(() => {
-      void previewSelectedSource(sourceType, value);
+      void previewSelectedTorrentFile(value);
     }, 400);
     return () => window.clearTimeout(timer);
-  }, [previewSelectedSource, sourceType, sourceValue]);
+  }, [previewSelectedTorrentFile, sourceType, sourceValue]);
 
   async function chooseTorrentFile() {
     setError(null);
@@ -258,7 +258,7 @@ export function AddTorrentPanel({ windowMode, initialSource, onAdded, onCancel }
         <div className="min-w-0">
           <h1 className="text-lg font-semibold tracking-tight">Add a torrent</h1>
           <p className="truncate text-sm text-muted-foreground">
-            {preview?.name || "Choose a file or paste a magnet link to begin."}
+            {preview?.name || (sourceType === "magnet" && hasSource ? "Magnet link ready to add." : "Choose a file or paste a magnet link to begin.")}
           </p>
         </div>
         {!windowMode ? (
@@ -414,8 +414,10 @@ export function AddTorrentPanel({ windowMode, initialSource, onAdded, onCancel }
                   ? `${selectedCount} of ${files.length} selected · ${formatBytes(selectedSize)} of ${formatBytes(totalSize)}`
                   : busy === "preview"
                     ? "Reading torrent metadata…"
-                    : sourceType === "magnet" && preview
-                      ? "File metadata will arrive after peer discovery."
+                    : sourceType === "magnet"
+                      ? hasSource
+                        ? "The file list will load after the torrent is added."
+                        : "Paste a magnet link to continue."
                       : "File details appear automatically."}
               </p>
             </div>
@@ -439,16 +441,22 @@ export function AddTorrentPanel({ windowMode, initialSource, onAdded, onCancel }
                   {busy === "preview" ? <Loader2 className="h-5 w-5 animate-spin" /> : sourceType === "magnet" ? <Link2 className="h-5 w-5" /> : <FileCheck2 className="h-5 w-5" />}
                 </div>
                 <p className="text-sm font-medium">
-                  {busy === "preview" ? "Reading torrent metadata" : sourceType === "magnet" && preview ? "Ready to fetch metadata" : "No torrent selected"}
+                  {busy === "preview"
+                    ? "Reading torrent metadata"
+                    : sourceType === "magnet"
+                      ? hasSource
+                        ? "Files load after adding"
+                        : "No magnet link selected"
+                      : "No torrent selected"}
                 </p>
                 <p className="mt-1 max-w-sm text-xs leading-relaxed text-muted-foreground">
                   {busy === "preview"
                     ? "The file list will appear here automatically."
-                    : sourceType === "magnet" && preview
-                      ? "Add the torrent to connect to peers and retrieve its file list."
-                      : sourceType === "file"
-                        ? "Choose a .torrent file to inspect its contents before downloading."
-                        : "Paste a magnet link to inspect its available details."}
+                    : sourceType === "magnet"
+                      ? hasSource
+                        ? "Add the torrent to connect to peers and retrieve its file list."
+                        : "Paste a magnet link to add a torrent."
+                      : "Choose a .torrent file to inspect its contents before downloading."}
                 </p>
               </div>
             )}
@@ -459,16 +467,6 @@ export function AddTorrentPanel({ windowMode, initialSource, onAdded, onCancel }
       <Separator />
       <footer className="flex flex-col gap-3 px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
         <div className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
-          {busy === "preview" ? (
-            <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
-          ) : preview ? (
-            <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-primary" />
-          ) : (
-            <FileUp className="h-3.5 w-3.5 shrink-0" />
-          )}
-          <span className="truncate">
-            {busy === "preview" ? "Previewing automatically…" : preview ? "Preview updated automatically" : "Preview starts when a source is entered"}
-          </span>
         </div>
         <div className="flex justify-end gap-2">
           <Button type="button" variant="outline" onClick={handleCancel} disabled={busy === "add"}>
