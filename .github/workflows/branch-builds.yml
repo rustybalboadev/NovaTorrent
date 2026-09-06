@@ -15,33 +15,8 @@ concurrency:
 
 jobs:
   build:
-    name: Build ${{ matrix.name }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Linux x64
-            platform: ubuntu-22.04
-            args: ""
-            rustTargets: ""
-            artifactName: NovaTorrent-linux-x64
-            artifactPath: |
-              src-tauri/target/release/bundle/appimage/*.AppImage
-              src-tauri/target/release/bundle/deb/*.deb
-          - name: macOS Apple Silicon
-            platform: macos-latest
-            args: "--target aarch64-apple-darwin"
-            rustTargets: aarch64-apple-darwin
-            artifactName: NovaTorrent-macos-apple-silicon
-            artifactPath: src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
-          - name: macOS Intel
-            platform: macos-latest
-            args: "--target x86_64-apple-darwin"
-            rustTargets: x86_64-apple-darwin
-            artifactName: NovaTorrent-macos-intel
-            artifactPath: src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg
-
-    runs-on: ${{ matrix.platform }}
+    name: Build Linux x64 Debian package
+    runs-on: ubuntu-22.04
 
     steps:
       - name: Check out source
@@ -56,21 +31,18 @@ jobs:
           cache: npm
 
       - name: Install Linux build dependencies
-        if: matrix.platform == 'ubuntu-22.04'
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils libssl-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.rustTargets }}
 
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: "./src-tauri -> target"
-          shared-key: "branch-${{ matrix.artifactName }}"
+          shared-key: branch-linux-x64-deb
 
       - name: Install frontend dependencies
         run: npm ci
@@ -78,19 +50,12 @@ jobs:
       - name: Build NovaTorrent
         uses: tauri-apps/tauri-action@v1
         with:
-          args: ${{ matrix.args }}
-
-      - name: Make AppImage compatible with host graphics libraries
-        if: matrix.platform == 'ubuntu-22.04'
-        shell: bash
-        run: |
-          appimage="$(find src-tauri/target/release/bundle/appimage -maxdepth 1 -name '*.AppImage' -print -quit)"
-          ./scripts/fix-appimage-compat.sh "$appimage"
+          args: --bundles deb
 
       - name: Upload test build
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifactName }}
-          path: ${{ matrix.artifactPath }}
+          name: NovaTorrent-linux-x64-deb
+          path: src-tauri/target/release/bundle/deb/*.deb
           if-no-files-found: error
           retention-days: 7
