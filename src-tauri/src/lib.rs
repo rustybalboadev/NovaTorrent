@@ -1687,8 +1687,8 @@ fn open_add_window(app: &AppHandle, source: Option<String>) -> Result<(), String
 
     WebviewWindowBuilder::new(app, label, WebviewUrl::App(route.into()))
         .title("Add Torrent")
-        .inner_size(780.0, 720.0)
-        .min_inner_size(620.0, 560.0)
+        .inner_size(1120.0, 760.0)
+        .min_inner_size(900.0, 620.0)
         .resizable(true)
         .decorations(false)
         .visible(false)
