@@ -20,13 +20,10 @@ import {
   SkipForward,
   Volume2,
   VolumeX,
-  X
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import {
-  closeMediaWindow,
-  clearStreamPriority,
   mediaPlayerLog,
   setStreamPriority,
   streamFileAvailability,
@@ -865,27 +862,9 @@ export function MediaPlayerWindow() {
     }, 900);
   }
 
-  async function closeViewer() {
-    const windowParams = originalWindowParamsRef.current ?? params;
-    if (windowParams) {
-      try {
-        logPlayerEvent("close");
-        await closeMediaWindow(windowParams.id, windowParams.fileIndex);
-        return;
-      } catch {
-        try {
-          await clearStreamPriority(windowParams.id);
-        } catch {
-          undefined;
-        }
-      }
-    }
-    window.close();
-  }
-
   return (
-    <main className="min-h-screen bg-zinc-950 text-zinc-100">
-      <div className="flex min-h-screen flex-col">
+    <main className="h-full min-h-0 bg-zinc-950 text-zinc-100">
+      <div className="flex h-full min-h-0 flex-col">
         <header className="flex items-center justify-between gap-3 border-b border-white/10 px-4 py-3">
           <div className="flex min-w-0 flex-1 items-center gap-3">
             <div className="flex h-9 w-9 items-center justify-center rounded-md bg-primary text-primary-foreground">
@@ -908,10 +887,6 @@ export function MediaPlayerWindow() {
             >
               {queueOpen ? <PanelRightClose className="h-4 w-4" /> : <PanelRightOpen className="h-4 w-4" />}
               {queueOpen ? "Hide queue" : `Queue (${playableFiles.length})`}
-            </Button>
-            <Button type="button" variant="outline" size="sm" className="shrink-0 border-white/15 bg-white/5 text-zinc-100 hover:bg-white/10" onClick={closeViewer}>
-              <X className="h-4 w-4" />
-              Close
             </Button>
           </div>
         </header>

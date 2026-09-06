@@ -56,14 +56,14 @@ pub struct PartialPieceStore {
 
 impl PartialPieceStore {
     pub fn open(
-        output_root: &Path,
+        store_dir: &Path,
         key: &str,
         total_length: u64,
         piece_length: u64,
         piece_hashes: &[[u8; 20]],
     ) -> Result<Self, String> {
         Self::open_inner(
-            output_root,
+            store_dir,
             key,
             total_length,
             piece_length,
@@ -74,14 +74,14 @@ impl PartialPieceStore {
     }
 
     pub fn open_existing(
-        output_root: &Path,
+        store_dir: &Path,
         key: &str,
         total_length: u64,
         piece_length: u64,
         piece_hashes: &[[u8; 20]],
     ) -> Result<Option<Self>, String> {
         Self::open_inner(
-            output_root,
+            store_dir,
             key,
             total_length,
             piece_length,
@@ -91,7 +91,7 @@ impl PartialPieceStore {
     }
 
     fn open_inner(
-        output_root: &Path,
+        store_dir: &Path,
         key: &str,
         total_length: u64,
         piece_length: u64,
@@ -110,7 +110,6 @@ impl PartialPieceStore {
             ));
         }
 
-        let store_dir = output_root.join(".novatorrent");
         let data_path = store_dir.join(format!("{key}.part"));
         let state_path = store_dir.join(format!("{key}.json"));
         if !create_missing && (!data_path.exists() || !state_path.exists()) {
@@ -809,7 +808,7 @@ pub fn verified_file_ranges_from_pieces(
 /// downloads. Streaming callers use this path after the session has observed the
 /// completed write, avoiding both stale availability and an expensive full recheck.
 pub fn read_verified_partial_file_range(
-    output_root: &Path,
+    store_dir: &Path,
     key: &str,
     total_length: u64,
     files: &[TorrentFile],
@@ -842,7 +841,7 @@ pub fn read_verified_partial_file_range(
         return Err("stream byte range is not verified yet".to_string());
     }
 
-    let data_path = output_root.join(".novatorrent").join(format!("{key}.part"));
+    let data_path = store_dir.join(format!("{key}.part"));
     let metadata = fs::symlink_metadata(&data_path)
         .map_err(|err| format!("could not inspect partial torrent data: {err}"))?;
     if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
@@ -960,12 +959,6 @@ pub fn total_file_length(files: &[TorrentFile]) -> Result<u64, String> {
 }
 
 pub fn requires_torrent_name_folder(files: &[TorrentFile]) -> bool {
-    let is_multi_file =
-        files.len() > 1 || files.first().is_some_and(|file| file.components.len() > 1);
-    if !is_multi_file {
-        return false;
-    }
-
     let Some(first_folder) = files
         .first()
         .and_then(|file| file.components.first())
@@ -1050,7 +1043,7 @@ mod tests {
         assert_eq!(summary.bytes_written, 5);
         assert_eq!(summary.files_written, 1);
         assert_eq!(
-            fs::read(root.join("payload.bin")).expect("file reads"),
+            fs::read(root.join("payload.bin").join("payload.bin")).expect("file reads"),
             b"hello"
         );
         remove_temp_dir(root);
@@ -1188,7 +1181,9 @@ mod tests {
     fn protects_existing_files_without_overwrite() {
         let root = temp_dir("overwrite");
         let files = vec![file("payload.bin", &["payload.bin"], 5, true)];
-        fs::write(root.join("payload.bin"), b"prior").expect("seed existing file");
+        fs::create_dir_all(root.join("payload.bin")).expect("payload folder creates");
+        fs::write(root.join("payload.bin").join("payload.bin"), b"prior")
+            .expect("seed existing file");
 
         let err = write_torrent_bytes(&root, "payload.bin", &files, b"hello", false)
             .expect_err("overwrite is rejected");
@@ -1197,7 +1192,7 @@ mod tests {
         write_torrent_bytes(&root, "payload.bin", &files, b"hello", true)
             .expect("overwrite allowed");
         assert_eq!(
-            fs::read(root.join("payload.bin")).expect("file reads"),
+            fs::read(root.join("payload.bin").join("payload.bin")).expect("file reads"),
             b"hello"
         );
         remove_temp_dir(root);
@@ -1264,11 +1259,10 @@ mod tests {
         assert_eq!(store.read_complete().expect("repaired data reads"), data);
         store.clear().expect("partial store clears");
         assert!(!data_path.exists());
-        assert!(!root
-            .join(".novatorrent")
-            .join(format!("{key}.json"))
-            .exists());
-        remove_temp_dir(root);
+        assert!(!root.join(format!("{key}.json")).exists());
+        if root.exists() {
+            remove_temp_dir(root);
+        }
     }
 
     #[test]

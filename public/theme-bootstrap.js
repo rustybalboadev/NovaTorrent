@@ -1,5 +1,6 @@
 (function () {
   var root = document.documentElement;
+  if (window.__TAURI_INTERNALS__) root.classList.add("tauri-runtime");
   var resolved = "light";
   try {
     var stored = window.localStorage.getItem("theme");

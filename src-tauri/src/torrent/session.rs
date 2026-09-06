@@ -418,6 +418,7 @@ struct PeerDownloadSnapshot {
     name: String,
     info_hash: [u8; 20],
     output_folder: PathBuf,
+    partial_store_dir: PathBuf,
     files: Vec<TorrentFile>,
     file_priorities: Vec<u8>,
     total_length: u64,
@@ -532,6 +533,7 @@ struct IncomingSeedSnapshot {
     name: String,
     info_hash: [u8; 20],
     output_folder: PathBuf,
+    partial_store_dir: PathBuf,
     files: Vec<TorrentFile>,
     total_length: u64,
     piece_length: u64,
@@ -603,6 +605,7 @@ struct PersistedTorrent {
 
 pub struct TorrentSession {
     default_output_dir: PathBuf,
+    partial_store_dir: PathBuf,
     log_file_path: PathBuf,
     session_file_path: PathBuf,
     dht_state_file_path: PathBuf,
@@ -676,6 +679,7 @@ impl TorrentSession {
     ) -> Self {
         let session_file_path = state_dir.join("novatorrent-session.json");
         let dht_state_file_path = state_dir.join("novatorrent-dht.json");
+        let partial_store_dir = state_dir.join("partial");
         let (dht_node_id, persisted_nodes, dht_state_error, write_new_dht_state) =
             match load_dht_state(&dht_state_file_path) {
                 Ok(Some(state)) if state.version == 1 && state.node_id != [0u8; 20] => {
@@ -711,6 +715,7 @@ impl TorrentSession {
         }
         let session = Self {
             default_output_dir,
+            partial_store_dir,
             log_file_path,
             session_file_path,
             dht_state_file_path,
@@ -750,6 +755,7 @@ impl TorrentSession {
             session.persist_dht_state_or_log();
         }
         session.restore_session();
+        session.migrate_legacy_partial_stores();
         session
     }
 
@@ -769,6 +775,42 @@ impl TorrentSession {
     #[cfg(test)]
     fn dht_state_file_path(&self) -> &Path {
         &self.dht_state_file_path
+    }
+
+    fn migrate_legacy_partial_stores(&self) {
+        let stores = self
+            .torrents
+            .lock()
+            .map(|torrents| {
+                torrents
+                    .iter()
+                    .map(|torrent| {
+                        (
+                            torrent.id,
+                            torrent.output_folder.clone(),
+                            sha1::hex(&torrent.info_hash),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for (id, output_folder, key) in stores {
+            match migrate_legacy_partial_store(&output_folder, &self.partial_store_dir, &key) {
+                Ok(true) => self.log(
+                    LogLevel::Info,
+                    "storage",
+                    "moved legacy partial download data into application storage",
+                    Some(id),
+                ),
+                Ok(false) => {}
+                Err(err) => self.log(
+                    LogLevel::Warn,
+                    "storage",
+                    format!("could not move legacy partial download data: {err}"),
+                    Some(id),
+                ),
+            }
+        }
     }
 
     fn persist_dht_state(&self) -> Result<(), String> {
@@ -1509,6 +1551,15 @@ impl TorrentSession {
             .ok_or_else(|| format!("torrent not found: {id}"))
     }
 
+    pub fn download_location_for(&self, id: &str) -> Result<PathBuf, String> {
+        let torrents = self.torrents.lock().map_err(|_| "torrent lock poisoned")?;
+        torrents
+            .iter()
+            .find(|torrent| torrent.matches_id(id))
+            .map(TorrentTask::download_location)
+            .ok_or_else(|| format!("torrent not found: {id}"))
+    }
+
     pub fn preview(&self, request: AddTorrentRequest) -> Result<AddTorrentResponse, String> {
         let mut task = self.build_task(request, None)?;
         task.stats.state = TorrentState::Preview;
@@ -1520,7 +1571,7 @@ impl TorrentSession {
         );
         Ok(AddTorrentResponse {
             id: None,
-            output_folder: task.output_folder.to_string_lossy().into_owned(),
+            output_folder: task.download_location_string(),
             seen_peers: Some(Vec::new()),
             details: task.details(),
         })
@@ -1548,7 +1599,7 @@ impl TorrentSession {
                 ));
             }
         }
-        let output_folder = task.output_folder.to_string_lossy().into_owned();
+        let output_folder = task.download_location_string();
         let details = task.details();
         let name = task.name.clone();
         let tracker_count = task.trackers.len();
@@ -1702,6 +1753,7 @@ impl TorrentSession {
                 name: torrent.name.clone(),
                 info_hash: torrent.info_hash,
                 output_folder: torrent.output_folder.clone(),
+                partial_store_dir: self.partial_store_dir.clone(),
                 files: torrent.files.clone(),
                 total_length: torrent.stats.total_bytes,
                 piece_length: torrent.general.piece_size,
@@ -1802,6 +1854,7 @@ impl TorrentSession {
         snapshot: &IncomingSeedSnapshot,
     ) -> Result<peerwire::SeedBlockReader, String> {
         let output_folder = snapshot.output_folder.clone();
+        let partial_store_dir = snapshot.partial_store_dir.clone();
         let torrent_name = snapshot.name.clone();
         let files = snapshot.files.clone();
         let piece_length = snapshot.piece_length;
@@ -1824,10 +1877,7 @@ impl TorrentSession {
 
         {
             let key = sha1::hex(&snapshot.info_hash);
-            let state_path = snapshot
-                .output_folder
-                .join(".novatorrent")
-                .join(format!("{key}.json"));
+            let state_path = snapshot.partial_store_dir.join(format!("{key}.json"));
             if !state_path.is_file() {
                 return Err("complete partial store is unavailable for unchecked files".to_string());
             }
@@ -1835,7 +1885,7 @@ impl TorrentSession {
         let key = sha1::hex(&snapshot.info_hash);
         Ok(Arc::new(move |offset, length| {
             read_verified_seed_block_from_partial_store(
-                &output_folder,
+                &partial_store_dir,
                 &key,
                 piece_length,
                 total_length,
@@ -3145,6 +3195,7 @@ impl TorrentSession {
                 name: torrent.name.clone(),
                 info_hash: torrent.info_hash,
                 output_folder: torrent.output_folder.clone(),
+                partial_store_dir: self.partial_store_dir.clone(),
                 files: torrent.files.clone(),
                 total_length: torrent.stats.total_bytes,
                 piece_length: torrent.general.piece_size,
@@ -3233,7 +3284,7 @@ impl TorrentSession {
 
         let store_key = sha1::hex(&snapshot.info_hash);
         let mut partial_store = storage::PartialPieceStore::open(
-            &snapshot.output_folder,
+            &snapshot.partial_store_dir,
             &store_key,
             snapshot.total_length,
             snapshot.piece_length,
@@ -4103,16 +4154,7 @@ impl TorrentSession {
         id: &str,
         file_index: usize,
     ) -> Result<TorrentFileAvailability, String> {
-        let (
-            output_folder,
-            files,
-            file,
-            info_hash,
-            piece_length,
-            piece_hashes,
-            finished,
-            live_verified,
-        ) = {
+        let (files, file, info_hash, piece_length, piece_hashes, finished, live_verified) = {
             let torrents = self.torrents.lock().map_err(|_| "torrent lock poisoned")?;
             let torrent = torrents
                 .iter()
@@ -4124,7 +4166,6 @@ impl TorrentSession {
                 .cloned()
                 .ok_or_else(|| format!("torrent file index is out of range: {file_index}"))?;
             (
-                torrent.output_folder.clone(),
                 torrent.files.clone(),
                 file,
                 torrent.info_hash,
@@ -4167,7 +4208,7 @@ impl TorrentSession {
         } else {
             let store_key = sha1::hex(&info_hash);
             let partial_store = storage::PartialPieceStore::open_existing(
-                &output_folder,
+                &self.partial_store_dir,
                 &store_key,
                 storage::total_file_length(&files)?,
                 piece_length,
@@ -4296,7 +4337,7 @@ impl TorrentSession {
             let store_key = sha1::hex(&info_hash);
             if let Some(verified) = live_verified {
                 storage::read_verified_partial_file_range(
-                    &output_folder,
+                    &self.partial_store_dir,
                     &store_key,
                     storage::total_file_length(&files)?,
                     &files,
@@ -4308,7 +4349,7 @@ impl TorrentSession {
                 )?
             } else {
                 let mut partial_store = storage::PartialPieceStore::open_existing(
-                    &output_folder,
+                    &self.partial_store_dir,
                     &store_key,
                     storage::total_file_length(&files)?,
                     piece_length,
@@ -5029,6 +5070,7 @@ impl TorrentSession {
         let started = Instant::now();
         match delete_torrent_payload_files(
             &cleanup.output_folder,
+            &self.partial_store_dir,
             &cleanup.name,
             &cleanup.files,
             cleanup.info_hash,
@@ -6105,6 +6147,25 @@ impl TorrentSession {
 }
 
 impl TorrentTask {
+    fn download_location(&self) -> PathBuf {
+        if storage::requires_torrent_name_folder(&self.files) {
+            return self.output_folder.join(&self.name);
+        }
+        self.files
+            .first()
+            .and_then(|file| {
+                (file.components.len() > 1)
+                    .then(|| file.components.first())
+                    .flatten()
+            })
+            .map(|root| self.output_folder.join(root))
+            .unwrap_or_else(|| self.output_folder.join(&self.name))
+    }
+
+    fn download_location_string(&self) -> String {
+        self.download_location().to_string_lossy().into_owned()
+    }
+
     fn summary(&self) -> TorrentSummary {
         let live = self.stats.live.clone().unwrap_or(LiveStats {
             download_speed: 0,
@@ -6123,7 +6184,7 @@ impl TorrentTask {
             id: Some(self.id).filter(|id| *id != 0),
             info_hash: sha1::hex(&self.info_hash),
             name: Some(self.name.clone()),
-            output_folder: self.output_folder.to_string_lossy().into_owned(),
+            output_folder: self.download_location_string(),
             stats: TorrentSummaryStats {
                 state: self.stats.state,
                 error: self.stats.error.clone(),
@@ -6148,6 +6209,7 @@ impl TorrentTask {
             time_remaining: None,
         }));
         let mut general = self.general.clone();
+        general.save_path = self.download_location_string();
         let now = timestamp_ms();
         general.active_time_seconds = ((now.saturating_sub(self.added_at_ms)) / 1_000) as u64;
         general.seeding_time_seconds = self
@@ -6181,7 +6243,7 @@ impl TorrentTask {
             id: Some(self.id).filter(|id| *id != 0),
             info_hash: sha1::hex(&self.info_hash),
             name: Some(self.name.clone()),
-            output_folder: self.output_folder.to_string_lossy().into_owned(),
+            output_folder: self.download_location_string(),
             files: Some(self.files.clone()),
             stats: Some(stats),
             general,
@@ -6811,6 +6873,7 @@ fn output_folder_with_subfolder(
 
 fn delete_torrent_payload_files(
     output_root: &Path,
+    partial_store_dir: &Path,
     torrent_name: &str,
     files: &[TorrentFile],
     info_hash: [u8; 20],
@@ -6848,11 +6911,13 @@ fn delete_torrent_payload_files(
         }
     }
 
-    let store_dir = output_root.join(".novatorrent");
     let store_key = sha1::hex(&info_hash);
+    let legacy_store_dir = output_root.join(".novatorrent");
     for path in [
-        store_dir.join(format!("{store_key}.part")),
-        store_dir.join(format!("{store_key}.json")),
+        partial_store_dir.join(format!("{store_key}.part")),
+        partial_store_dir.join(format!("{store_key}.json")),
+        legacy_store_dir.join(format!("{store_key}.part")),
+        legacy_store_dir.join(format!("{store_key}.json")),
     ] {
         match fs::metadata(&path) {
             Ok(metadata) if metadata.is_file() => {
@@ -6875,7 +6940,8 @@ fn delete_torrent_payload_files(
             }
         }
     }
-    candidate_dirs.insert(store_dir);
+    candidate_dirs.insert(partial_store_dir.to_path_buf());
+    candidate_dirs.insert(legacy_store_dir);
     if wrap_in_torrent_folder {
         candidate_dirs.insert(output_root.join(torrent_name));
     }
@@ -6890,6 +6956,53 @@ fn delete_torrent_payload_files(
     }
 
     Ok((deleted_files, deleted_bytes))
+}
+
+fn migrate_legacy_partial_store(
+    output_root: &Path,
+    partial_store_dir: &Path,
+    key: &str,
+) -> Result<bool, String> {
+    let legacy_store_dir = output_root.join(".novatorrent");
+    let legacy_paths = [
+        legacy_store_dir.join(format!("{key}.part")),
+        legacy_store_dir.join(format!("{key}.json")),
+    ];
+    if !legacy_paths.iter().any(|path| path.is_file()) {
+        return Ok(false);
+    }
+    fs::create_dir_all(partial_store_dir)
+        .map_err(|err| format!("could not create application partial store: {err}"))?;
+    let mut moved = false;
+    for legacy_path in legacy_paths {
+        if !legacy_path.is_file() {
+            continue;
+        }
+        let file_name = legacy_path
+            .file_name()
+            .ok_or_else(|| "legacy partial store path has no file name".to_string())?;
+        let destination = partial_store_dir.join(file_name);
+        if destination.exists() {
+            continue;
+        }
+        if fs::rename(&legacy_path, &destination).is_err() {
+            fs::copy(&legacy_path, &destination).map_err(|err| {
+                format!(
+                    "could not copy legacy partial store file {}: {err}",
+                    legacy_path.to_string_lossy()
+                )
+            })?;
+            fs::remove_file(&legacy_path).map_err(|err| {
+                format!(
+                    "could not remove migrated partial store file {}: {err}",
+                    legacy_path.to_string_lossy()
+                )
+            })?;
+        }
+        moved = true;
+    }
+    let _ = fs::remove_dir(&legacy_store_dir);
+    Ok(moved)
 }
 
 fn timestamp_ms() -> u128 {
@@ -7009,7 +7122,7 @@ fn read_verified_seed_block_from_files(
 }
 
 fn read_verified_seed_block_from_partial_store(
-    output_folder: &Path,
+    partial_store_dir: &Path,
     key: &str,
     piece_length: u64,
     total_length: u64,
@@ -7020,7 +7133,7 @@ fn read_verified_seed_block_from_partial_store(
     let (piece_index, piece_start, piece_end, relative_start) =
         seed_piece_bounds(piece_length, total_length, piece_hashes, offset, length)?;
     let mut store = storage::PartialPieceStore::open_existing(
-        output_folder,
+        partial_store_dir,
         key,
         total_length,
         piece_length,
@@ -9091,8 +9204,8 @@ mod tests {
             first_seed.join().expect("first seed exits").bytes_uploaded,
             4
         );
-        let partial_path = output_dir
-            .join(".novatorrent")
+        let partial_path = session
+            .partial_store_dir
             .join(format!("{}.part", sha1::hex(&info_hash)));
         assert!(partial_path.exists());
         assert_eq!(
@@ -9362,8 +9475,9 @@ mod tests {
         assert_eq!(restored[0].id, Some(first_id));
         assert_eq!(
             restored[0].output_folder,
-            output_dir.join("chosen").to_string_lossy()
+            output_dir.join("chosen").join("Example").to_string_lossy()
         );
+        assert_eq!(restored[0].general.save_path, restored[0].output_folder);
         assert!(restored[0].options.paused);
         assert!(restored[0].options.overwrite);
         assert!(restored[0].options.disable_trackers);
@@ -9577,6 +9691,39 @@ mod tests {
     }
 
     #[test]
+    fn moves_legacy_partial_store_out_of_the_download_folder() {
+        let root = temp_dir("legacy-partial-store");
+        let output_dir = root.join("downloads");
+        let partial_store_dir = root.join("app-data").join("partial");
+        let legacy_store_dir = output_dir.join(".novatorrent");
+        let key = "00112233445566778899aabbccddeeff00112233";
+        fs::create_dir_all(&legacy_store_dir).expect("legacy store creates");
+        fs::write(legacy_store_dir.join(format!("{key}.part")), b"pieces")
+            .expect("legacy data writes");
+        fs::write(legacy_store_dir.join(format!("{key}.json")), b"state")
+            .expect("legacy state writes");
+
+        assert!(
+            migrate_legacy_partial_store(&output_dir, &partial_store_dir, key)
+                .expect("legacy store migrates")
+        );
+        assert_eq!(
+            fs::read(partial_store_dir.join(format!("{key}.part"))).expect("migrated data reads"),
+            b"pieces"
+        );
+        assert_eq!(
+            fs::read(partial_store_dir.join(format!("{key}.json"))).expect("migrated state reads"),
+            b"state"
+        );
+        assert!(!legacy_store_dir.exists());
+        assert!(
+            !migrate_legacy_partial_store(&output_dir, &partial_store_dir, key)
+                .expect("second migration is a no-op")
+        );
+        fs::remove_dir_all(root).expect("temp dir removes");
+    }
+
+    #[test]
     fn lsd_announce_adds_public_lan_peer_and_skips_private_torrents() {
         let root = temp_dir("session-lsd");
         let torrent_path = root.join("public.torrent");
@@ -9682,7 +9829,7 @@ mod tests {
             (torrent.info_hash, torrent.piece_hashes.clone())
         };
         let mut store = storage::PartialPieceStore::open(
-            &output_dir,
+            &session.partial_store_dir,
             &sha1::hex(&info_hash),
             data.len() as u64,
             4,
@@ -9711,7 +9858,7 @@ mod tests {
         );
 
         let mut store = storage::PartialPieceStore::open(
-            &output_dir,
+            &session.partial_store_dir,
             &sha1::hex(&info_hash),
             data.len() as u64,
             4,
@@ -10667,7 +10814,7 @@ mod tests {
             vec!["started", "webseed", "completed"]
         );
         assert_eq!(
-            fs::read(output_dir.join("file.bin")).expect("output reads"),
+            fs::read(output_dir.join("file.bin").join("file.bin")).expect("output reads"),
             data
         );
 
@@ -11413,6 +11560,15 @@ mod tests {
         assert_eq!(summaries[0].first_playable_file_index, None);
         assert_eq!(summaries[0].stats.total_bytes, 9);
         assert_eq!(summaries[0].stats.state, TorrentState::Paused);
+        assert_eq!(
+            summaries[0].output_folder,
+            root.join("out").join("Example").to_string_lossy()
+        );
+        let details = session
+            .details(&summaries[0].id.expect("summary has id").to_string())
+            .expect("details load");
+        assert_eq!(details.output_folder, summaries[0].output_folder);
+        assert_eq!(details.general.save_path, summaries[0].output_folder);
         fs::remove_dir_all(root).expect("temp dir removes");
     }
 

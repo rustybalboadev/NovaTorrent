@@ -4,28 +4,6 @@
 
 @layer base {
   :root {
-    --background: 210 26% 97%;
-    --foreground: 216 28% 9%;
-    --card: 0 0% 100%;
-    --card-foreground: 216 28% 9%;
-    --popover: 0 0% 100%;
-    --popover-foreground: 216 28% 9%;
-    --primary: 174 84% 30%;
-    --primary-foreground: 0 0% 100%;
-    --secondary: 212 22% 91%;
-    --secondary-foreground: 216 28% 13%;
-    --muted: 210 24% 93%;
-    --muted-foreground: 216 9% 43%;
-    --accent: 28 92% 55%;
-    --accent-foreground: 25 91% 9%;
-    --destructive: 0 78% 52%;
-    --destructive-foreground: 0 0% 100%;
-    --border: 214 22% 86%;
-    --input: 214 22% 86%;
-    --ring: 174 84% 30%;
-  }
-
-  .dark {
     --background: 220 22% 8%;
     --foreground: 210 22% 94%;
     --card: 218 18% 12%;
@@ -47,22 +25,45 @@
     --ring: 172 72% 42%;
   }
 
+  .light {
+    --background: 210 26% 97%;
+    --foreground: 216 28% 9%;
+    --card: 0 0% 100%;
+    --card-foreground: 216 28% 9%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 216 28% 9%;
+    --primary: 174 84% 30%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 212 22% 91%;
+    --secondary-foreground: 216 28% 13%;
+    --muted: 210 24% 93%;
+    --muted-foreground: 216 9% 43%;
+    --accent: 28 92% 55%;
+    --accent-foreground: 25 91% 9%;
+    --destructive: 0 78% 52%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 214 22% 86%;
+    --input: 214 22% 86%;
+    --ring: 174 84% 30%;
+  }
+
   * {
     @apply border-border;
   }
 
   html,
   body {
-    min-height: 100%;
+    height: 100%;
+    overflow: hidden;
   }
 
   html {
     background: hsl(var(--background));
-    color-scheme: light;
+    color-scheme: dark;
   }
 
-  html.dark {
-    color-scheme: dark;
+  html.light {
+    color-scheme: light;
   }
 
   body {
@@ -76,6 +77,114 @@
   ::selection {
     background: hsl(var(--primary) / 0.24);
   }
+
+  .app-window-content {
+    height: 100%;
+    min-height: 0;
+    overflow: auto;
+  }
+
+  .window-titlebar {
+    display: none;
+  }
+
+  .tauri-runtime .window-titlebar {
+    position: relative;
+    display: flex;
+    height: 30px;
+    flex: 0 0 30px;
+    align-items: center;
+    border-bottom: 1px solid hsl(var(--border));
+    background: hsl(var(--card));
+    color: hsl(var(--foreground));
+    user-select: none;
+  }
+
+  .tauri-runtime .app-window-content {
+    height: calc(100% - 30px);
+  }
+
+  .window-titlebar-controls {
+    z-index: 1;
+    display: flex;
+    height: 100%;
+    align-items: center;
+    gap: 1px;
+    padding-left: 8px;
+  }
+
+  .window-titlebar-title {
+    pointer-events: none;
+    position: absolute;
+    left: 50%;
+    display: flex;
+    max-width: min(46%, 28rem);
+    transform: translateX(-50%);
+    align-items: center;
+  }
+
+  .window-titlebar-button {
+    display: flex;
+    height: 30px;
+    width: 18px;
+    align-items: center;
+    justify-content: center;
+    border-radius: 5px;
+  }
+
+  .window-titlebar-dot {
+    display: flex;
+    height: 11px;
+    width: 11px;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid rgb(0 0 0 / 0.14);
+    border-radius: 999px;
+    color: rgb(47 47 47);
+    transition: filter 100ms ease, transform 100ms ease;
+  }
+
+  .window-titlebar-dot svg {
+    height: 7px;
+    width: 7px;
+    opacity: 0;
+    stroke-width: 2.25;
+    transition: opacity 100ms ease;
+  }
+
+  .window-titlebar:hover .window-titlebar-dot svg,
+  .window-titlebar-button:focus-visible .window-titlebar-dot svg {
+    opacity: 0.82;
+  }
+
+  .window-titlebar-button:hover .window-titlebar-dot {
+    filter: brightness(0.94);
+    transform: scale(1.04);
+  }
+
+  .window-titlebar-button:focus-visible {
+    outline: 2px solid hsl(var(--ring));
+    outline-offset: -1px;
+  }
+
+  .window-titlebar-close .window-titlebar-dot {
+    background: #ff5f57;
+  }
+
+  .window-titlebar-minimize .window-titlebar-dot {
+    background: #febc2e;
+  }
+
+  .window-titlebar-maximize .window-titlebar-dot {
+    background: #28c840;
+  }
+
+  .tauri-runtime .window-titlebar-media {
+    border-color: rgb(255 255 255 / 0.1);
+    background: rgb(9 9 11);
+    color: rgb(244 244 245);
+  }
+
 }
 
 @layer utilities {

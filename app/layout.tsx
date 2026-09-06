@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import Script from "next/script";
 import "./globals.css";
 import { ThemeProvider } from "@/components/theme-provider";
+import { WindowTitlebar } from "@/components/window-titlebar";
 
 export const metadata: Metadata = {
   title: "NovaTorrent",
@@ -25,7 +26,8 @@ export default function RootLayout({
       </head>
       <body>
         <ThemeProvider attribute="class" defaultTheme="system" enableSystem disableTransitionOnChange>
-          {children}
+          <WindowTitlebar />
+          <div className="app-window-content">{children}</div>
         </ThemeProvider>
       </body>
     </html>

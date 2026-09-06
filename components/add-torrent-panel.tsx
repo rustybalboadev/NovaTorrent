@@ -41,7 +41,6 @@ export function AddTorrentPanel({ windowMode, initialSource, onAdded, onCancel }
   const [paused, setPaused] = React.useState(false);
   const [overwrite, setOverwrite] = React.useState(false);
   const [disableTrackers, setDisableTrackers] = React.useState(false);
-  const [subFolder, setSubFolder] = React.useState("");
   const [advancedOpen, setAdvancedOpen] = React.useState(false);
   const [preview, setPreview] = React.useState<TorrentDetails | null>(null);
   const [selectedFileIds, setSelectedFileIds] = React.useState<Set<number>>(new Set());
@@ -114,11 +113,11 @@ export function AddTorrentPanel({ windowMode, initialSource, onAdded, onCancel }
   const totalSize = files.reduce((sum, file) => sum + file.length, 0);
   const selectedSize = files.reduce((sum, file, index) => (selectedFileIds.has(index) ? sum + file.length : sum), 0);
   const selectedCount = files.reduce((count, _, index) => count + Number(selectedFileIds.has(index)), 0);
-  const resolvedPath = resolveDownloadPath(destination, subFolder, preview);
+  const previewFiles = filesWithTorrentRoot(files, preview?.name ?? undefined);
   const hasSource = Boolean(sourceValue.trim());
   const selectionIsEmpty = files.length > 0 && selectedFileIds.size === 0;
 
-  const previewSelectedSource = React.useCallback(async (kind: "file" | "magnet", value: string) => {
+  const previewSelectedTorrentFile = React.useCallback(async (value: string) => {
     if (!value.trim()) return;
     const requestId = ++previewRequestId.current;
     setBusy("preview");
@@ -126,7 +125,7 @@ export function AddTorrentPanel({ windowMode, initialSource, onAdded, onCancel }
     setSuccess(null);
     try {
       const response = await previewTorrent({
-        source: { kind, value: value.trim() },
+        source: { kind: "file", value: value.trim() },
         destination: null,
         paused: false,
         overwrite: false,
@@ -151,12 +150,12 @@ export function AddTorrentPanel({ windowMode, initialSource, onAdded, onCancel }
 
   React.useEffect(() => {
     const value = sourceValue.trim();
-    if (!value) return;
+    if (!value || sourceType === "magnet") return;
     const timer = window.setTimeout(() => {
-      void previewSelectedSource(sourceType, value);
+      void previewSelectedTorrentFile(value);
     }, 400);
     return () => window.clearTimeout(timer);
-  }, [previewSelectedSource, sourceType, sourceValue]);
+  }, [previewSelectedTorrentFile, sourceType, sourceValue]);
 
   async function chooseTorrentFile() {
     setError(null);
@@ -249,7 +248,7 @@ export function AddTorrentPanel({ windowMode, initialSource, onAdded, onCancel }
       overwrite,
       disableTrackers,
       onlyFiles,
-      subFolder: subFolder.trim() || null
+      subFolder: null
     };
   }
 
@@ -259,16 +258,18 @@ export function AddTorrentPanel({ windowMode, initialSource, onAdded, onCancel }
         <div className="min-w-0">
           <h1 className="text-lg font-semibold tracking-tight">Add a torrent</h1>
           <p className="truncate text-sm text-muted-foreground">
-            {preview?.name || "Choose a file or paste a magnet link to begin."}
+            {preview?.name || (sourceType === "magnet" && hasSource ? "Magnet link ready to add." : "Choose a file or paste a magnet link to begin.")}
           </p>
         </div>
-        <Button variant="ghost" size="icon" type="button" aria-label="Close add torrent" onClick={handleCancel}>
-          <X />
-        </Button>
+        {!windowMode ? (
+          <Button variant="ghost" size="icon" type="button" aria-label="Close add torrent" onClick={handleCancel}>
+            <X />
+          </Button>
+        ) : null}
       </header>
 
-      <div className="grid min-h-0 min-w-0 flex-1 overflow-y-auto lg:grid-cols-[minmax(340px,400px)_1fr] lg:overflow-hidden">
-        <div className="min-w-0 space-y-5 border-b p-5 lg:overflow-y-auto lg:border-b-0 lg:border-r">
+      <div className="grid min-h-0 min-w-0 flex-1 overflow-y-auto md:grid-cols-[minmax(320px,380px)_1fr] md:overflow-hidden">
+        <div className="min-w-0 space-y-5 border-b p-5 md:overflow-y-auto md:border-b-0 md:border-r">
           <div className="grid grid-cols-2 rounded-lg bg-muted p-1">
             <SourceButton
               active={sourceType === "file"}
@@ -339,7 +340,7 @@ export function AddTorrentPanel({ windowMode, initialSource, onAdded, onCancel }
               <Input
                 className="min-w-0 cursor-pointer pr-10"
                 id="destination"
-                value={resolvedPath}
+                value={destination}
                 readOnly
                 onClick={chooseDestination}
                 onKeyDown={(event) => {
@@ -349,7 +350,7 @@ export function AddTorrentPanel({ windowMode, initialSource, onAdded, onCancel }
                   }
                 }}
                 placeholder="Choose a destination folder"
-                title={resolvedPath || "Choose a destination folder"}
+                title={destination || "Choose a destination folder"}
               />
               <FolderOpen className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
             </div>
@@ -370,11 +371,6 @@ export function AddTorrentPanel({ windowMode, initialSource, onAdded, onCancel }
             </button>
             {advancedOpen ? (
               <div className="space-y-4 border-t bg-muted/35 p-3.5">
-                <div className="space-y-1.5">
-                  <Label htmlFor="sub-folder">Custom subfolder</Label>
-                  <Input id="sub-folder" value={subFolder} onChange={(event) => setSubFolder(event.target.value)} placeholder="Optional folder name" />
-                  <p className="text-xs text-muted-foreground">Adds one folder inside the selected destination.</p>
-                </div>
                 <ToggleRow
                   label="Start paused"
                   description="Add it to the queue without connecting yet."
@@ -409,7 +405,7 @@ export function AddTorrentPanel({ windowMode, initialSource, onAdded, onCancel }
           ) : null}
         </div>
 
-        <div className="flex min-h-[380px] min-w-0 flex-col lg:min-h-0">
+        <div className="flex min-h-[380px] min-w-0 flex-col md:min-h-0">
           <div className="flex min-h-16 items-center justify-between gap-4 border-b px-5 py-3">
             <div>
               <h2 className="text-sm font-semibold">Files to download</h2>
@@ -418,8 +414,10 @@ export function AddTorrentPanel({ windowMode, initialSource, onAdded, onCancel }
                   ? `${selectedCount} of ${files.length} selected · ${formatBytes(selectedSize)} of ${formatBytes(totalSize)}`
                   : busy === "preview"
                     ? "Reading torrent metadata…"
-                    : sourceType === "magnet" && preview
-                      ? "File metadata will arrive after peer discovery."
+                    : sourceType === "magnet"
+                      ? hasSource
+                        ? "The file list will load after the torrent is added."
+                        : "Paste a magnet link to continue."
                       : "File details appear automatically."}
               </p>
             </div>
@@ -436,23 +434,29 @@ export function AddTorrentPanel({ windowMode, initialSource, onAdded, onCancel }
           </div>
           <div className="min-h-0 flex-1 overflow-y-auto p-4">
             {files.length > 0 ? (
-              <FileTree files={files} selectedFileIds={selectedFileIds} onSelectionChange={setSelectedFileIds} />
+              <FileTree files={previewFiles} selectedFileIds={selectedFileIds} onSelectionChange={setSelectedFileIds} />
             ) : (
               <div className="flex h-full min-h-72 flex-col items-center justify-center rounded-xl border border-dashed px-8 py-12 text-center">
                 <div className="mb-3 flex h-10 w-10 items-center justify-center rounded-full bg-secondary text-muted-foreground">
                   {busy === "preview" ? <Loader2 className="h-5 w-5 animate-spin" /> : sourceType === "magnet" ? <Link2 className="h-5 w-5" /> : <FileCheck2 className="h-5 w-5" />}
                 </div>
                 <p className="text-sm font-medium">
-                  {busy === "preview" ? "Reading torrent metadata" : sourceType === "magnet" && preview ? "Ready to fetch metadata" : "No torrent selected"}
+                  {busy === "preview"
+                    ? "Reading torrent metadata"
+                    : sourceType === "magnet"
+                      ? hasSource
+                        ? "Files load after adding"
+                        : "No magnet link selected"
+                      : "No torrent selected"}
                 </p>
                 <p className="mt-1 max-w-sm text-xs leading-relaxed text-muted-foreground">
                   {busy === "preview"
                     ? "The file list will appear here automatically."
-                    : sourceType === "magnet" && preview
-                      ? "Add the torrent to connect to peers and retrieve its file list."
-                      : sourceType === "file"
-                        ? "Choose a .torrent file to inspect its contents before downloading."
-                        : "Paste a magnet link to inspect its available details."}
+                    : sourceType === "magnet"
+                      ? hasSource
+                        ? "Add the torrent to connect to peers and retrieve its file list."
+                        : "Paste a magnet link to add a torrent."
+                      : "Choose a .torrent file to inspect its contents before downloading."}
                 </p>
               </div>
             )}
@@ -463,16 +467,6 @@ export function AddTorrentPanel({ windowMode, initialSource, onAdded, onCancel }
       <Separator />
       <footer className="flex flex-col gap-3 px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
         <div className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
-          {busy === "preview" ? (
-            <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
-          ) : preview ? (
-            <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-primary" />
-          ) : (
-            <FileUp className="h-3.5 w-3.5 shrink-0" />
-          )}
-          <span className="truncate">
-            {busy === "preview" ? "Previewing automatically…" : preview ? "Preview updated automatically" : "Preview starts when a source is entered"}
-          </span>
         </div>
         <div className="flex justify-end gap-2">
           <Button type="button" variant="outline" onClick={handleCancel} disabled={busy === "add"}>
@@ -543,29 +537,14 @@ function StatusLine({ tone, icon, children }: { tone: "error" | "success"; icon:
   );
 }
 
-function resolveDownloadPath(destination: string, subFolder: string, preview: TorrentDetails | null) {
-  const base = joinPath(destination.trim(), subFolder.trim());
-  const files = preview?.files ?? [];
-  if (!base || files.length === 0) return base;
-
-  const isMultiFile = files.length > 1 || (files[0]?.components.length ?? 0) > 1;
-  if (!isMultiFile) return joinPath(base, ...(files[0]?.components ?? []));
-
-  const firstFolder = files[0]?.components.length > 1 ? files[0].components[0] : null;
+function filesWithTorrentRoot(files: NonNullable<TorrentDetails["files"]>, torrentName?: string) {
+  if (!torrentName || files.length === 0) return files;
+  const firstRoot = files[0]?.components.length > 1 ? files[0].components[0] : null;
   const alreadyContained = Boolean(
-    firstFolder && files.every((file) => file.components.length > 1 && file.components[0] === firstFolder)
+    firstRoot && files.every((file) => file.components.length > 1 && file.components[0] === firstRoot)
   );
-  return joinPath(base, alreadyContained ? firstFolder ?? "" : preview?.name ?? "");
-}
-
-function joinPath(...parts: string[]) {
-  const usable = parts.map((part) => part.trim()).filter(Boolean);
-  if (usable.length === 0) return "";
-  const separator = usable[0].includes("\\") ? "\\" : "/";
-  return usable
-    .map((part, index) => (index === 0 ? part.replace(/[\\/]+$/, "") : part.replace(/^[\\/]+|[\\/]+$/g, "")))
-    .filter(Boolean)
-    .join(separator);
+  if (alreadyContained) return files;
+  return files.map((file) => ({ ...file, components: [torrentName, ...file.components] }));
 }
 
 function parseInitialSource(initialSource?: string | null) {

@@ -161,6 +161,11 @@ export async function recheckTorrent(id: string) {
   await invoke("recheck_torrent", { id });
 }
 
+export async function openTorrentFolder(id: string) {
+  if (!isTauriRuntime()) return;
+  await invoke("open_torrent_folder", { id });
+}
+
 export async function queryDhtTorrent(id: string) {
   if (!isTauriRuntime()) return;
   await invoke("query_dht_torrent", { id });
