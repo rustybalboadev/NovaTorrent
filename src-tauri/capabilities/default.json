@@ -1,7 +1,16 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "main-capability",
-  "description": "Allows the NovaTorrent windows to use native dialogs and app events.",
-  "windows": ["main", "add-torrent"],
-  "permissions": ["core:default", "core:event:default", "dialog:default"]
+  "description": "Allows NovaTorrent windows to use native dialogs, app events, and the custom title bar controls.",
+  "windows": ["main", "add-torrent", "media-*"],
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "core:window:allow-close",
+    "core:window:allow-is-maximized",
+    "core:window:allow-minimize",
+    "core:window:allow-start-dragging",
+    "core:window:allow-toggle-maximize",
+    "dialog:default"
+  ]
 }

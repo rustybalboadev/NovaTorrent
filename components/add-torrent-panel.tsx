@@ -262,9 +262,11 @@ export function AddTorrentPanel({ windowMode, initialSource, onAdded, onCancel }
             {preview?.name || "Choose a file or paste a magnet link to begin."}
           </p>
         </div>
-        <Button variant="ghost" size="icon" type="button" aria-label="Close add torrent" onClick={handleCancel}>
-          <X />
-        </Button>
+        {!windowMode ? (
+          <Button variant="ghost" size="icon" type="button" aria-label="Close add torrent" onClick={handleCancel}>
+            <X />
+          </Button>
+        ) : null}
       </header>
 
       <div className="grid min-h-0 min-w-0 flex-1 overflow-y-auto lg:grid-cols-[minmax(340px,400px)_1fr] lg:overflow-hidden">

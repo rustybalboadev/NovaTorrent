@@ -1517,6 +1517,15 @@ async fn open_media_window(
         .inner_size(1040.0, 720.0)
         .min_inner_size(700.0, 460.0)
         .resizable(true)
+        .decorations(false)
+        .visible(false)
+        .background_color(Color(16, 20, 25, 255))
+        .on_page_load(|window, payload| {
+            if payload.event() == PageLoadEvent::Finished {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        })
         .build()
         .map_err(error_to_string)?;
     let closed_app = app.clone();
@@ -1681,6 +1690,7 @@ fn open_add_window(app: &AppHandle, source: Option<String>) -> Result<(), String
         .inner_size(780.0, 720.0)
         .min_inner_size(620.0, 560.0)
         .resizable(true)
+        .decorations(false)
         .visible(false)
         .background_color(Color(16, 20, 25, 255))
         .on_page_load(|window, payload| {
@@ -1929,6 +1939,12 @@ pub fn run() {
 
     let app = builder
         .plugin(tauri_plugin_dialog::init())
+        .on_page_load(|window, payload| {
+            if window.label() == "main" && payload.event() == PageLoadEvent::Finished {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        })
         .setup(|app| {
             let default_output_dir = app.path().download_dir()?;
             let state_dir = app.path().app_local_data_dir()?;

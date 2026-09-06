@@ -469,8 +469,8 @@ export function TorrentDashboard() {
   }
 
   return (
-    <main className="min-h-screen bg-background p-3 text-foreground">
-      <div className="mx-auto flex min-h-[calc(100vh-1.5rem)] flex-col gap-3">
+    <main className="h-full min-h-0 bg-background p-3 text-foreground">
+      <div className="mx-auto flex min-h-full flex-col gap-3">
         <header className="panel grid grid-cols-[auto_auto] items-center justify-center gap-x-3 gap-y-2 px-4 py-3 lg:grid-cols-[auto_1fr_auto] lg:justify-stretch">
           <div className="order-1 flex items-center gap-3">
             <Image

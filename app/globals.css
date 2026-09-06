@@ -4,28 +4,6 @@
 
 @layer base {
   :root {
-    --background: 210 26% 97%;
-    --foreground: 216 28% 9%;
-    --card: 0 0% 100%;
-    --card-foreground: 216 28% 9%;
-    --popover: 0 0% 100%;
-    --popover-foreground: 216 28% 9%;
-    --primary: 174 84% 30%;
-    --primary-foreground: 0 0% 100%;
-    --secondary: 212 22% 91%;
-    --secondary-foreground: 216 28% 13%;
-    --muted: 210 24% 93%;
-    --muted-foreground: 216 9% 43%;
-    --accent: 28 92% 55%;
-    --accent-foreground: 25 91% 9%;
-    --destructive: 0 78% 52%;
-    --destructive-foreground: 0 0% 100%;
-    --border: 214 22% 86%;
-    --input: 214 22% 86%;
-    --ring: 174 84% 30%;
-  }
-
-  .dark {
     --background: 220 22% 8%;
     --foreground: 210 22% 94%;
     --card: 218 18% 12%;
@@ -47,22 +25,45 @@
     --ring: 172 72% 42%;
   }
 
+  .light {
+    --background: 210 26% 97%;
+    --foreground: 216 28% 9%;
+    --card: 0 0% 100%;
+    --card-foreground: 216 28% 9%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 216 28% 9%;
+    --primary: 174 84% 30%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 212 22% 91%;
+    --secondary-foreground: 216 28% 13%;
+    --muted: 210 24% 93%;
+    --muted-foreground: 216 9% 43%;
+    --accent: 28 92% 55%;
+    --accent-foreground: 25 91% 9%;
+    --destructive: 0 78% 52%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 214 22% 86%;
+    --input: 214 22% 86%;
+    --ring: 174 84% 30%;
+  }
+
   * {
     @apply border-border;
   }
 
   html,
   body {
-    min-height: 100%;
+    height: 100%;
+    overflow: hidden;
   }
 
   html {
     background: hsl(var(--background));
-    color-scheme: light;
+    color-scheme: dark;
   }
 
-  html.dark {
-    color-scheme: dark;
+  html.light {
+    color-scheme: light;
   }
 
   body {
@@ -75,6 +76,75 @@
 
   ::selection {
     background: hsl(var(--primary) / 0.24);
+  }
+
+  .app-window-content {
+    height: 100%;
+    min-height: 0;
+    overflow: auto;
+  }
+
+  .window-titlebar {
+    display: none;
+  }
+
+  .tauri-runtime .window-titlebar {
+    display: flex;
+    height: 38px;
+    flex: 0 0 38px;
+    align-items: center;
+    border-bottom: 1px solid hsl(var(--border));
+    background: hsl(var(--card));
+    color: hsl(var(--foreground));
+    user-select: none;
+  }
+
+  .tauri-runtime .app-window-content {
+    height: calc(100% - 38px);
+  }
+
+  .window-titlebar-button {
+    display: flex;
+    height: 38px;
+    width: 46px;
+    align-items: center;
+    justify-content: center;
+    color: hsl(var(--foreground) / 0.78);
+    transition: background-color 120ms ease, color 120ms ease;
+  }
+
+  .window-titlebar-button:hover {
+    background: hsl(var(--secondary));
+    color: hsl(var(--foreground));
+  }
+
+  .window-titlebar-button:focus-visible {
+    outline: 2px solid hsl(var(--ring));
+    outline-offset: -2px;
+  }
+
+  .window-titlebar-close:hover {
+    background: hsl(0 84% 58%);
+    color: white;
+  }
+
+  .tauri-runtime .window-titlebar-media {
+    border-color: rgb(255 255 255 / 0.1);
+    background: rgb(9 9 11);
+    color: rgb(244 244 245);
+  }
+
+  .window-titlebar-media .window-titlebar-button {
+    color: rgb(212 212 216);
+  }
+
+  .window-titlebar-media .window-titlebar-button:hover {
+    background: rgb(255 255 255 / 0.1);
+    color: white;
+  }
+
+  .window-titlebar-media .window-titlebar-close:hover {
+    background: hsl(0 84% 58%);
   }
 }
 
