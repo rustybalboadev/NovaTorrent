@@ -30,9 +30,13 @@ export function WindowTitlebar() {
       if (disposed) return;
       const currentWindow = getCurrentWindow();
       windowRef.current = currentWindow;
+      document.documentElement.classList.add("tauri-runtime");
       setMaximized(await currentWindow.isMaximized());
       unlisten = await currentWindow.onResized(async () => {
         if (!disposed) setMaximized(await currentWindow.isMaximized());
+      });
+      window.requestAnimationFrame(() => {
+        if (!disposed) void currentWindow.show();
       });
     });
 
