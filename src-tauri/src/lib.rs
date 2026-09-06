@@ -1957,7 +1957,6 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .on_page_load(|window, payload| {
             if window.label() == "main" && payload.event() == PageLoadEvent::Finished {
-                let _ = window.show();
                 let _ = window.set_focus();
             }
         })
