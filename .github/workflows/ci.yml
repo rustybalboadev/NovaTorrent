@@ -14,7 +14,11 @@ concurrency:
 jobs:
   rust:
     name: Rust
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
 
     defaults:
       run:
@@ -74,3 +78,34 @@ jobs:
 
       - name: Build Tauri app
         run: npm run tauri -- build --no-bundle
+
+  macos-bundle:
+    name: macOS DMG Launch
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - name: Select stable Rust
+        run: rustup default stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+      - run: npm ci --prefer-offline --no-audit
+      - name: Build app and DMG
+        run: npm run tauri:build
+      - name: Launch app installed from DMG
+        shell: bash
+        run: |
+          set -euo pipefail
+          volume="$RUNNER_TEMP/novatorrent-volume"
+          installed="$RUNNER_TEMP/novatorrent-installed"
+          mkdir -p "$installed"
+          hdiutil attach -readonly -nobrowse -mountpoint "$volume" src-tauri/target/release/bundle/dmg/*.dmg
+          trap 'hdiutil detach "$volume"' EXIT
+          ditto "$volume/NovaTorrent.app" "$installed/NovaTorrent.app"
+          swift scripts/macos-window-smoke.swift "$installed/NovaTorrent.app"
