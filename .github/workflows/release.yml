@@ -9,9 +9,19 @@ permissions:
   contents: write
 
 jobs:
-  windows-release:
-    name: Build Windows Installers
-    runs-on: windows-latest
+  desktop-release:
+    name: Build ${{ matrix.platform }} Installers
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: Windows
+            runner: windows-latest
+            args: ""
+          - platform: macOS
+            runner: macos-latest
+            args: --target universal-apple-darwin
+    runs-on: ${{ matrix.runner }}
 
     steps:
       - name: Check out source
@@ -28,6 +38,10 @@ jobs:
       - name: Select stable Rust
         run: rustup default stable
 
+      - name: Install macOS targets
+        if: runner.os == 'macOS'
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
         with:
@@ -42,6 +56,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
+          args: ${{ matrix.args }}
           tagName: ${{ github.ref_name }}
           releaseName: NovaTorrent ${{ github.ref_name }}
           generateReleaseNotes: true

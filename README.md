@@ -10,7 +10,7 @@
 
 
 <p align="center">
-  A fast, modern BitTorrent client for Windows with built-in media streaming.
+  A fast, modern BitTorrent client for Windows and macOS with built-in media streaming.
 </p>
 
 <p align="center">
@@ -24,7 +24,7 @@
 </p>
 
 <p align="center">
-  NovaTorrent is a Windows BitTorrent client built with Rust, Tauri, React, and Next.js. It downloads torrents from magnet links or .torrent files, supports resumable downloads and per-file controls, and can play media while it downloads.
+  NovaTorrent is a desktop BitTorrent client built with Rust, Tauri, React, and Next.js. It downloads torrents from magnet links or .torrent files, supports resumable downloads and per-file controls, and can play media while it downloads.
 </p>
 
 ## Download and install
@@ -96,6 +96,48 @@ src-tauri/target/release/novatorrent.exe
 src-tauri/target/release/bundle/nsis/NovaTorrent_<version>_x64-setup.exe
 src-tauri/target/release/bundle/msi/NovaTorrent_<version>_x64_en-US.msi
 ```
+
+## Build a macOS release
+
+On macOS, install Xcode Command Line Tools (`xcode-select --install`),
+Node.js 20.9 or newer, and the current stable Rust toolchain. From the repository:
+
+```sh
+npm ci
+npm run tauri:dev
+# Build an app and DMG for this Mac's architecture:
+npm run tauri:build
+```
+
+Tauri automatically applies `src-tauri/tauri.macos.conf.json` on macOS. The
+app and DMG are written to `src-tauri/target/release/bundle/macos/` and
+`src-tauri/target/release/bundle/dmg/`. Open the DMG and drag NovaTorrent to
+Applications, then launch it from Applications.
+
+For one DMG that supports both Apple silicon and Intel (also used by the release workflow):
+
+```sh
+rustup target add aarch64-apple-darwin x86_64-apple-darwin
+npm run tauri -- build --target universal-apple-darwin
+```
+
+Universal bundles are under `src-tauri/target/universal-apple-darwin/release/bundle/`.
+These builds are not Developer ID signed or notarized; macOS may require approval
+in **System Settings → Privacy & Security** for a downloaded build you trust.
+The existing v1.0.2 release contains Windows installers only; macOS release
+artifacts are produced on subsequent release tags using the updated workflow.
+
+To check an installed bundle from a logged-in macOS desktop session, quit any
+running NovaTorrent instance and run:
+
+```sh
+swift scripts/macos-window-smoke.swift /path/to/NovaTorrent.app
+```
+
+The check launches the bundle through macOS, requires an on-screen main window
+within 30 seconds, and terminates the test app. It checks native window visibility;
+it does not test torrent downloads or replace interaction testing. See
+[the macOS investigation report](MACOS_REPORT.md) for findings and validation.
 
 ## License
 
