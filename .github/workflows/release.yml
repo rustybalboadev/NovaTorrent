@@ -21,12 +21,9 @@ jobs:
           - name: Linux x64
             platform: ubuntu-22.04
             args: ""
-          - name: macOS Apple Silicon
+          - name: macOS Universal
             platform: macos-latest
-            args: "--target aarch64-apple-darwin"
-          - name: macOS Intel
-            platform: macos-latest
-            args: "--target x86_64-apple-darwin"
+            args: "--target universal-apple-darwin"
 
     runs-on: ${{ matrix.platform }}
 

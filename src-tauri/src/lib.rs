@@ -1533,7 +1533,7 @@ async fn open_media_window(
         .min_inner_size(700.0, 460.0)
         .resizable(true)
         .decorations(false)
-        .visible(false)
+        .visible(cfg!(target_os = "macos"))
         .background_color(Color(16, 20, 25, 255))
         .on_page_load(|window, payload| {
             if payload.event() == PageLoadEvent::Finished {
@@ -1706,7 +1706,7 @@ fn open_add_window(app: &AppHandle, source: Option<String>) -> Result<(), String
         .min_inner_size(900.0, 620.0)
         .resizable(true)
         .decorations(false)
-        .visible(false)
+        .visible(cfg!(target_os = "macos"))
         .background_color(Color(16, 20, 25, 255))
         .on_page_load(|window, payload| {
             if payload.event() == PageLoadEvent::Finished {
@@ -1882,6 +1882,25 @@ fn error_to_string(err: impl std::fmt::Display) -> String {
     err.to_string()
 }
 
+fn show_main_window(app: &AppHandle) -> tauri::Result<()> {
+    let window = match app.get_webview_window("main") {
+        Some(window) => window,
+        None => {
+            let config = app
+                .config()
+                .app
+                .windows
+                .iter()
+                .find(|window| window.label == "main")
+                .expect("main window configuration is required");
+            WebviewWindowBuilder::from_config(app, config)?.build()?
+        }
+    };
+    window.unminimize()?;
+    window.show()?;
+    window.set_focus()
+}
+
 fn migrate_legacy_state_dir(legacy: &Path, destination: &Path) -> std::io::Result<()> {
     if legacy == destination || !legacy.is_dir() {
         return Ok(());
@@ -1928,6 +1947,9 @@ pub fn run() {
         builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
             let sources = supported_open_sources(argv, Some(Path::new(&cwd)));
             if sources.is_empty() {
+                if let Err(err) = show_main_window(app) {
+                    eprintln!("could not show the main window: {err}");
+                }
                 return;
             }
 
@@ -1979,6 +2001,10 @@ pub fn run() {
                 log_file_path,
                 pending_sources,
             ));
+            // WKWebView can defer work while its window is hidden. Reveal the
+            // native window without waiting for page load or animation frames.
+            #[cfg(target_os = "macos")]
+            show_main_window(app.handle())?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -2021,6 +2047,12 @@ pub fn run() {
         .expect("error while building NovaTorrent");
 
     app.run(|app_handle, event| {
+        #[cfg(target_os = "macos")]
+        if let tauri::RunEvent::Reopen { .. } = &event {
+            if let Err(err) = show_main_window(app_handle) {
+                eprintln!("could not reopen the main window: {err}");
+            }
+        }
         if let tauri::RunEvent::ExitRequested { api, .. } = event {
             if let Some(state) = app_handle.try_state::<AppState>() {
                 if !state.shutdown_started.swap(true, Ordering::AcqRel) {

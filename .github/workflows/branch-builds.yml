@@ -20,6 +20,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - name: Windows x64
+            platform: windows-latest
+            args: ""
+            rustTargets: ""
+            artifactName: NovaTorrent-windows-x64
+            artifactPath: |
+              src-tauri/target/release/bundle/nsis/*.exe
+              src-tauri/target/release/bundle/msi/*.msi
           - name: Linux x64 Debian package
             platform: ubuntu-22.04
             args: "--bundles deb"
